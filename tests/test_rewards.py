@@ -96,8 +96,11 @@ def test_progression_and_exit_time_plus_health_efficiency():
             keys=[0, 0, 1, 0, 0, 0],
             sector_ceiling=[64.0, 64.0, 128.0],
             exit_reached=True,
-        )
+        ),
+        action=np.eye(9, dtype=np.int8)[7],
+        prev_action=np.zeros(9, dtype=np.int8),
     )
+    assert c3["use_penalty"] == 0
     assert ev3.exit_reached is True
     assert c3["exit"] == pytest.approx(cfg.exit_reward)
     expected_eff = cfg.efficiency_bonus * 0.75 + cfg.health_efficiency_bonus * 0.80
@@ -168,13 +171,24 @@ def test_use_waste_door_bounce_and_combat_resource_rewards():
     assert c_ammo["ammo_waste"] == pytest.approx(cfg.wasted_ammo_penalty)
     assert c_ammo["pickup"] > 0.0
 
-    # 4. Damage rebalance: taking 20 HP fireball outweighs kill_reward (0.5 + 20 * -0.035 = -0.20 < 0)
+    # 4. Rebalanced combat: killing an enemy while taking one 20 HP hit stays positive (no combat cowardice),
+    # while facetanking 50 HP of damage for a single kill or dying remains strictly negative.
     _, _, c_trade = shaper.step(
         _priv(tic=20, health=50.0, armor=30.0, kills=1, damage_taken=20.0, sector_ceiling=[4.0, 0.0, 128.0]),
         obs=_obs(bullets=48.0, enemy_visible=True),
     )
     assert c_trade["ammo_waste"] == pytest.approx(0.0)
-    assert c_trade["kill"] + c_trade["damage"] < 0.0
+    assert c_trade["kill"] + c_trade["damage"] > 0.0
+    _, _, c_facetank = shaper.step(
+        _priv(tic=22, health=20.0, armor=30.0, kills=2, damage_taken=70.0, sector_ceiling=[4.0, 0.0, 128.0]),
+        obs=_obs(bullets=47.0, enemy_visible=True),
+    )
+    assert c_facetank["kill"] + c_facetank["damage"] < 0.0
+    _, _, c_dead = shaper.step(
+        _priv(tic=24, health=0.0, dead=True, damage_taken=120.0, sector_ceiling=[4.0, 0.0, 128.0]),
+        obs=_obs(bullets=48.0, enemy_visible=True),
+    )
+    assert c_dead["death"] + c_dead["damage"] < -1.0
 
 
 def test_reward_shaper_on_real_key_door_exit_doom_env():
@@ -214,3 +228,119 @@ def test_reward_shaper_on_real_key_door_exit_doom_env():
         assert totals["explore"] > 0.0
     finally:
         env.close()
+
+
+def test_use_hold_attack_press_and_weapon_switch_penalties():
+    cfg = RewardConfig()
+    shaper = RewardShaper(cfg)
+    shaper.reset(_priv(tic=0, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]))
+
+    prev_use = np.zeros(9, dtype=np.int8)
+    prev_use[7] = 1
+    hold_use = np.zeros(9, dtype=np.int8)
+    hold_use[7] = 1
+    _, _, c_hold = shaper.step(
+        _priv(tic=4, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=hold_use,
+        prev_action=prev_use,
+        obs=_obs(bullets=50.0, enemy_visible=False),
+    )
+    assert c_hold["use_penalty"] == pytest.approx(cfg.use_hold_penalty)
+
+    atk_act = np.zeros(9, dtype=np.int8)
+    atk_act[6] = 1
+    _, _, c_atk = shaper.step(
+        _priv(tic=8, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=atk_act,
+        prev_action=np.zeros(9, dtype=np.int8),
+        obs=_obs(bullets=50.0, enemy_visible=False),
+    )
+    assert c_atk["ammo_waste"] == pytest.approx(cfg.wasted_ammo_penalty)
+
+    wpn_act = np.zeros(9, dtype=np.int8)
+    wpn_act[8] = 1
+    obs_loaded = _obs(bullets=50.0, enemy_visible=False)
+    obs_loaded["vitals"][2] = 2.0  # Pistol
+    obs_loaded["vitals"][3] = 50.0
+    _, _, c_sw_loaded = shaper.step(
+        _priv(tic=12, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=wpn_act,
+        prev_action=np.zeros(9, dtype=np.int8),
+        obs=obs_loaded,
+    )
+    assert c_sw_loaded["weapon_switch_penalty"] == pytest.approx(cfg.weapon_switch_waste_penalty)
+
+    obs_empty = _obs(bullets=0.0, enemy_visible=False)
+    obs_empty["vitals"][2] = 2.0
+    obs_empty["vitals"][3] = 0.0
+    _, _, c_sw_empty = shaper.step(
+        _priv(tic=16, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=wpn_act,
+        prev_action=np.zeros(9, dtype=np.int8),
+        obs=obs_empty,
+    )
+    assert c_sw_empty["weapon_switch_penalty"] == pytest.approx(0.0)
+
+    obs_fist = _obs(bullets=50.0, enemy_visible=False)
+    obs_fist["vitals"][2] = 1.0  # Fist
+    obs_fist["vitals"][3] = 50.0
+    _, _, c_sw_fist = shaper.step(
+        _priv(tic=20, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=wpn_act,
+        prev_action=np.zeros(9, dtype=np.int8),
+        obs=obs_fist,
+    )
+    assert c_sw_fist["weapon_switch_penalty"] == pytest.approx(0.0)
+
+
+def test_continuous_spin_penalty_allows_normal_turns_and_penalizes_spinning():
+    cfg = RewardConfig()
+    shaper = RewardShaper(cfg)
+    shaper.reset(_priv(tic=0, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]))
+
+    turn_l = np.zeros(9, dtype=np.int8)
+    turn_l[4] = 1
+    turn_r = np.zeros(9, dtype=np.int8)
+    turn_r[5] = 1
+    straight = np.zeros(9, dtype=np.int8)
+
+    prev = straight
+    for i in range(cfg.spin_threshold_steps):
+        _, _, comp = shaper.step(
+            _priv(tic=(i + 1) * 4, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+            action=turn_l,
+            prev_action=prev,
+        )
+        assert comp["spin_penalty"] == pytest.approx(0.0)
+        prev = turn_l
+
+    # Step 9+ consecutive left turns trigger spin_penalty
+    _, _, comp9 = shaper.step(
+        _priv(tic=40, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=turn_l,
+        prev_action=turn_l,
+    )
+    assert comp9["spin_penalty"] == pytest.approx(cfg.spin_penalty)
+
+    # Switching to TURN_RIGHT or going straight resets streak to 0.0
+    _, _, comp_flip = shaper.step(
+        _priv(tic=44, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=turn_r,
+        prev_action=turn_l,
+    )
+    assert comp_flip["spin_penalty"] == pytest.approx(0.0)
+
+    for i in range(cfg.spin_threshold_steps):
+        _, _, comp_r = shaper.step(
+            _priv(tic=48 + i * 4, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+            action=turn_r,
+            prev_action=turn_r,
+        )
+    assert comp_r["spin_penalty"] == pytest.approx(cfg.spin_penalty)
+
+    _, _, comp_str = shaper.step(
+        _priv(tic=100, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=straight,
+        prev_action=turn_r,
+    )
+    assert comp_str["spin_penalty"] == pytest.approx(0.0)

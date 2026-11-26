@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from submission.obs import obs_to_torch
 from submission.policy import CHECKPOINT_FORMAT_VERSION, PolicyConfig, build_policy
@@ -32,9 +33,11 @@ class PPOConfig:
     target_kl: float | None = 0.03
     normalize_advantages: bool = True
     clip_vloss: bool = True
+    use_huber_vloss: bool = True
+    huber_delta: float = 5.0
     use_asymmetric_critic: bool = True
     aux_coef: float = 0.2
-    curiosity_coef: float = 0.02
+    curiosity_coef: float = 0.0
     detach_asymmetric_critic_feat: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,6 +60,7 @@ class RecurrentPPOTrainer:
     ):
         self.policy = policy
         self.config = config or PPOConfig()
+        self._ent_coef = float(self.config.ent_coef)
         self.device = torch.device(device)
         hidden_dim = int(getattr(getattr(policy, "config", None), "hidden_size", 256))
 
@@ -93,6 +97,9 @@ class RecurrentPPOTrainer:
     def set_lr(self, lr: float) -> None:
         for group in self.optimizer.param_groups:
             group["lr"] = float(lr)
+
+    def set_ent_coef(self, ent_coef: float) -> None:
+        self._ent_coef = float(ent_coef)
 
     def close(self) -> None:
         if self.feature_hook is not None:
@@ -149,7 +156,15 @@ class RecurrentPPOTrainer:
                 pg_loss2 = -adv * torch.clamp(ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                if cfg.clip_vloss:
+                if cfg.use_huber_vloss:
+                    if cfg.clip_vloss:
+                        v_loss_unclipped = F.huber_loss(new_value, ret, reduction="none", delta=cfg.huber_delta)
+                        v_clipped = old_value + torch.clamp(new_value - old_value, -cfg.clip_coef, cfg.clip_coef)
+                        v_loss_clipped = F.huber_loss(v_clipped, ret, reduction="none", delta=cfg.huber_delta)
+                        v_loss = torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    else:
+                        v_loss = F.huber_loss(new_value, ret, reduction="mean", delta=cfg.huber_delta)
+                elif cfg.clip_vloss:
                     v_loss_unclipped = (new_value - ret) ** 2
                     v_clipped = old_value + torch.clamp(new_value - old_value, -cfg.clip_coef, cfg.clip_coef)
                     v_loss_clipped = (v_clipped - ret) ** 2
@@ -158,7 +173,7 @@ class RecurrentPPOTrainer:
                     v_loss = 0.5 * ((new_value - ret) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - cfg.ent_coef * entropy_loss + cfg.vf_coef * v_loss
+                loss = pg_loss - self._ent_coef * entropy_loss + cfg.vf_coef * v_loss
 
                 if self.aux_head is not None and cfg.aux_coef > 0.0 and feat_seq is not None:
                     aux_targets = torch.as_tensor(mb["aux_targets"], dtype=torch.float32, device=self.device)

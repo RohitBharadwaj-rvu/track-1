@@ -17,6 +17,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from submission.ego_map import EGO_MAP_CHANNELS, EGO_MAP_SIZE, EgocentricSpatialMap
 from submission.obs import (
     MAX_ENTITIES,
     NUM_ACTIONS,
@@ -27,7 +28,14 @@ from submission.obs import (
     preprocess_obs,
 )
 from training.interfaces import EpisodeMetrics, MapSpec
+from training.pbrs import GeodesicPBRS
 from training.rewards import RewardConfig, RewardShaper
+from training.symmetry import (
+    mirror_action,
+    mirror_aux_targets,
+    mirror_priv_features,
+    mirror_raw_obs,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 PRIV_FEATURE_DIM = 16
@@ -101,7 +109,7 @@ def resolve_train_maps(
         if not specs:
             specs = list(DEFAULT_TRAIN_MAPS)
 
-    if procedural_per_family > 0:
+    if procedural_per_family > 0 and not map_args and stage != "connect":
         try:
             maps_mod = importlib.import_module("training.maps")
             if hasattr(maps_mod, "generate_training_variations"):
@@ -111,6 +119,7 @@ def resolve_train_maps(
                     out_dir,
                     count_per_family=int(procedural_per_family),
                     base_seed=int(procedural_seed),
+                    families=("door_exit", "combat", "multi_room", "key_return", "gauntlet"),
                 )
                 specs = [*specs, *proc_specs]
         except ModuleNotFoundError:
@@ -153,6 +162,8 @@ class _DoomWorkerSlot:
         render_buffers: bool = False,
         max_cached_envs: int = 32,
         map_weights: Sequence[float] | None = None,
+        use_ego_map: bool = False,
+        mirror_prob: float = 0.0,
     ):
         if not map_specs:
             raise ValueError("map_specs must not be empty")
@@ -162,12 +173,17 @@ class _DoomWorkerSlot:
         self.shaper = RewardShaper(reward_config)
         self.render_buffers = render_buffers
         self.max_cached_envs = max(1, max_cached_envs)
+        self.use_ego_map = bool(use_ego_map)
+        self.mirror_prob = float(np.clip(mirror_prob, 0.0, 1.0))
+        self._ego_map = EgocentricSpatialMap() if self.use_ego_map else None
+        self._pbrs_cache: dict[tuple[str, str], GeodesicPBRS | None] = {}
         self._rng = np.random.default_rng(base_seed + slot_id * 10007)
         self._episode_counter = 0
         self._envs: OrderedDict[tuple[str, str, int], Any] = OrderedDict()
 
         self._active_env: Any = None
         self._active_spec: MapSpec = self.map_specs[0]
+        self._mirror_ep: bool = False
         self._current_seed: int = 0
         self._steps = 0
         self._total_reward = 0.0
@@ -177,9 +193,31 @@ class _DoomWorkerSlot:
         self._kills = 0
         self._damage_taken = 0.0
         self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
-        self._locked_door_xy: tuple[float, float] | None = None
+        self._locked_doors_xy: list[tuple[float, float]] = []
         self._last_priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
         self._last_aux_targets = np.zeros(AUX_TARGET_DIM, dtype=np.float32)
+
+    def _get_pbrs(self, spec: MapSpec) -> GeodesicPBRS | None:
+        cfg = self.shaper.config
+        if cfg.pbrs_scale <= 0.0:
+            return None
+        wad_path = _resolve_wad_path(spec.wad)
+        key = (wad_path, spec.map_name.upper())
+        if key not in self._pbrs_cache:
+            pbrs = GeodesicPBRS(
+                wad_path,
+                spec.map_name,
+                scale=cfg.pbrs_scale,
+                gamma=cfg.pbrs_gamma,
+            )
+            self._pbrs_cache[key] = pbrs if pbrs.graph is not None else None
+        return self._pbrs_cache[key]
+
+    def _preprocess_with_ego(self, raw_obs: dict[str, Any], action_for_ego: np.ndarray) -> dict[str, np.ndarray]:
+        prep = preprocess_obs(raw_obs)
+        if self._ego_map is not None:
+            prep["ego_map"] = self._ego_map.update(raw_obs, action_for_ego)
+        return prep
 
     def set_map_weights(self, weights: Sequence[float]) -> None:
         self.map_probs = _normalize_weights(weights, len(self.map_specs))
@@ -214,8 +252,14 @@ class _DoomWorkerSlot:
         py = float(priv["y"])
         heading = math.radians(float(priv["angle"]))
 
-        if unlocked_this_step > 0:
-            self._locked_door_xy = None
+        if unlocked_this_step > 0 and self._locked_doors_xy:
+            # Remove nearest unlocked door(s) while preserving remaining sighted locks on Tier 4 maps
+            for _ in range(min(unlocked_this_step, len(self._locked_doors_xy))):
+                nearest_idx = min(
+                    range(len(self._locked_doors_xy)),
+                    key=lambda i: math.hypot(self._locked_doors_xy[i][0] - px, self._locked_doors_xy[i][1] - py),
+                )
+                self._locked_doors_xy.pop(nearest_idx)
 
         rays = raw_obs["rays"]
         hit_type = np.asarray(rays["hit_type"], dtype=np.int64)
@@ -225,15 +269,27 @@ class _DoomWorkerSlot:
             best_ray = int(locked_indices[int(np.argmin(dists))])
             d = float(rays["distance"][best_ray]) * _RAY_RANGE
             ray_angle = heading + best_ray * (2.0 * math.pi / float(NUM_RAYS))
-            self._locked_door_xy = (px + d * math.cos(ray_angle), py + d * math.sin(ray_angle))
+            cand_xy = (px + d * math.cos(ray_angle), py + d * math.sin(ray_angle))
+            merged = False
+            for i, (lx, ly) in enumerate(self._locked_doors_xy):
+                if math.hypot(cand_xy[0] - lx, cand_xy[1] - ly) < 96.0:
+                    self._locked_doors_xy[i] = cand_xy
+                    merged = True
+                    break
+            if not merged:
+                self._locked_doors_xy.append(cand_xy)
 
         seen_locked = 0.0
         door_sin = 0.0
         door_cos = 0.0
         door_dist_norm = 0.0
-        if self._locked_door_xy is not None:
-            dx = self._locked_door_xy[0] - px
-            dy = self._locked_door_xy[1] - py
+        if self._locked_doors_xy:
+            target_xy = min(
+                self._locked_doors_xy,
+                key=lambda pt: math.hypot(pt[0] - px, pt[1] - py),
+            )
+            dx = target_xy[0] - px
+            dy = target_xy[1] - py
             dist = math.hypot(dx, dy)
             rel_angle = math.atan2(dy, dx) - heading
             seen_locked = 1.0
@@ -263,12 +319,13 @@ class _DoomWorkerSlot:
         env = self._get_or_create_env(spec)
         self._active_env = env
         self._active_spec = spec
+        self._mirror_ep = bool(self.mirror_prob > 0.0 and self._rng.random() < self.mirror_prob)
         self._episode_counter += 1
         self._current_seed = int(self.slot_id * 1_000_000 + self._episode_counter)
 
         raw_obs, _ = env.reset(seed=self._current_seed)
         priv = env.privileged_state()
-        self.shaper.reset(priv, obs=raw_obs)
+        self.shaper.reset(priv, obs=raw_obs, pbrs=self._get_pbrs(spec))
         self._steps = 0
         self._total_reward = 0.0
         self._keys_picked_up = 0
@@ -277,20 +334,31 @@ class _DoomWorkerSlot:
         self._kills = 0
         self._damage_taken = 0.0
         self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
-        self._locked_door_xy = None
-        self._last_priv_features, self._last_aux_targets = self._update_door_sighting_and_features(raw_obs, priv)
-        return preprocess_obs(raw_obs)
+        if self._ego_map is not None:
+            self._ego_map.reset()
+        self._locked_doors_xy = []
+        priv_f, aux_t = self._update_door_sighting_and_features(raw_obs, priv)
+        obs_for_policy = mirror_raw_obs(raw_obs) if self._mirror_ep else raw_obs
+        if self._mirror_ep:
+            priv_f = mirror_priv_features(priv_f)
+            aux_t = mirror_aux_targets(aux_t)
+        self._last_priv_features = priv_f
+        self._last_aux_targets = aux_t
+        return self._preprocess_with_ego(obs_for_policy, self._prev_action)
 
     def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         if self._active_env is None:
             raise RuntimeError("Call reset() before step()")
-        act = np.asarray(action, dtype=np.int8)
-        raw_obs, _, terminated, truncated, _ = self._active_env.step(act)
+        was_mirrored = self._mirror_ep
+        act_policy = np.asarray(action, dtype=np.int8)
+        act_env = mirror_action(act_policy) if was_mirrored else act_policy
+
+        raw_obs, _, terminated, truncated, _ = self._active_env.step(act_env)
         priv = self._active_env.privileged_state()
         reward, events, _ = self.shaper.step(
-            priv, action=act, prev_action=self._prev_action, obs=raw_obs
+            priv, action=act_env, prev_action=self._prev_action, obs=raw_obs
         )
-        self._prev_action = act.copy()
+        self._prev_action = act_env.copy()
 
         self._steps += 1
         self._total_reward += reward
@@ -303,17 +371,21 @@ class _DoomWorkerSlot:
         priv_f, aux_t = self._update_door_sighting_and_features(
             raw_obs, priv, unlocked_this_step=events.locked_doors_unlocked
         )
+        obs_for_policy = mirror_raw_obs(raw_obs) if was_mirrored else raw_obs
+        if was_mirrored:
+            priv_f = mirror_priv_features(priv_f)
+            aux_t = mirror_aux_targets(aux_t)
+        obs_proc = self._preprocess_with_ego(obs_for_policy, act_policy)
 
-        info: dict[str, Any] = {}
+        info: dict[str, Any] = {"mirrored": was_mirrored}
         if terminated or truncated:
-            final_obs = preprocess_obs(raw_obs)
             if priv.get("exit_reached"):
                 outcome = "exit"
             elif priv.get("dead"):
                 outcome = "death"
             else:
                 outcome = "timeout"
-            info["final_obs"] = final_obs
+            info["final_obs"] = obs_proc
             info["final_priv_features"] = priv_f
             info["final_aux_targets"] = aux_t
             info["episode"] = EpisodeMetrics(
@@ -342,7 +414,7 @@ class _DoomWorkerSlot:
             self._last_aux_targets = aux_t
             info["priv_features"] = priv_f
             info["aux_targets"] = aux_t
-            next_obs = preprocess_obs(raw_obs)
+            next_obs = obs_proc
         return next_obs, float(reward), bool(terminated), bool(truncated), info
 
     def close(self) -> None:
@@ -367,6 +439,8 @@ class SyncVecDoomEnv:
         num_envs: int | None = None,
         max_cached_envs: int = 32,
         map_weights: Sequence[float] | None = None,
+        use_ego_map: bool = False,
+        mirror_prob: float = 0.0,
     ):
         self.num_envs = num_envs if num_envs is not None else max(1, len(map_specs))
         self.slots = [
@@ -378,6 +452,8 @@ class SyncVecDoomEnv:
                 render_buffers=render_buffers,
                 max_cached_envs=max_cached_envs,
                 map_weights=map_weights,
+                use_ego_map=use_ego_map,
+                mirror_prob=mirror_prob,
             )
             for i in range(self.num_envs)
         ]
@@ -439,6 +515,8 @@ def _worker_loop(
     render_buffers: bool,
     max_cached_envs: int,
     map_weights: Sequence[float] | None,
+    use_ego_map: bool = False,
+    mirror_prob: float = 0.0,
 ) -> None:
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(var, "1")
@@ -450,6 +528,8 @@ def _worker_loop(
         render_buffers=render_buffers,
         max_cached_envs=max_cached_envs,
         map_weights=map_weights,
+        use_ego_map=use_ego_map,
+        mirror_prob=mirror_prob,
     )
     try:
         while True:
@@ -486,6 +566,8 @@ class SubprocVecDoomEnv:
         num_envs: int = 4,
         max_cached_envs: int = 32,
         map_weights: Sequence[float] | None = None,
+        use_ego_map: bool = False,
+        mirror_prob: float = 0.0,
     ):
         self.num_envs = int(num_envs)
         ctx = mp.get_context("spawn")
@@ -507,6 +589,8 @@ class SubprocVecDoomEnv:
                     render_buffers,
                     max_cached_envs,
                     map_weights,
+                    use_ego_map,
+                    mirror_prob,
                 ),
                 daemon=True,
             )
@@ -618,7 +702,14 @@ def compute_gae(
 class RolloutBuffer:
     """Stores contiguous `(T, N, ...)` rollouts (incl. optional privileged/aux targets)."""
 
-    def __init__(self, num_steps: int, num_envs: int, hidden_shape: tuple[int, ...]):
+    def __init__(
+        self,
+        num_steps: int,
+        num_envs: int,
+        hidden_shape: tuple[int, ...],
+        *,
+        use_ego_map: bool = False,
+    ):
         self.num_steps = int(num_steps)
         self.num_envs = int(num_envs)
         self.hidden_shape = tuple(hidden_shape)
@@ -632,6 +723,10 @@ class RolloutBuffer:
             "ent_mask": np.zeros((T, N, MAX_ENTITIES), dtype=np.float32),
             "vitals": np.zeros((T, N, NUM_VITALS), dtype=np.float32),
         }
+        if use_ego_map:
+            self.obs["ego_map"] = np.zeros(
+                (T, N, EGO_MAP_CHANNELS, EGO_MAP_SIZE, EGO_MAP_SIZE), dtype=np.uint8
+            )
         self.prev_actions = np.zeros((T, N, NUM_ACTIONS), dtype=np.float32)
         self.actions = np.zeros((T, N, NUM_ACTIONS), dtype=np.float32)
         self.log_probs = np.zeros((T, N), dtype=np.float32)

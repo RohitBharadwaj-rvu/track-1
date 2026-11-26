@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from submission.ego_map import EGO_MAP_CHANNELS, EGO_MAP_SIZE
     from submission.obs import (
         MAX_ENTITIES,
         NUM_ACTIONS,
@@ -32,6 +33,7 @@ try:
         NUM_VITALS,
     )
 except ImportError:  # pragma: no cover - fallback when submission/ is imported directly
+    from ego_map import EGO_MAP_CHANNELS, EGO_MAP_SIZE
     from obs import (
         MAX_ENTITIES,
         NUM_ACTIONS,
@@ -78,6 +80,10 @@ class PolicyConfig:
     weapon_switch_init_bias: float = -2.0
     eval_deterministic: bool = False
     action_threshold: float = 0.5
+    use_ego_map: bool = False
+    ego_map_out_dim: int = 128
+    ego_map_channels: int = EGO_MAP_CHANNELS
+    ego_map_size: int = EGO_MAP_SIZE
 
     def __post_init__(self) -> None:
         if self.num_rays % 4 != 0:
@@ -222,7 +228,7 @@ def build_policy(config: PolicyConfig):
     import torch.nn.functional as F
 
     def _init_orthogonal(module: nn.Module, gain: float = math.sqrt(2.0)) -> None:
-        if isinstance(module, (nn.Linear, nn.Conv1d)):
+        if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
             nn.init.orthogonal_(module.weight, gain=gain)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -575,6 +581,38 @@ def build_policy(config: PolicyConfig):
             out = self.out_proj(torch.cat([pooled, summary], dim=-1))
             return torch.where(has_any.unsqueeze(-1), out, self.empty_embed.expand(batch_size, -1))
 
+    class SpatialMapEncoder(nn.Module):
+        """Compact 2D CNN encoding the 8-channel egocentric odometric spatial memory."""
+
+        def __init__(self, cfg: PolicyConfig) -> None:
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv2d(cfg.ego_map_channels, 24, kernel_size=3, stride=2, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1),
+                nn.SiLU(),
+            )
+            out_hw = cfg.ego_map_size
+            for _ in range(3):
+                out_hw = (out_hw + 1) // 2
+            self.proj = nn.Sequential(
+                nn.Flatten(start_dim=1),
+                nn.Linear(48 * out_hw * out_hw, cfg.ego_map_out_dim),
+                nn.LayerNorm(cfg.ego_map_out_dim),
+                nn.SiLU(),
+            )
+
+        def forward(self, ego_map: torch.Tensor) -> torch.Tensor:
+            if not ego_map.is_floating_point():
+                x = ego_map.float() / 255.0
+            else:
+                x = ego_map.float()
+                if x.numel() > 0 and float(x.max().item()) > 1.5:
+                    x = x / 255.0
+            return self.proj(self.conv(x))
+
     class TelemetryPolicy(nn.Module):
         """Zero-pixel recurrent telemetry actor-critic implementing the frozen Role 1/2 contract."""
 
@@ -582,11 +620,15 @@ def build_policy(config: PolicyConfig):
             super().__init__()
             self.config = cfg
             self.action_head = cfg.action_head
+            self.use_ego_map = bool(cfg.use_ego_map)
             self.ray_encoder = CircularRayEncoder(cfg)
             self.vitals_encoder = VitalsActionEncoder(cfg)
             self.entity_encoder = MaskedEntityAttentionEncoder(cfg)
+            self.ego_map_encoder = SpatialMapEncoder(cfg) if self.use_ego_map else None
 
             fused_dim = cfg.ray_out_dim + cfg.entity_out_dim + cfg.vitals_dim
+            if self.use_ego_map:
+                fused_dim += cfg.ego_map_out_dim
             self.fusion = nn.Sequential(
                 nn.Linear(fused_dim, cfg.hidden_size),
                 nn.LayerNorm(cfg.hidden_size),
@@ -648,7 +690,21 @@ def build_policy(config: PolicyConfig):
                 vitals_feat,
                 ray_feat,
             )
-            return self.fusion(torch.cat([ray_feat, ent_feat, vitals_feat], dim=-1))
+            parts = [ray_feat, ent_feat, vitals_feat]
+            if self.ego_map_encoder is not None:
+                ego_map = obs.get("ego_map")
+                if ego_map is None:
+                    b = vitals_feat.shape[0]
+                    ego_map = torch.zeros(
+                        b,
+                        self.config.ego_map_channels,
+                        self.config.ego_map_size,
+                        self.config.ego_map_size,
+                        dtype=vitals_feat.dtype,
+                        device=vitals_feat.device,
+                    )
+                parts.append(self.ego_map_encoder(ego_map))
+            return self.fusion(torch.cat(parts, dim=-1))
 
         def _heads(self, gru_out: torch.Tensor, fused: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             feat = self.post_gru_norm(gru_out + fused) if self.config.use_gru_residual else self.post_gru_norm(gru_out)

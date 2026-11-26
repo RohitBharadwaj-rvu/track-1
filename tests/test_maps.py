@@ -144,6 +144,10 @@ def test_registry_splits_and_zero_overlap():
     assert split_hashes["train"].isdisjoint(split_hashes["final"])
     assert split_hashes["dev"].isdisjoint(split_hashes["final"])
 
+    stress_hashes = {get_definition(s.wad).blueprint_hash() for s in get_maps("stress")}
+    assert len(stress_hashes) == len(get_maps("stress")) == 10
+    assert all(stress_hashes.isdisjoint(group) for group in split_hashes.values())
+
     # Reserve seeds never overlap nominal seeds
     for spec in DEV_MAPS:
         res = get_reserve_seeds(spec, count=3)
@@ -275,9 +279,176 @@ def test_final_polygon_maps_engine_verified():
 
 
 def test_procedural_generator_all_families_engine_valid(tmp_path: Path):
-    """Verify on-the-fly procedural WAD generator produces engine-valid maps for all 4 families."""
+    """Verify on-the-fly procedural WAD generator produces engine-valid maps for all 5 families."""
     specs = generate_training_variations(tmp_path, count_per_family=1, base_seed=42)
-    assert len(specs) == 4
+    assert len(specs) == 5
     for spec in specs:
         res = verify_wad_in_engine(spec.wad, map_name=spec.map_name, episode_ticks=spec.episode_ticks)
         assert res.ok, f"Procedural map {spec.wad} failed engine verification: {res.errors}"
+
+
+def test_procedural_generator_covers_verticality_polygons_switches_and_roster(tmp_path: Path):
+    """Verify broadened procedural generation produces verticality, windows/grates, switches, polygons, and expanded roster."""
+    from doom_env.mapinfo import parse_udmf
+    from doom_env.wad import map_lumps, read_wad
+
+    specs = generate_training_variations(tmp_path, count_per_family=8, base_seed=200)
+    assert len(specs) == 40
+
+    has_stairs_or_ledge = False
+    has_non_axis = False
+    has_exit_switch = False
+    has_remote_door_switch = False
+    has_skull_key = False
+    has_window_or_grate = False
+    has_new_monster = False
+    has_new_weapon = False
+
+    engine_checked_families: set[str] = set()
+    for spec in specs:
+        if spec.family not in engine_checked_families:
+            res = verify_wad_in_engine(spec.wad, map_name=spec.map_name, episode_ticks=spec.episode_ticks, step_count=2)
+            assert res.ok, f"Procedural map {spec.wad} failed engine verification: {res.errors}"
+            engine_checked_families.add(spec.family)
+
+        b = parse_udmf(map_lumps(read_wad(spec.wad), spec.map_name)["TEXTMAP"].decode("utf-8", "replace"))
+        verts = [(float(v["x"]), float(v["y"])) for v in b.get("vertex", [])]
+        secs = b.get("sector", [])
+        if any(int(s.get("heightfloor", 0)) > 0 for s in secs):
+            has_stairs_or_ledge = True
+        if any(0 < int(s.get("heightceiling", 128)) < 56 for s in secs):
+            has_window_or_grate = True
+        for ld in b.get("linedef", []):
+            v1, v2 = verts[int(ld["v1"])], verts[int(ld["v2"])]
+            if abs(v1[0] - v2[0]) > 1e-3 and abs(v1[1] - v2[1]) > 1e-3:
+                has_non_axis = True
+            if int(ld.get("special", 0) or 0) == 243 and ld.get("playeruse"):
+                has_exit_switch = True
+            if int(ld.get("special", 0) or 0) == 12 and int(ld.get("arg0", 0) or 0) > 0:
+                has_remote_door_switch = True
+            if ld.get("twosided") and ld.get("blocking"):
+                has_window_or_grate = True
+        for th in b.get("thing", []):
+            tp = int(th["type"])
+            if tp in (38, 39, 40):
+                has_skull_key = True
+            if tp in (65, 3005, 69, 3006, 58):
+                has_new_monster = True
+            if tp in (82, 2003, 2004):
+                has_new_weapon = True
+
+    assert has_stairs_or_ledge, "Expected procedural maps with non-zero floor heights (stairs/ledges)"
+    assert has_non_axis, "Expected procedural maps with diagonal/polygonal walls"
+    assert has_exit_switch, "Expected procedural maps with wall-mounted exit switches"
+    assert has_remote_door_switch, "Expected procedural maps with remote switch-triggered doors"
+    assert has_skull_key, "Expected procedural maps with skull keys"
+    assert has_window_or_grate, "Expected procedural maps with low windows or impassable grates"
+    assert has_new_monster, "Expected procedural maps with expanded monster roster"
+    assert has_new_weapon, "Expected procedural maps with expanded weapon roster"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "exit_ahead",
+        "exit_left",
+        "exit_behind",
+        "exit_switch",
+        "key_open",
+        "key_window",
+        "junction_return",
+        "stairs_ledge",
+        "remote_door_switch",
+        "grate_combat",
+    ],
+)
+def test_stress_playthrough(name):
+    spec = next(s for s in get_maps("stress") if Path(s.wad).stem == name)
+    env = make_env(str(ROOT / spec.wad), spec.map_name, episode_ticks=spec.episode_ticks,
+                   render_buffers=False)
+    try:
+        obs, _ = env.reset(seed=0)
+        tracker = PrivilegedEventTracker()
+        tracker.reset(env.privileged_state())
+        if name.startswith("exit_"):
+            _turn_toward(env, 0)
+            if name == "exit_switch":
+                for _ in range(60):
+                    _, _, term, trunc, _ = env.step(FWD)
+                    assert not (term or trunc)
+                env.step(USE)
+            else:
+                _walk_toward(env, tracker, 432, 96)
+        elif name.startswith("key_"):
+            assert 9 in obs["visible_entities"]["entity_type"]
+            if name == "key_window":
+                assert _ray_ahead_type(obs) == 1
+                for _ in range(30):
+                    env.step(FWD)
+                assert env.privileged_state()["x"] < 192
+                for x, y in ((128, 240), (352, 240)):
+                    _walk_toward(env, tracker, x, y)
+            _walk_toward(env, tracker, 352, 80)
+            obs, *_ = env.step(NOOP)
+            assert obs["vitals"][11] == 1
+            if name == "key_window":
+                for x, y in ((352, 240), (96, 240)):
+                    _walk_toward(env, tracker, x, y)
+            _walk_toward(env, tracker, 80, 80)
+            _walk_toward(env, tracker, -220, 80)
+        elif name == "stairs_ledge":
+            # Direct east path is blocked by 48-unit cliff (RAY_WALL) while YellowSkull is visible
+            assert _ray_ahead_type(obs) == 1
+            assert 9 in obs["visible_entities"]["entity_type"]
+            for _ in range(30):
+                env.step(FWD)
+            assert env.privileged_state()["x"] < 192
+            # Climb 3-step stairs north (z rises to 48), cross upper bridge, grab YellowSkull, unlock & exit
+            for x, y in ((96, 352), (352, 352), (352, 80)):
+                _walk_toward(env, tracker, x, y)
+            obs, *_ = env.step(NOOP)
+            assert env.privileged_state()["z"] >= 47.0
+            assert obs["vitals"][12] == 1  # YellowSkull
+            _walk_toward(env, tracker, 656, 80)
+        elif name == "remote_door_switch":
+            # Remote door emits RAY_DOOR but pressing USE directly on it cannot open it
+            assert _ray_ahead_type(obs) == RAY_DOOR
+            _walk_toward(env, tracker, 232, 80, max_steps=60)
+            env.step(USE)
+            for _ in range(12):
+                env.step(FWD)
+            assert env.privileged_state()["x"] < 256
+            # Walk into north alcove, press USE on wall switch, then cross raised door to exit
+            _walk_toward(env, tracker, 128, 296, max_steps=120)
+            _turn_toward(env, 90)
+            for _ in range(10):
+                env.step(FWD)
+            env.step(USE)
+            for _ in range(10):
+                env.step(NOOP)
+            _walk_toward(env, tracker, 128, 80, max_steps=120)
+            _walk_toward(env, tracker, 528, 80, max_steps=200)
+        elif name == "grate_combat":
+            # Impassable mid-grate emits RAY_WALL while enemies remain visible in LOS
+            assert _ray_ahead_type(obs) == 1
+            ve_types = set(obs["visible_entities"]["entity_type"][obs["visible_entities"]["mask"] > 0].tolist())
+            assert ve_types & {2, 3}  # enemy_hitscan / enemy_projectile visible behind grate
+            for _ in range(35):
+                env.step(FWD)
+            assert env.privileged_state()["x"] < 256
+            # Flank through angled north corridor to exit
+            for x, y in ((160, 336), (400, 336), (480, 128), (608, 128)):
+                ev = _walk_toward(env, tracker, x, y, max_steps=160)
+                if ev["done"]:
+                    break
+        else:
+            for x in range(240, 1681, 160):
+                _walk_toward(env, tracker, x, 64)
+            _walk_toward(env, tracker, 1680, 320)
+            _walk_toward(env, tracker, 1680, 64)
+            for x in range(1520, 79, -160):
+                _walk_toward(env, tracker, x, 64)
+            _walk_toward(env, tracker, -220, 64)
+        assert env.privileged_state()["exit_reached"]
+    finally:
+        env.close()

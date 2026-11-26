@@ -59,19 +59,29 @@ THING_DOOMEDNUM: dict[str, int] = {
     "c": 65,    # ChaingunGuy (hitscan, 70 HP)
     "i": 3001,  # DoomImp (projectile, 60 HP)
     "m": 3002,  # Demon (melee, 150 HP)
+    "S": 58,    # Spectre (melee, 150 HP)
+    "l": 3006,  # LostSoul (melee, 100 HP)
     "k": 3005,  # Cacodemon (projectile, 400 HP)
+    "n": 69,    # HellKnight (projectile, 500 HP)
     # Pickups & props
     "h": 2011,  # Stimpack (+10 HP)
     "H": 2012,  # Medikit (+25 HP)
     "A": 2018,  # GreenArmor (+100 armor)
+    "M": 2019,  # BlueArmor (+200 armor)
     "a": 2048,  # ClipBox (+50 bullets)
     "e": 2049,  # ShellBox (+20 shells)
+    "o": 2046,  # RocketBox (+5 rockets)
+    "u": 2047,  # CellPack (+100 cells)
     "g": 2001,  # Shotgun
     "G": 2002,  # Chaingun
+    "W": 82,    # SuperShotgun
+    "L": 2003,  # RocketLauncher
+    "F": 2004,  # PlasmaRifle
+    "O": 2024,  # BlurSphere (Powerup -> other)
     "x": 2035,  # ExplosiveBarrel
 }
 
-MONSTER_CHARS = frozenset({"z", "s", "c", "i", "m", "k"})
+MONSTER_CHARS = frozenset({"z", "s", "c", "i", "m", "S", "l", "k", "n"})
 
 # Visual texture themes (all standard Freedoom2 / Doom2 textures)
 THEMES: dict[str, tuple[str, str, str, int]] = {
@@ -111,8 +121,9 @@ class PolygonSector:
 
     `kind` is one of:
       - "room": regular playable space (ceiling 128)
-      - "door": unlocked manual door (ceiling 0, special=12)
-      - "door_red" / "door_blue" / "door_yellow": locked door (ceiling 0, special=13)
+      - "door": unlocked manual door (ceiling starts at height_floor, special=12)
+      - "remote_door": switch-triggered door (ceiling starts at height_floor, opened via `door_switch` matching `sector_id`)
+      - "door_red" / "door_blue" / "door_yellow": locked door (ceiling starts at height_floor, special=13)
       - "exit": exit pad (ceiling 128, GATE3 floor, special=243 playercross)
     """
 
@@ -126,6 +137,14 @@ class PolygonSector:
     height_ceiling: int = 128
     light_level: int = 192
     holes: tuple[PolygonHole, ...] = field(default_factory=tuple)
+    # Exterior edge activating Exit_Normal on a USE pulse (either vertex order).
+    exit_switch: tuple[tuple[float, float], tuple[float, float]] | None = None
+    # Optional UDMF sector tag ID (used by remote switch-triggered doors).
+    sector_id: int = 0
+    # Exterior edge activating Door_Raise on `target_sector_id`: (p1, p2, target_sector_id).
+    door_switch: tuple[tuple[float, float], tuple[float, float], int] | None = None
+    # Two-sided shared edges marked impassable (sight passes through, movement/rays stop).
+    blocking_edges: tuple[tuple[tuple[float, float], tuple[float, float]], ...] = field(default_factory=tuple)
 
 
 def layout_hash(spec_text: str) -> str:
@@ -215,10 +234,11 @@ def _emit_udmf(
     for x, y in vertices:
         lines.append(f"vertex {{ x = {x:.1f}; y = {y:.1f}; }}")
     for sec in sectors:
+        id_part = f' id = {int(sec["id"])};' if int(sec.get("id", 0) or 0) != 0 else ""
         lines.append(
             f'sector {{ texturefloor = "{sec["floor"]}"; textureceiling = "{sec["ceil"]}"; '
             f'heightfloor = {int(sec["hf"])}; heightceiling = {int(sec["hc"])}; '
-            f'lightlevel = {int(sec["light"])}; }}'
+            f'lightlevel = {int(sec["light"])};{id_part} }}'
         )
     for sd in sidedefs:
         lines.append(
@@ -271,6 +291,7 @@ def build_grid_textmap(
     theme: str = "techbase",
     monster_angle: int = 180,
     extra_things: Sequence[ThingSpec] = (),
+    skull_keys: bool = False,
     door_close_delay: int = 150,
 ) -> str:
     """Compile a 2D ASCII grid into a valid ZDoom UDMF `TEXTMAP` string.
@@ -510,7 +531,10 @@ def build_grid_textmap(
                 things.append(ThingSpec(x=cx, y=cy, doomednum=1, angle=int(ang)))
             elif ch in THING_DOOMEDNUM:
                 ang = monster_angle if ch in MONSTER_CHARS else 0
-                things.append(ThingSpec(x=cx, y=cy, doomednum=THING_DOOMEDNUM[ch], angle=ang))
+                number = THING_DOOMEDNUM[ch]
+                if skull_keys and ch in KEY_CHARS:
+                    number = {"b": 40, "y": 39, "r": 38}[ch]
+                things.append(ThingSpec(x=cx, y=cy, doomednum=number, angle=ang))
     things.extend(extra_things)
 
     if player_count != 1:
@@ -573,6 +597,7 @@ def build_grid_wad(
     theme: str = "techbase",
     monster_angle: int = 180,
     extra_things: Sequence[ThingSpec] = (),
+    skull_keys: bool = False,
     door_close_delay: int = 150,
 ) -> Path:
     """Compile a 2D ASCII grid and write a complete UDMF PWAD file."""
@@ -583,6 +608,7 @@ def build_grid_wad(
         theme=theme,
         monster_angle=monster_angle,
         extra_things=extra_things,
+        skull_keys=skull_keys,
         door_close_delay=door_close_delay,
     )
     return _write_textmap_wad(path, textmap, map_name=map_name)
@@ -611,8 +637,8 @@ def build_polygon_textmap(
 
     sectors: list[dict[str, object]] = []
     for ps in poly_sectors:
-        is_door = _door_code_from_kind(ps.kind) is not None
-        hc = 0 if is_door else ps.height_ceiling
+        is_door = (_door_code_from_kind(ps.kind) is not None) or (ps.kind == "remote_door")
+        hc = ps.height_floor if is_door else ps.height_ceiling
         floor = "GATE3" if ps.kind == "exit" else ("FLAT5_4" if is_door else ps.floor_texture)
         sectors.append({
             "floor": floor,
@@ -620,6 +646,7 @@ def build_polygon_textmap(
             "hf": ps.height_floor,
             "hc": hc,
             "light": ps.light_level,
+            "id": int(ps.sector_id),
         })
 
     # Collect directed boundary edges from every polygon (normalized CW -> interior on right).
@@ -642,7 +669,8 @@ def build_polygon_textmap(
             if p1 == p2:
                 continue
             ukey = (min(p1, p2), max(p1, p2))
-            wall_tex = "DOORTRAK" if _door_code_from_kind(ps.kind) is not None else ps.wall_texture
+            is_door = (_door_code_from_kind(ps.kind) is not None) or (ps.kind == "remote_door")
+            wall_tex = "DOORTRAK" if is_door else ps.wall_texture
             edge_owners.setdefault(ukey, []).append((p1, p2, sid, wall_tex))
 
     vert_index: dict[tuple[float, float], int] = {}
@@ -660,18 +688,57 @@ def build_polygon_textmap(
     sidedefs: list[dict[str, object]] = []
     linedefs: list[dict[str, object]] = []
 
+    blocking_edge_keys: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    for sid, ps in enumerate(poly_sectors):
+        if ps.exit_switch is not None:
+            edge = tuple(sorted(_snap_pt(p) for p in ps.exit_switch))
+            owners = edge_owners.get(edge, [])
+            if len(owners) != 1 or owners[0][2] != sid:
+                raise ValueError(f"Exit switch in {ps.name} requires an exterior edge")
+        if ps.door_switch is not None:
+            sp1, sp2, target_id = ps.door_switch
+            if int(target_id) <= 0:
+                raise ValueError(f"Door switch in {ps.name} requires positive target sector_id")
+            edge = tuple(sorted((_snap_pt(sp1), _snap_pt(sp2))))
+            owners = edge_owners.get(edge, [])
+            if len(owners) != 1 or owners[0][2] != sid:
+                raise ValueError(f"Door switch in {ps.name} requires an exterior edge")
+        for bp1, bp2 in ps.blocking_edges:
+            blocking_edge_keys.add(tuple(sorted((_snap_pt(bp1), _snap_pt(bp2)))))
+
     for ukey, owners in edge_owners.items():
         if len(owners) == 1:
             p1, p2, sid, wall_tex = owners[0]
+            ps_cur = poly_sectors[sid]
+            switch = ps_cur.exit_switch
+            is_exit_switch = switch is not None and ukey == tuple(sorted(_snap_pt(p) for p in switch))
+            dswitch = ps_cur.door_switch
+            is_door_switch = (
+                dswitch is not None and ukey == tuple(sorted((_snap_pt(dswitch[0]), _snap_pt(dswitch[1]))))
+            )
+            mid_tex = "SW1EXIT" if is_exit_switch else ("SW1COMP" if is_door_switch else wall_tex)
             sd_front = len(sidedefs)
-            sidedefs.append({"sector": sid, "top": "-", "mid": wall_tex, "bot": "-"})
-            linedefs.append({
+            sidedefs.append({"sector": sid, "top": "-", "mid": mid_tex, "bot": "-"})
+            ld_dict: dict[str, object] = {
                 "v1": get_v(p1),
                 "v2": get_v(p2),
                 "front": sd_front,
                 "blocking": True,
                 "dontpegbottom": True,
-            })
+            }
+            if is_exit_switch:
+                ld_dict.update({"special": 243, "playeruse": True})
+            elif is_door_switch:
+                assert dswitch is not None
+                ld_dict.update({
+                    "special": 12,
+                    "arg0": int(dswitch[2]),
+                    "arg1": 16,
+                    "arg2": 0,  # stay open once triggered by remote switch
+                    "playeruse": True,
+                    "repeatspecial": True,
+                })
+            linedefs.append(ld_dict)
         elif len(owners) == 2:
             (p1a, p2a, sa, _), (p1b, p2b, sb, _) = owners
             if sa == sb:
@@ -727,6 +794,18 @@ def build_polygon_textmap(
                         "monsteruse": False,
                         "repeatspecial": True,
                     })
+            elif back_kind == "remote_door":
+                sd_front = len(sidedefs)
+                sidedefs.append({"sector": front_sec, "top": DOOR_TEXTURES["D"], "mid": "-", "bot": "-"})
+                sd_back = len(sidedefs)
+                sidedefs.append({"sector": back_sec, "top": "-", "mid": "-", "bot": "-"})
+                linedefs.append({
+                    "v1": v1,
+                    "v2": v2,
+                    "front": sd_front,
+                    "back": sd_back,
+                    "twosided": True,
+                })
             elif back_kind == "exit":
                 sd_front = len(sidedefs)
                 sidedefs.append({"sector": front_sec, "top": "-", "mid": "-", "bot": "-"})
@@ -742,17 +821,27 @@ def build_polygon_textmap(
                     "playercross": True,
                 })
             else:
+                is_grate = ukey in blocking_edge_keys
                 sd_front = len(sidedefs)
-                sidedefs.append({"sector": front_sec, "top": "-", "mid": "-", "bot": "-"})
-                sd_back = len(sidedefs)
-                sidedefs.append({"sector": back_sec, "top": "-", "mid": "-", "bot": "-"})
-                linedefs.append({
+                sd_back = sd_front + 1
+                for sid, opposite in ((front_sec, back_sec), (back_sec, front_sec)):
+                    room, neighbor = poly_sectors[sid], poly_sectors[opposite]
+                    sidedefs.append({
+                        "sector": sid,
+                        "mid": "MIDBARS3" if is_grate else "-",
+                        "top": neighbor.wall_texture if room.height_ceiling > neighbor.height_ceiling else "-",
+                        "bot": neighbor.wall_texture if room.height_floor < neighbor.height_floor else "-",
+                    })
+                ld_portal: dict[str, object] = {
                     "v1": v1,
                     "v2": v2,
                     "front": sd_front,
                     "back": sd_back,
                     "twosided": True,
-                })
+                }
+                if is_grate:
+                    ld_portal["blocking"] = True
+                linedefs.append(ld_portal)
         else:
             raise ValueError(f"Edge {ukey} shared by {len(owners)} polygons (max 2)")
 

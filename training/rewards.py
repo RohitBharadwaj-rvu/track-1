@@ -13,7 +13,11 @@ import numpy as np
 
 from training.interfaces import PrivilegedEventTracker, StepEvents
 
+_TURN_LEFT_IDX = 4
+_TURN_RIGHT_IDX = 5
+_ATTACK_IDX = 6
 _USE_IDX = 7
+_WEAPON_SWITCH_IDX = 8
 _ENEMY_ENTITY_TYPES = (1, 2, 3)
 
 
@@ -21,25 +25,32 @@ _ENEMY_ENTITY_TYPES = (1, 2, 3)
 class RewardConfig:
     """Hierarchical reward weights keeping exit completion dominant over exploration & combat."""
 
-    exit_reward: float = 10.0
-    efficiency_bonus: float = 2.0
+    exit_reward: float = 12.0
+    efficiency_bonus: float = 2.5
     health_efficiency_bonus: float = 1.5
-    key_pickup_reward: float = 3.0
-    locked_door_unlock_reward: float = 4.0
-    door_open_reward: float = 1.5
-    new_cell_reward: float = 0.12
+    key_pickup_reward: float = 4.0
+    locked_door_unlock_reward: float = 5.0
+    door_open_reward: float = 2.0
+    new_cell_reward: float = 0.10
     max_exploration_cells: int = 250
-    explore_decay_cells: float = 25.0
-    post_key_cell_reward: float = 0.06
-    max_post_key_cells: int = 60
-    kill_reward: float = 0.5
-    damage_penalty: float = -0.035
-    death_penalty: float = -2.5
-    door_bounce_penalty: float = -0.15
-    use_waste_penalty: float = -0.02
-    wasted_ammo_penalty: float = -0.005
-    max_pickup_bonus: float = 2.0
-    step_penalty: float = -0.002
+    explore_decay_cells: float = 60.0
+    post_key_cell_reward: float = 0.08
+    max_post_key_cells: int = 80
+    kill_reward: float = 0.8
+    damage_penalty: float = -0.032
+    death_penalty: float = -3.0
+    door_bounce_penalty: float = -0.25
+    use_waste_penalty: float = -0.008
+    use_hold_penalty: float = -0.025
+    wasted_ammo_penalty: float = -0.02
+    weapon_switch_waste_penalty: float = -0.02
+    weapon_pickup_reward: float = 0.6
+    max_pickup_bonus: float = 2.5
+    pbrs_scale: float = 3.0
+    pbrs_gamma: float = 1.0
+    spin_penalty: float = -0.010
+    spin_threshold_steps: int = 8
+    step_penalty: float = -0.005
     cell_size: float = 64.0
     open_threshold: float = 8.0
 
@@ -70,8 +81,9 @@ def _has_visible_enemy(obs: dict[str, Any] | None) -> bool:
 class RewardShaper:
     """Computes dense, bounded per-step training rewards from `env.privileged_state()`."""
 
-    def __init__(self, config: RewardConfig | None = None):
+    def __init__(self, config: RewardConfig | None = None, *, pbrs: Any = None):
         self.config = config or RewardConfig()
+        self.pbrs = pbrs
         self.tracker = PrivilegedEventTracker(
             open_threshold=self.config.open_threshold,
             cell_size=self.config.cell_size,
@@ -83,7 +95,10 @@ class RewardShaper:
         self._prev_health: float = 100.0
         self._prev_armor: float = 0.0
         self._prev_ammo: float | None = None
+        self._owned_weapons: set[int] = set()
         self._pickup_bonus_earned: float = 0.0
+        self._consec_turn_dir: int = 0
+        self._consec_turn_steps: int = 0
 
     @property
     def unique_cells_visited(self) -> int:
@@ -99,7 +114,9 @@ class RewardShaper:
             int(np.floor(float(priv_state["y"]) / self.config.cell_size)),
         )
 
-    def reset(self, priv_state: dict[str, Any], obs: dict[str, Any] | None = None) -> None:
+    def reset(self, priv_state: dict[str, Any], obs: dict[str, Any] | None = None, *, pbrs: Any = None) -> None:
+        if pbrs is not None:
+            self.pbrs = pbrs
         self.tracker.reset(priv_state)
         self._post_key_visited_cells = {self._cell(priv_state)}
         self._post_key_explore_count = 0
@@ -110,7 +127,14 @@ class RewardShaper:
         ammo, armor = _extract_ammo_and_armor(priv_state, obs)
         self._prev_armor = armor
         self._prev_ammo = ammo
+        self._owned_weapons = set()
+        if obs is not None and "vitals" in obs:
+            self._owned_weapons.add(int(round(float(obs["vitals"][2]))))
         self._pickup_bonus_earned = 0.0
+        self._consec_turn_dir = 0
+        self._consec_turn_steps = 0
+        if self.pbrs is not None:
+            self.pbrs.reset(priv_state)
 
     def step(
         self,
@@ -169,14 +193,16 @@ class RewardShaper:
         if bounced:
             use_penalty += cfg.door_bounce_penalty
         elif action is not None and prev_action is not None:
-            use_pulsed = int(action[_USE_IDX]) == 1 and int(prev_action[_USE_IDX]) == 0
             if (
-                use_pulsed
+                not events.exit_reached
                 and events.doors_opened == 0
                 and events.locked_doors_unlocked == 0
                 and not started_or_rising
             ):
-                use_penalty += cfg.use_waste_penalty
+                if int(action[_USE_IDX]) == 1 and int(prev_action[_USE_IDX]) == 0:
+                    use_penalty += cfg.use_waste_penalty
+                elif int(action[_USE_IDX]) == 1 and int(prev_action[_USE_IDX]) == 1:
+                    use_penalty += cfg.use_hold_penalty
 
         # 4. Exit + time/health efficiency
         efficiency = 0.0
@@ -187,17 +213,22 @@ class RewardShaper:
             health_frac = min(1.5, max(0.0, curr_health / 100.0))
             efficiency = cfg.efficiency_bonus * remaining_time + cfg.health_efficiency_bonus * health_frac
 
-        # 5. Combat, wasted ammo, and bounded low-health/armor pickup bonus
+        # 5. Combat, wasted ammo/action spam, and bounded low-health/armor pickup bonus
         curr_ammo, curr_armor = _extract_ammo_and_armor(priv_state, obs)
+        ammo_dropped = (
+            curr_ammo is not None and self._prev_ammo is not None and curr_ammo < self._prev_ammo
+        )
+        attack_pressed = action is not None and int(action[_ATTACK_IDX]) == 1
         ammo_waste = 0.0
-        if (
-            curr_ammo is not None
-            and self._prev_ammo is not None
-            and curr_ammo < self._prev_ammo
-            and events.kills == 0
-            and not _has_visible_enemy(obs)
-        ):
+        if (ammo_dropped or attack_pressed) and events.kills == 0 and not _has_visible_enemy(obs):
             ammo_waste = cfg.wasted_ammo_penalty
+
+        weapon_switch_penalty = 0.0
+        if action is not None and int(action[_WEAPON_SWITCH_IDX]) == 1 and obs is not None and "vitals" in obs:
+            sel_wpn = int(round(float(obs["vitals"][2])))
+            sel_ammo = float(obs["vitals"][3])
+            if sel_wpn >= 2 and sel_ammo > 0.5:
+                weapon_switch_penalty = cfg.weapon_switch_waste_penalty
 
         pickup = 0.0
         if self._pickup_bonus_earned < cfg.max_pickup_bonus:
@@ -206,9 +237,30 @@ class RewardShaper:
                 raw_pickup += 0.015 * (curr_health - self._prev_health)
             if curr_armor > self._prev_armor and self._prev_armor < 50.0:
                 raw_pickup += 0.008 * (curr_armor - self._prev_armor)
+            if obs is not None and "vitals" in obs:
+                cur_wpn = int(round(float(obs["vitals"][2])))
+                if cur_wpn >= 3 and cur_wpn not in self._owned_weapons:
+                    self._owned_weapons.add(cur_wpn)
+                    raw_pickup += cfg.weapon_pickup_reward
             if raw_pickup > 0.0:
                 pickup = min(raw_pickup, cfg.max_pickup_bonus - self._pickup_bonus_earned)
                 self._pickup_bonus_earned += pickup
+
+        pbrs_rew = self.pbrs.step(priv_state) if self.pbrs is not None else 0.0
+
+        spin_pen = 0.0
+        if action is not None:
+            td = int(action[_TURN_LEFT_IDX] > 0) - int(action[_TURN_RIGHT_IDX] > 0)
+            if td != 0 and td == self._consec_turn_dir:
+                self._consec_turn_steps += 1
+            elif td != 0:
+                self._consec_turn_dir = td
+                self._consec_turn_steps = 1
+            else:
+                self._consec_turn_dir = 0
+                self._consec_turn_steps = 0
+            if self._consec_turn_steps > cfg.spin_threshold_steps:
+                spin_pen = cfg.spin_penalty
 
         self._prev_health = curr_health
         self._prev_armor = curr_armor
@@ -228,7 +280,10 @@ class RewardShaper:
             "death": cfg.death_penalty if events.dead else 0.0,
             "use_penalty": use_penalty,
             "ammo_waste": ammo_waste,
+            "weapon_switch_penalty": weapon_switch_penalty,
             "pickup": pickup,
+            "pbrs": pbrs_rew,
+            "spin_penalty": spin_pen,
             "time": cfg.step_penalty,
         }
         return float(sum(components.values())), events, components

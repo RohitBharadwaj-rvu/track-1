@@ -73,3 +73,40 @@ def test_explicit_tier_and_family_weights_disable_auto_shift():
     assert w[2] > w[1] > w[0]
     assert sched.observe_episodes([_ep(1, exit_ok=True) for _ in range(20)]) is False
     assert sched.phase == 0
+
+
+def test_adaptive_weights_upweight_unmastered_maps_and_tier3_require_exit():
+    specs = [
+        MapSpec(wad="t3_easy.wad", family="key_return", tier=3, split="train"),
+        MapSpec(wad="t3_hard.wad", family="key_return", tier=3, split="train"),
+    ]
+    sched = CurriculumScheduler(
+        CurriculumConfig(
+            auto_curriculum=True,
+            window_size=16,
+            min_episodes_to_promote=8,
+            tier12_exit_promote_threshold=0.5,
+            tier3_progress_promote_threshold=0.5,
+            tier3_require_exit=True,
+            adaptive_weights=True,
+        )
+    )
+    sched.phase = 1
+    # Unlocking without exiting must NOT promote when tier3_require_exit=True
+    unlock_only = [
+        EpisodeMetrics(wad="t3_easy.wad", map_name="MAP01", family="key_return", tier=3, seed=0, outcome="timeout", locked_doors_unlocked=1)
+        for _ in range(8)
+    ]
+    assert sched.observe_episodes(unlock_only) is False
+
+    # Easy map exits 16/16 (flushes earlier 8 timeouts), hard map fails 0/8 -> adaptive weights strongly favor t3_hard.wad
+    mixed = [
+        EpisodeMetrics(wad="t3_easy.wad", map_name="MAP01", family="key_return", tier=3, seed=0, outcome="exit")
+        for _ in range(16)
+    ] + [
+        EpisodeMetrics(wad="t3_hard.wad", map_name="MAP01", family="key_return", tier=3, seed=0, outcome="timeout")
+        for _ in range(8)
+    ]
+    assert sched.observe_episodes(mixed) is True  # 16/24 >= 0.50 promotes to phase 2
+    w = sched.compute_map_weights(specs)
+    assert w[1] > w[0] * 3.0 and w[0] > 0.0

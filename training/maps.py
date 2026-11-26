@@ -22,10 +22,14 @@ from training.wad_gen.families import (
     FINAL_DEFINITIONS,
     TRAIN_DEFINITIONS,
     MapDefinition,
-    materialize_all_maps,
+    materialize_definition,
 )
 from training.wad_gen.procedural import generate_procedural_wad
+from training.wad_gen.stress import STRESS_DEFINITIONS
 from training.wad_gen.verify import WadVerificationResult, verify_wad_in_engine
+
+REGISTERED_DEFINITIONS = (*ALL_DEFINITIONS, *STRESS_DEFINITIONS)
+STRESS_MAPS = tuple(d.spec for d in STRESS_DEFINITIONS)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -52,7 +56,7 @@ FINAL_POLYGON_MAPS: tuple[MapSpec, ...] = tuple(
     d.spec for d in FINAL_DEFINITIONS if d.construction == "polygon"
 )
 
-_DEFINITIONS_BY_WAD: dict[str, MapDefinition] = {d.spec.wad: d for d in ALL_DEFINITIONS}
+_DEFINITIONS_BY_WAD: dict[str, MapDefinition] = {d.spec.wad: d for d in REGISTERED_DEFINITIONS}
 
 CURRICULUM_STAGES: tuple[str, ...] = (
     "connect",
@@ -72,7 +76,7 @@ def get_maps(
     families: Sequence[str] | None = None,
     stage: str | None = None,
 ) -> list[MapSpec]:
-    """Return registered `MapSpec` entries for `split` (`train`, `dev`, `final`, or `all`).
+    """Return registered `MapSpec` entries for `split` (`train`, `dev`, `final`, `stress`, or legacy `all`).
 
     Optional filters:
       - `tiers`: keep only specs with `spec.tier in tiers`.
@@ -88,6 +92,7 @@ def get_maps(
             "train": TRAIN_MAPS,
             "dev": DEV_MAPS,
             "final": FINAL_MAPS,
+            "stress": STRESS_MAPS,
             "all": ALL_MAPS,
         }
         if split not in by_split:
@@ -169,7 +174,7 @@ def generate_training_variations(
     *,
     count_per_family: int = 2,
     base_seed: int = 1000,
-    families: Sequence[str] = ("combat", "multi_room", "key_return", "gauntlet"),
+    families: Sequence[str] = ("door_exit", "combat", "multi_room", "key_return", "gauntlet"),
 ) -> list[MapSpec]:
     """Generate fresh procedural training variations on demand (not committed to git)."""
     specs: list[MapSpec] = []
@@ -188,7 +193,7 @@ def verify_all_maps(
 ) -> list[WadVerificationResult]:
     """Verify every registered WAD in real `doom_env` (freedoom2.wad, skill 3)."""
     results: list[WadVerificationResult] = []
-    for defn in ALL_DEFINITIONS:
+    for defn in REGISTERED_DEFINITIONS:
         if defn.spec.split not in splits:
             continue
         wad_path = repo_root / defn.spec.wad
@@ -205,19 +210,19 @@ def verify_all_maps(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Role 3 map registry, generator, and verifier.")
-    parser.add_argument("--generate", action="store_true", help="Regenerate all registered WADs in maps/.")
+    parser.add_argument("--generate", action="store_true", help="Regenerate all WADs for the selected split.")
     parser.add_argument("--verify", action="store_true", help="Verify all registered WADs in doom_env.")
     parser.add_argument("--list", action="store_true", help="List registered maps by split and tier.")
     parser.add_argument(
         "--split",
-        choices=("train", "dev", "final", "all"),
+        choices=("train", "dev", "final", "stress", "all"),
         default="all",
-        help="Split to list or verify.",
+        help="Split to generate, list, or verify. The legacy all suite contains Train, Dev, and Final.",
     )
     args = parser.parse_args(argv)
 
     if args.generate:
-        paths = materialize_all_maps(ROOT)
+        paths = [materialize_definition(get_definition(spec.wad), ROOT) for spec in get_maps(args.split)]
         print(f"Generated {len(paths)} verified WADs in {ROOT / 'maps'}.")
 
     if args.list or (not args.generate and not args.verify):
