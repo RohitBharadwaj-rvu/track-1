@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import shutil
 import os
 from pathlib import Path
 import time
@@ -103,6 +104,8 @@ class TrainConfig:
     export_path: str = "submission/weights/policy.pt"
     resume: str | None = None
     save_interval: int = 10
+    save_every_seconds: float = 0.0
+    max_train_seconds: float = 0.0
     log_interval: int = 1
     render_buffers: bool = False
 
@@ -414,6 +417,8 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     all_recent_episodes: list[EpisodeMetrics] = []
     last_summary: dict[str, float] = {}
     t_start = time.perf_counter()
+    last_save = t_start
+    finished_update = start_update
 
     try:
         with _make_vec_env(
@@ -578,7 +583,11 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                         flush=True,
                     )
 
-                if cfg.save_interval > 0 and update_idx % cfg.save_interval == 0:
+                finished_update = update_idx
+                now = time.perf_counter()
+                timed_save = cfg.save_every_seconds > 0 and now - last_save >= cfg.save_every_seconds
+                interval_save = cfg.save_interval > 0 and update_idx % cfg.save_interval == 0
+                if timed_save or interval_save:
                     save_training_state(
                         resume_path,
                         policy,
@@ -598,6 +607,15 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                     if cfg.export_path:
                         plain_meta = {k: (v.item() if hasattr(v, "item") else v) for k, v in record.items()}
                         save_checkpoint(cfg.export_path, policy, policy_cfg, meta=plain_meta)
+                    if timed_save:
+                        snapshots = ckpt_dir / f"update_{update_idx:07d}"
+                        snapshots.mkdir(exist_ok=True)
+                        shutil.copy2(resume_path, snapshots / "train_state.pt")
+                        if cfg.export_path:
+                            shutil.copy2(cfg.export_path, snapshots / "policy.pt")
+                        last_save += cfg.save_every_seconds
+                if cfg.max_train_seconds > 0 and time.perf_counter() - t_start >= cfg.max_train_seconds:
+                    break
 
             save_training_state(
                 resume_path,
@@ -606,7 +624,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                 trainer.optimizer,
                 ppo_cfg,
                 {
-                    "updates": start_update + target_updates,
+                    "updates": finished_update,
                     "total_decisions": total_decisions,
                     "episodes_completed": episodes_completed,
                     "curriculum_phase": scheduler.phase,
@@ -623,14 +641,14 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
         trainer.close()
 
     elapsed_s = max(1e-6, time.perf_counter() - t_start)
-    overall_sps = (target_updates * steps_per_update) / elapsed_s
+    overall_sps = ((finished_update - start_update) * steps_per_update) / elapsed_s
     return {
         "device": device,
         "arch": policy_cfg.arch,
         "num_maps": len(map_specs),
         "curriculum_phase": scheduler.phase,
         "total_decisions": total_decisions,
-        "optimizer_updates": start_update + target_updates,
+        "optimizer_updates": finished_update,
         "episodes_completed": episodes_completed,
         "elapsed_s": elapsed_s,
         "decisions_per_sec": overall_sps,
@@ -884,6 +902,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--export-path", default="submission/weights/policy.pt")
     p.add_argument("--resume", default=None)
     p.add_argument("--save-interval", type=int, default=10)
+    p.add_argument("--save-every-seconds", type=float, default=0.0,
+                   help="Archive policy and training state at the next completed PPO update")
+    p.add_argument("--max-train-seconds", type=float, default=0.0,
+                   help="Finish and export at the first completed update after this wall time")
     p.add_argument("--log-interval", type=int, default=1)
     p.add_argument("--bench-workers", default=None, help="Comma-separated worker counts, e.g. 1,4,8,12")
     p.add_argument("--verify-two-maps", action="store_true")
@@ -977,6 +999,8 @@ def main(argv: list[str] | None = None) -> None:
         export_path=args.export_path,
         resume=args.resume,
         save_interval=args.save_interval,
+        save_every_seconds=args.save_every_seconds,
+        max_train_seconds=args.max_train_seconds,
         log_interval=args.log_interval,
     )
     summary = run_training(cfg)

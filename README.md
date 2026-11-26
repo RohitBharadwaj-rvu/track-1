@@ -88,10 +88,13 @@ Generate the mixed corpus from the repository root:
 uv run python -m training.generate_corpus --count 5000 --out training/runs/corpus_5k_progression --workers 12 --engine-spotcheck 30
 ```
 
-Use `manifest.jsonl` from that directory for mixed training or `progression.jsonl` to practice the
-three multi-step dependency patterns. Both work with the trainer's `--corpus-manifest` and
-`--corpus-pool-size` options outside the connect stage. The focused maps vary wing assignment,
-distances, bends, spawn heading, and key colours across seeds.
+Run `uv run python -m training.split_corpus training/runs/corpus_5k_progression/manifest.jsonl`
+to assign maps to Train, Dev, and Eval with every difficulty band represented. Pass `train.jsonl`
+to the trainer's `--corpus-manifest`. The evaluator accepts `dev_panel.jsonl`, `dev.jsonl`, and
+`eval.jsonl` through its own `--corpus-manifest` option. The full
+[A100 CLI prompt](training/A100_PROGRESSION_PROMPT.md) includes timed checkpoints, adaptive sampling,
+and checkpoint selection. The progression maps vary wing assignment, distances, bends, spawn
+heading, and key colours across seeds.
 
 - **Two-key join.** Collect keys from two separate wings in either order. Both are needed to
   reach the switch that opens the exit wing.

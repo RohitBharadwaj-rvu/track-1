@@ -867,6 +867,8 @@ class CorpusPoolSampler:
                 if not line:
                     continue
                 rec = json.loads(line)
+                if rec.get("split", "train") != "train":
+                    raise ValueError(f"Training sampler received a held-out map in {mp}")
                 if not include_freedoom and rec.get("source") == "freedoom2_disjoint":
                     continue
                 if float(rec.get("difficulty_score", 0.0)) < float(min_difficulty):
@@ -905,7 +907,9 @@ class CorpusPoolSampler:
         if not all_idxs or k <= 0:
             return []
         picked: list[int] = []
-        while len(picked) < k:
+        eligible = {i for i in all_idxs
+                    if (self.records[i]["wad"] + ":" + self.records[i].get("map_name", "MAP01")) not in exclude}
+        while eligible and len(picked) < k:
             if not unseen:
                 unseen.extend(all_idxs)
                 perm = rng.permutation(len(unseen)) if hasattr(rng, "permutation") else None
@@ -915,8 +919,9 @@ class CorpusPoolSampler:
                     random.Random(0).shuffle(unseen)
             cand = unseen.pop()
             key = f"{self.records[cand]['wad']}:{self.records[cand].get('map_name', 'MAP01')}"
-            if key in exclude and len(all_idxs) > len(picked) + 1:
+            if cand not in eligible:
                 continue
+            eligible.remove(cand)
             exclude.add(key)
             picked.append(cand)
         return picked
@@ -971,11 +976,11 @@ class CorpusPoolSampler:
             n_high += n_std
             n_std = 0
 
-        for idx in self._pop_unseen(self._high_indices and self._unseen_high or [], self._high_indices, n_high, rng, used_keys):
+        for idx in self._pop_unseen(self._unseen_high, self._high_indices, n_high, rng, used_keys):
             s = self._to_spec(self.records[idx])
             chosen_specs.append(s)
             self._seen_counts[f"{s.wad}:{s.map_name}"] += 1
-        for idx in self._pop_unseen(self._std_indices and self._unseen_std or [], self._std_indices, n_std, rng, used_keys):
+        for idx in self._pop_unseen(self._unseen_std, self._std_indices, n_std, rng, used_keys):
             s = self._to_spec(self.records[idx])
             chosen_specs.append(s)
             self._seen_counts[f"{s.wad}:{s.map_name}"] += 1

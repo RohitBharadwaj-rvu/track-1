@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import subprocess
@@ -176,17 +177,18 @@ def _git_commit() -> str | None:
 
 def _weights_sha256() -> dict[str, str]:
     weights_dir = ROOT / "submission" / "weights"
-    if not weights_dir.is_dir():
-        return {}
+    override = os.environ.get("DOOM_AGENT_WEIGHTS")
+    weights = [Path(override).resolve()] if override else sorted(weights_dir.rglob("*"))
     hashes: dict[str, str] = {}
-    for p in sorted(weights_dir.rglob("*")):
+    for p in weights:
         if not p.is_file() or p.name == ".gitkeep":
             continue
         h = hashlib.sha256()
         with p.open("rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
-        hashes[str(p.relative_to(ROOT)).replace("\\", "/")] = h.hexdigest()
+        label = p.relative_to(ROOT) if p.is_relative_to(ROOT) else p
+        hashes[label.as_posix()] = h.hexdigest()
     return hashes
 
 
@@ -986,6 +988,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=("connect", "mvp_gate", "dev", "final", "final_ood", "train", "stress", "freedoom", "all"),
         help="Named map suite (overrides --split)",
     )
+    parser.add_argument("--corpus-manifest", type=Path, help="Evaluate a dev or eval corpus JSONL manifest")
     parser.add_argument("--map", action="append", default=None, help="wad[:map[:family[:tier[:ticks]]]]")
     parser.add_argument("--seeds", nargs="+", type=int, default=None, help="Override seed list for all maps")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
@@ -1062,7 +1065,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(cmp_result, indent=2))
         return 0
 
-    specs = resolve_maps(split=args.split, map_args=args.map, suite=args.suite)
+    if args.corpus_manifest:
+        if args.map or args.suite:
+            parser.error("--corpus-manifest cannot be combined with --map or --suite")
+        records = [json.loads(line) for line in args.corpus_manifest.read_text(encoding="utf-8").splitlines()]
+        if not records or any(record.get("split") not in ("dev", "eval") for record in records):
+            parser.error("--corpus-manifest requires a nonempty dev or eval split")
+        specs = [
+            MapSpec(record["wad"], map_name=record["map_name"], family=record["family"],
+                    tier=record["tier"], episode_ticks=record["episode_ticks"], split=record["split"])
+            for record in records
+        ]
+    else:
+        specs = resolve_maps(split=args.split, map_args=args.map, suite=args.suite)
     seeds_override = tuple(args.seeds) if args.seeds is not None else None
     if args.compare_determinism:
         stoch = evaluate_suite(
