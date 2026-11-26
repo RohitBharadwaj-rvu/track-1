@@ -150,6 +150,226 @@ def _grate_combat():
     )
 
 
+def _nukage_hazard():
+    """Damaging nukage pool (sector_special=71) with RadSuit before crossing to east exit."""
+    sectors = (
+        PolygonSector(
+            "spawn_bank",
+            ((0, 0), (0, 256), (192, 256), (192, 192), (192, 64), (192, 0)),
+            wall_texture="STARTAN2",
+        ),
+        _rect(
+            "nukage_pool",
+            192,
+            64,
+            448,
+            192,
+            wall_texture="BROWN1",
+            floor_texture="NUKAGE1",
+            height_floor=-8,
+            sector_special=71,
+        ),
+        _rect("dry_north_flank", 192, 192, 448, 256, wall_texture="METAL1", floor_texture="FLOOR5_1"),
+        _rect("dry_south_flank", 192, 0, 448, 64, wall_texture="METAL1", floor_texture="FLOOR5_1"),
+        PolygonSector(
+            "east_bank",
+            ((448, 0), (448, 64), (448, 192), (448, 256), (640, 256), (640, 0)),
+            wall_texture="STONE2",
+        ),
+        _rect("exit", 640, 64, 704, 192, kind="exit"),
+    )
+    # Add vertices (640, 64) and (640, 192) on east_bank so exit stitches 1:1
+    sectors = (
+        sectors[0],
+        sectors[1],
+        sectors[2],
+        sectors[3],
+        PolygonSector(
+            "east_bank",
+            ((448, 0), (448, 64), (448, 192), (448, 256), (640, 256), (640, 192), (640, 64), (640, 0)),
+            wall_texture="STONE2",
+        ),
+        sectors[5],
+    )
+    things = (
+        ThingSpec(80, 128, 1, 0),     # Player facing nukage + east exit
+        ThingSpec(144, 128, 2025, 0), # RadSuit right before nukage
+        ThingSpec(544, 128, 3001, 180),
+    )
+    return MapDefinition(
+        MapSpec("maps/stress/nukage_hazard.wad", family="multi_room", tier=2, split="stress", episode_ticks=2100),
+        "polygon",
+        "Damaging nukage pool (special=71) with RadSuit and narrow dry flanking catwalks.",
+        poly_sectors=sectors,
+        poly_things=things,
+    )
+
+
+def _dropoff_return():
+    """Climb East 16u stairs to RedCard on +64u cliff, then take one-way 64u drop-off back to courtyard."""
+    sectors = (
+        PolygonSector(
+            "courtyard",
+            ((0, 0), (0, 256), (320, 256), (320, 192), (320, 64), (320, 0)),
+            wall_texture="STONE2",
+            height_ceiling=192,
+        ),
+        _rect("step1", 320, 0, 384, 64, height_floor=16, height_ceiling=192, wall_texture="STEP1"),
+        _rect("step2", 384, 0, 448, 64, height_floor=32, height_ceiling=192, wall_texture="STEP1"),
+        _rect("step3", 448, 0, 512, 64, height_floor=48, height_ceiling=192, wall_texture="STEP1"),
+        PolygonSector(
+            "high_ledge",
+            ((320, 64), (320, 192), (512, 192), (512, 64), (448, 64)),
+            height_floor=64,
+            height_ceiling=192,
+            wall_texture="BRICK1",
+            floor_texture="FLOOR7_1",
+        ),
+        _rect("red_door", -48, 64, 0, 192, kind="door_red", height_ceiling=192),
+        _rect("vestibule", -176, 64, -48, 192, height_ceiling=192),
+        _rect("exit", -240, 64, -176, 192, kind="exit", height_ceiling=192),
+    )
+    # Match (0, 64), (0, 192) on courtyard left wall and (320, 64)-(512, 64) on high_ledge cleanly
+    sectors = (
+        PolygonSector(
+            "courtyard",
+            ((0, 0), (0, 64), (0, 192), (0, 256), (320, 256), (320, 192), (320, 64), (320, 0)),
+            wall_texture="STONE2",
+            height_ceiling=192,
+        ),
+        sectors[1],
+        sectors[2],
+        sectors[3],
+        _rect("step4_top", 448, 64, 512, 192, height_floor=64, height_ceiling=192, wall_texture="BRICK1"),
+        _rect("high_ledge", 320, 64, 448, 192, height_floor=64, height_ceiling=192, wall_texture="BRICK1", floor_texture="FLOOR7_1"),
+        sectors[5],
+        sectors[6],
+        sectors[7],
+    )
+    things = (
+        ThingSpec(160, 128, 1, 0),    # Player facing east toward high_ledge dropoff
+        ThingSpec(240, 128, 2001, 0), # Shotgun on courtyard
+        ThingSpec(200, 64, 2012, 0),  # Medikit
+        ThingSpec(384, 128, 13, 0),   # RedCard on high_ledge (+64u cliff directly above courtyard)
+        ThingSpec(432, 168, 3004, 180),
+        ThingSpec(-112, 160, 9, 0),
+    )
+    return _probe(
+        "dropoff_return",
+        "Climb stairs to +64u high ledge for RedCard, then take one-way 64u drop-off back to RedDoor.",
+        sectors,
+        things,
+        locked=True,
+    )
+
+
+def _open_arena_horde():
+    """Wide 1280x1280 open arena (>1024u -> RAY_NONE) with dense 8-enemy Tier 4 combat horde."""
+    sectors = (
+        _rect(
+            "arena",
+            0,
+            0,
+            1280,
+            1280,
+            wall_texture="BRICK1",
+            floor_texture="FLOOR7_1",
+            height_ceiling=192,
+        ),
+        _rect("exit", 1280, 576, 1344, 704, kind="exit", height_ceiling=192),
+    )
+    sectors = (
+        PolygonSector(
+            "arena",
+            ((0, 0), (0, 1280), (1280, 1280), (1280, 704), (1280, 576), (1280, 0)),
+            wall_texture="BRICK1",
+            floor_texture="FLOOR7_1",
+            height_ceiling=192,
+        ),
+        sectors[1],
+    )
+    things = (
+        ThingSpec(160, 640, 1, 0),
+        ThingSpec(256, 512, 82, 0),     # SuperShotgun
+        ThingSpec(256, 768, 2004, 0),   # PlasmaRifle
+        ThingSpec(256, 640, 17, 0),     # CellPack
+        ThingSpec(160, 448, 2018, 0),   # GreenArmor
+        ThingSpec(384, 640, 2012, 0),   # Medikit
+        ThingSpec(640, 320, 3004, 180),
+        ThingSpec(640, 960, 9, 180),
+        ThingSpec(768, 640, 65, 180),
+        ThingSpec(896, 448, 3005, 180), # Cacodemon
+        ThingSpec(896, 832, 69, 180),   # HellKnight
+        ThingSpec(1024, 384, 68, 180),  # Arachnotron
+        ThingSpec(1024, 896, 66, 180),  # Revenant
+        ThingSpec(1152, 640, 3001, 180),
+    )
+    return MapDefinition(
+        MapSpec("maps/stress/open_arena_horde.wad", family="gauntlet", tier=4, split="stress", episode_ticks=4200),
+        "polygon",
+        "Wide 1280x1280 open arena (>1024u rays -> RAY_NONE) with 8 diverse Tier 4 enemies.",
+        poly_sectors=sectors,
+        poly_things=things,
+    )
+
+
+def _three_lock_citadel():
+    """Tier 4 three-lock citadel (Red -> Blue -> Yellow) with hub & combat."""
+    sectors = (
+        PolygonSector(
+            "hub",
+            ((256, 256), (256, 320), (256, 448), (256, 512), (320, 512), (448, 512), (512, 512), (512, 448), (512, 320), (512, 256), (448, 256), (320, 256)),
+            wall_texture="STONE2",
+            height_ceiling=160,
+        ),
+        _rect("west_wing", 0, 256, 256, 512, wall_texture="STARTAN2", height_ceiling=160),
+        _rect("red_door", 512, 320, 576, 448, kind="door_red", height_ceiling=160),
+        _rect("east_wing", 576, 256, 832, 512, wall_texture="METAL1", height_ceiling=160),
+        _rect("blue_door", 320, 512, 448, 576, kind="door_blue", height_ceiling=160),
+        _rect("north_wing", 256, 576, 512, 832, wall_texture="BRICK1", height_ceiling=160),
+        _rect("yellow_door", 320, 192, 448, 256, kind="door_yellow", height_ceiling=160),
+        _rect("south_sanctum", 256, 64, 512, 192, wall_texture="GRAY1", height_ceiling=160),
+        _rect("exit", 320, 0, 448, 64, kind="exit", height_ceiling=160),
+    )
+    # Fix shared door edges strictly on west_wing/east_wing/north_wing/south_sanctum:
+    sectors = (
+        sectors[0],
+        PolygonSector("west_wing", ((0, 256), (0, 512), (256, 512), (256, 448), (256, 320), (256, 256)), wall_texture="STARTAN2", height_ceiling=160),
+        sectors[2],
+        PolygonSector("east_wing", ((576, 256), (576, 320), (576, 448), (576, 512), (832, 512), (832, 256)), wall_texture="METAL1", height_ceiling=160),
+        sectors[4],
+        PolygonSector("north_wing", ((256, 576), (256, 832), (512, 832), (512, 576), (448, 576), (320, 576)), wall_texture="BRICK1", height_ceiling=160),
+        sectors[6],
+        PolygonSector("south_sanctum", ((256, 64), (256, 192), (320, 192), (448, 192), (512, 192), (512, 64), (448, 64), (320, 64)), wall_texture="GRAY1", height_ceiling=160),
+        sectors[8],
+    )
+    things = (
+        ThingSpec(384, 384, 1, 180),     # Facing West toward RedCard wing
+        ThingSpec(384, 448, 82, 0),      # SuperShotgun
+        ThingSpec(448, 448, 2049, 0),    # ShellBox
+        ThingSpec(384, 320, 2019, 0),    # BlueArmor
+        ThingSpec(320, 320, 2012, 0),    # Medikit
+        ThingSpec(96, 384, 13, 0),       # RedCard in West
+        ThingSpec(736, 384, 5, 0),       # BlueCard in East
+        ThingSpec(640, 320, 2004, 0),    # PlasmaRifle
+        ThingSpec(704, 320, 17, 0),      # CellPack
+        ThingSpec(384, 736, 6, 0),       # YellowCard in North
+        ThingSpec(320, 704, 2012, 0),    # Medikit
+        ThingSpec(160, 320, 9, 0),
+        ThingSpec(672, 448, 3002, 180),
+        ThingSpec(448, 672, 66, 270),    # Revenant
+        ThingSpec(448, 128, 3003, 90),   # BaronOfHell
+    )
+    return MapDefinition(
+        MapSpec("maps/stress/three_lock_citadel.wad", family="gauntlet", tier=4, split="stress", episode_ticks=4200),
+        "polygon",
+        "Tier 4 three-lock citadel requiring Red -> Blue -> Yellow progression and Baron/Revenant combat.",
+        poly_sectors=sectors,
+        poly_things=things,
+        min_locked_doors=3,
+    )
+
+
 STRESS_DEFINITIONS = (
     *_exit_probes(),
     _key_window(False),
@@ -158,4 +378,8 @@ STRESS_DEFINITIONS = (
     _stairs_ledge(),
     _remote_door_switch(),
     _grate_combat(),
+    _nukage_hazard(),
+    _dropoff_return(),
+    _open_arena_horde(),
+    _three_lock_citadel(),
 )

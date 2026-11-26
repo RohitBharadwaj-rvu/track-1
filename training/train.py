@@ -41,8 +41,9 @@ class TrainConfig:
     eval_deterministic: bool = False
     split: str = "train"
     stage: str | None = None
-    procedural_per_family: int = 2
+    procedural_per_family: int = 4
     procedural_dir: str | None = None
+    procedural_refresh_updates: int = 20
     tier_weights: dict[int, float] | None = None
     auto_curriculum: bool = True
     adaptive_weights: bool = True
@@ -55,7 +56,7 @@ class TrainConfig:
     maps: tuple[str, ...] = ()
     num_envs: int = 4
     vec_mode: str = "subproc"  # "subproc" | "sync"
-    max_cached_envs: int = 24
+    max_cached_envs: int = 48
     rollout_steps: int = 256
     chunk_len: int = 64
     num_minibatches: int = 4
@@ -350,6 +351,26 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                     if promoted:
                         print(f"[curriculum] Promoted to phase {scheduler.phase} (tier weights={scheduler.current_tier_weights()})", flush=True)
 
+                if (
+                    cfg.procedural_refresh_updates > 0
+                    and cfg.procedural_per_family > 0
+                    and not cfg.maps
+                    and cfg.stage != "connect"
+                    and (local_idx + 1) < target_updates
+                    and update_idx % cfg.procedural_refresh_updates == 0
+                ):
+                    refresh_seed = cfg.seed + 1000 + update_idx * 97
+                    map_specs = resolve_train_maps(
+                        None,
+                        split=cfg.split,
+                        stage=cfg.stage,
+                        procedural_per_family=cfg.procedural_per_family,
+                        procedural_dir=proc_dir,
+                        procedural_seed=refresh_seed,
+                    )
+                    refreshed_weights = scheduler.compute_map_weights(map_specs)
+                    vec_env.set_map_specs(map_specs, refreshed_weights)
+
                 total_decisions += steps_per_update
                 episodes_completed += len(ep_list)
                 all_recent_episodes.extend(ep_list)
@@ -633,8 +654,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--map", dest="maps", action="append", default=[])
     p.add_argument("--split", default="train")
     p.add_argument("--stage", default=None)
-    p.add_argument("--procedural-per-family", type=int, default=2)
+    p.add_argument("--procedural-per-family", type=int, default=4)
     p.add_argument("--procedural-dir", default=None)
+    p.add_argument("--procedural-refresh-updates", type=int, default=20)
     p.add_argument("--tier-weights", default=None, help="Comma-separated tier:weight, e.g. 1:0.4,2:0.3,3:0.2,4:0.1")
     p.add_argument("--auto-curriculum", dest="auto_curriculum", action="store_true", default=True)
     p.add_argument("--no-auto-curriculum", dest="auto_curriculum", action="store_false")
@@ -651,7 +673,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pbrs-scale", type=float, default=3.0)
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--vec-mode", choices=("subproc", "sync"), default="subproc")
-    p.add_argument("--max-cached-envs", type=int, default=24)
+    p.add_argument("--max-cached-envs", type=int, default=48)
     p.add_argument("--rollout-steps", type=int, default=256)
     p.add_argument("--chunk-len", type=int, default=64)
     p.add_argument("--num-minibatches", type=int, default=4)
@@ -723,6 +745,7 @@ def main(argv: list[str] | None = None) -> None:
         stage=args.stage,
         procedural_per_family=args.procedural_per_family,
         procedural_dir=args.procedural_dir,
+        procedural_refresh_updates=args.procedural_refresh_updates,
         tier_weights=_parse_tier_weights(args.tier_weights),
         auto_curriculum=args.auto_curriculum,
         adaptive_weights=args.adaptive_weights,

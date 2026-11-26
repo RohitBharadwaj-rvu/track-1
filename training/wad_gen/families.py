@@ -64,9 +64,12 @@ class MapDefinition:
             if ps.height_floor != 0 or ps.height_ceiling != 128 or ps.exit_switch is not None
         )
         parts.extend(
-            f"{ps.name}:id={ps.sector_id}:dsw={ps.door_switch}:blk={ps.blocking_edges}"
+            f"{ps.name}:id={ps.sector_id}:sp={ps.sector_special}:dsw={ps.door_switch}:blk={ps.blocking_edges}"
             for ps in self.poly_sectors
-            if ps.sector_id != 0 or ps.door_switch is not None or ps.blocking_edges
+            if ps.sector_id != 0
+            or ps.sector_special != 0
+            or ps.door_switch is not None
+            or ps.blocking_edges
         )
         tparts = [f"{t.doomednum}@{t.x},{t.y},{t.angle}" for t in self.poly_things]
         return layout_hash("poly\n" + "\n".join(parts) + "\n" + "\n".join(tparts))

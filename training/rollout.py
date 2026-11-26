@@ -222,6 +222,25 @@ class _DoomWorkerSlot:
     def set_map_weights(self, weights: Sequence[float]) -> None:
         self.map_probs = _normalize_weights(weights, len(self.map_specs))
 
+    def set_map_specs(
+        self,
+        map_specs: list[MapSpec],
+        weights: Sequence[float] | None = None,
+    ) -> None:
+        if not map_specs:
+            raise ValueError("map_specs must not be empty")
+        self.map_specs = list(map_specs)
+        self.map_probs = _normalize_weights(weights, len(self.map_specs))
+        live_wads = {_resolve_wad_path(s.wad) for s in self.map_specs}
+        for pk in [k for k in self._pbrs_cache if k[0] not in live_wads]:
+            del self._pbrs_cache[pk]
+        for ek in [k for k, env in self._envs.items() if k[0] not in live_wads and env is not self._active_env]:
+            evicted = self._envs.pop(ek)
+            try:
+                evicted.close()
+            except Exception:
+                pass
+
     def _get_or_create_env(self, spec: MapSpec):
         wad_path = _resolve_wad_path(spec.wad)
         key = (wad_path, spec.map_name.upper(), int(spec.episode_ticks))
@@ -464,6 +483,14 @@ class SyncVecDoomEnv:
         for slot in self.slots:
             slot.set_map_weights(weights)
 
+    def set_map_specs(
+        self,
+        map_specs: list[MapSpec],
+        weights: Sequence[float] | None = None,
+    ) -> None:
+        for slot in self.slots:
+            slot.set_map_specs(map_specs, weights)
+
     def get_privileged_batch(self) -> tuple[np.ndarray, np.ndarray]:
         return self._last_priv_batch.copy(), self._last_aux_batch.copy()
 
@@ -541,6 +568,9 @@ def _worker_loop(
                 conn.send(slot.step(data))
             elif cmd == "set_weights":
                 slot.set_map_weights(data)
+            elif cmd == "set_map_specs":
+                new_specs, new_weights = data
+                slot.set_map_specs(new_specs, new_weights)
             elif cmd == "close":
                 slot.close()
                 conn.send(None)
@@ -603,6 +633,15 @@ class SubprocVecDoomEnv:
         w = list(weights)
         for conn in self._parent_conns:
             conn.send(("set_weights", w))
+
+    def set_map_specs(
+        self,
+        map_specs: list[MapSpec],
+        weights: Sequence[float] | None = None,
+    ) -> None:
+        payload = (list(map_specs), None if weights is None else list(weights))
+        for conn in self._parent_conns:
+            conn.send(("set_map_specs", payload))
 
     def get_privileged_batch(self) -> tuple[np.ndarray, np.ndarray]:
         return self._last_priv_batch.copy(), self._last_aux_batch.copy()

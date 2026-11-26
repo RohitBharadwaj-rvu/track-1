@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from doom_env import spaces as S
 from doom_env.sensors import RAY_DOOR, RAY_LOCKED
@@ -308,3 +309,25 @@ def test_wasted_attack_diagnostics_and_eval_mode():
     assert report["metadata"]["eval_mode_applied"] is True
     codes = {d["code"] for d in report["diagnosis"]}
     assert "wasted_ammo" in codes
+
+
+def test_resolve_final_ood_and_freedoom_suites_and_summary_metrics():
+    from training.eval import summarize_episodes
+    from training.interfaces import EpisodeMetrics
+
+    ood_specs = resolve_maps(suite="final_ood")
+    assert len(ood_specs) == 8
+    assert {s.tier for s in ood_specs} == {1, 2, 3, 4}
+
+    fd_specs = resolve_maps(suite="freedoom")
+    assert len(fd_specs) == 8
+    assert [s.map_name for s in fd_specs] == [f"MAP{i:02d}" for i in range(1, 9)]
+
+    eps = [
+        EpisodeMetrics(wad="a.wad", map_name="MAP01", family="combat", tier=1, seed=0, outcome="exit"),
+        EpisodeMetrics(wad="b.wad", map_name="MAP01", family="gauntlet", tier=4, seed=0, outcome="timeout"),
+    ]
+    overall = summarize_episodes(eps)["overall"]
+    assert overall["exit_rate_se"] == pytest.approx(0.3536, abs=1e-3)
+    # 0.25 * T12(1.0) + 0.75 * T34(0.0) = 0.25
+    assert overall["proxy_leaderboard_score"] == pytest.approx(0.25, abs=1e-4)

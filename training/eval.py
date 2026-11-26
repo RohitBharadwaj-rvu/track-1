@@ -96,12 +96,16 @@ def resolve_maps(
         return [
             MapSpec("vizdoom/freedoom2.wad", map_name=f"MAP{i:02d}", family="freedoom", tier=4,
                     split="stress", episode_ticks=4200)
-            for i in range(1, 5)
+            for i in range(1, 9)
         ]
     if target == "stress":
         from training.maps import STRESS_MAPS
 
         return list(STRESS_MAPS)
+    if target == "final_ood":
+        from training.maps import FINAL_OOD_MAPS
+
+        return list(FINAL_OOD_MAPS)
 
     try:
         maps_mod = importlib.import_module("training.maps")
@@ -364,6 +368,7 @@ def _aggregate_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
             "timeouts": 0,
             "errors": 0,
             "exit_rate": 0.0,
+            "exit_rate_se": 0.0,
             "keys_picked_up": 0,
             "doors_opened": 0,
             "locked_doors_unlocked": 0,
@@ -390,13 +395,17 @@ def _aggregate_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
         1 for e in episodes if e.locked_doors_unlocked > 0 and e.outcome == "exit"
     )
     deaths_after_pickup = sum(1 for e in episodes if bool(e.extra.get("died_after_pickup", False)))
+    exits = sum(1 for e in episodes if e.outcome == "exit")
+    p_exit = exits / n
+    exit_se = math.sqrt(p_exit * (1.0 - p_exit) / n)
     return {
         "episodes": n,
-        "exits": sum(1 for e in episodes if e.outcome == "exit"),
+        "exits": exits,
         "deaths": sum(1 for e in episodes if e.outcome == "death"),
         "timeouts": sum(1 for e in episodes if e.outcome == "timeout"),
         "errors": sum(1 for e in episodes if e.outcome == "error"),
-        "exit_rate": round(sum(1 for e in episodes if e.outcome == "exit") / n, 4),
+        "exit_rate": round(p_exit, 4),
+        "exit_rate_se": round(exit_se, 4),
         "keys_picked_up": sum(e.keys_picked_up for e in episodes),
         "doors_opened": sum(e.doors_opened for e in episodes),
         "locked_doors_unlocked": sum(e.locked_doors_unlocked for e in episodes),
@@ -435,8 +444,21 @@ def summarize_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
     for family in sorted({e.family for e in episodes}):
         by_family[family] = _aggregate_episodes([e for e in episodes if e.family == family])
 
-    overall["tier12_exits"] = sum(1 for e in episodes if e.tier in (1, 2) and e.outcome == "exit")
-    overall["tier34_exits"] = sum(1 for e in episodes if e.tier in (3, 4) and e.outcome == "exit")
+    t12 = [e for e in episodes if e.tier in (1, 2)]
+    t34 = [e for e in episodes if e.tier in (3, 4)]
+    overall["tier12_exits"] = sum(1 for e in t12 if e.outcome == "exit")
+    overall["tier34_exits"] = sum(1 for e in t34 if e.outcome == "exit")
+    r12 = overall["tier12_exits"] / len(t12) if t12 else None
+    r34 = overall["tier34_exits"] / len(t34) if t34 else None
+    if r12 is not None and r34 is not None:
+        proxy = 0.25 * r12 + 0.75 * r34
+    elif r34 is not None:
+        proxy = r34
+    elif r12 is not None:
+        proxy = r12
+    else:
+        proxy = float(overall["exit_rate"])
+    overall["proxy_leaderboard_score"] = round(proxy, 4)
     return {"overall": overall, "by_tier": by_tier, "by_family": by_family}
 
 
@@ -851,7 +873,7 @@ def format_report_markdown(report: dict[str, Any]) -> str:
     lines = [
         f"## Evaluation Summary ({meta.get('git_commit') or 'uncommitted'})",
         f"- Agent: `{meta['agent_spec']}` | Device: `{meta['device']}` | Eval mode: `{meta.get('eval_mode', 'default')}` | Init: `{meta['init_time_s']}s` | Wall: `{meta['wall_time_s']}s`",
-        f"- Episodes: `{overall['episodes']}` | Exits: `{overall['exits']}` | Deaths: `{overall['deaths']}` | Timeouts: `{overall['timeouts']}` | Errors: `{overall['errors']}`",
+        f"- Episodes: `{overall['episodes']}` | Exits: `{overall['exits']}` (`{overall['exit_rate']:.1%}` +- `{overall.get('exit_rate_se', 0.0):.1%}`) | Proxy score: `{overall.get('proxy_leaderboard_score', overall['exit_rate']):.4f}` | Deaths: `{overall['deaths']}` | Timeouts: `{overall['timeouts']}` | Errors: `{overall['errors']}`",
         f"- Progression: Keys `{overall['keys_picked_up']}` | Doors `{overall['doors_opened']}` | Unlocks `{overall['locked_doors_unlocked']}` | Kills `{overall['kills']}` | Mean cells `{overall['mean_unique_cells']}`",
         f"- Funnel & Actions: `unlock|pickup={unlock_str}` | `exit|unlock={exit_u_str}` | Deaths after pickup `{overall.get('deaths_after_pickup', 0)}` | Opposing steps `{overall.get('opposing_button_steps', 0)}/{overall.get('total_steps', 0)}` | Consecutive USE `{overall.get('consecutive_use_presses', 0)}` | Wasted attacks `{overall.get('wasted_attack_steps', 0)}/{overall.get('attack_steps', 0)}`",
         f"- Compute: Total agent `{overall['total_agent_time_s']}s` | Max step `{overall['max_step_ms']} ms` | Within budget: `{overall['all_within_budget']}`",
@@ -903,11 +925,11 @@ def format_report_markdown(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Role 4 independent DoomAgent evaluator.")
-    parser.add_argument("--split", default="dev", choices=("train", "dev", "final", "stress", "all"))
+    parser.add_argument("--split", default="dev", choices=("train", "dev", "final", "final_ood", "stress", "all"))
     parser.add_argument(
         "--suite",
         default=None,
-        choices=("connect", "mvp_gate", "dev", "final", "train", "stress", "freedoom", "all"),
+        choices=("connect", "mvp_gate", "dev", "final", "final_ood", "train", "stress", "freedoom", "all"),
         help="Named map suite (overrides --split)",
     )
     parser.add_argument("--map", action="append", default=None, help="wad[:map[:family[:tier[:ticks]]]]")

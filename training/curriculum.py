@@ -51,21 +51,29 @@ class CurriculumScheduler:
         tier_w = self.current_tier_weights()
         fam_w = self.config.family_weights or {}
 
-        # Count how many maps fall into each tier so tier budget splits fairly per tier.
-        tier_counts: dict[int, int] = {}
-        for spec in map_specs:
-            tier_counts[spec.tier] = tier_counts.get(spec.tier, 0) + 1
-
-        raw = []
-        for spec in map_specs:
-            tw = float(tier_w.get(spec.tier, 1.0)) / float(max(1, tier_counts[spec.tier]))
+        # Normalize (fw * aw) within each tier so each tier preserves its exact target budget.
+        tier_indices: dict[int, list[int]] = {}
+        inner_weights: list[float] = []
+        for idx, spec in enumerate(map_specs):
+            tier_indices.setdefault(spec.tier, []).append(idx)
             fw = float(fam_w.get(spec.family, 1.0))
-            aw = 1.0
-            if self.config.adaptive_weights and spec.wad in self._map_exits and len(self._map_exits[spec.wad]) > 0:
+            if not self.config.adaptive_weights:
+                aw = 1.0
+            elif spec.wad in self._map_exits and len(self._map_exits[spec.wad]) > 0:
                 hist = self._map_exits[spec.wad]
                 exit_rate = sum(hist) / len(hist)
                 aw = max(self.config.adaptive_floor, 1.0 - exit_rate + self.config.adaptive_floor)
-            raw.append(max(1e-6, tw * fw * aw))
+            else:
+                # Optimistic exploration weight for newly refreshed / unseen maps.
+                aw = 1.0 + self.config.adaptive_floor
+            inner_weights.append(max(1e-6, fw * aw))
+
+        raw = [0.0] * len(map_specs)
+        for tier, idxs in tier_indices.items():
+            tb = max(0.0, float(tier_w.get(tier, 1.0)))
+            inner_sum = sum(inner_weights[i] for i in idxs)
+            for i in idxs:
+                raw[i] = max(1e-8, tb * (inner_weights[i] / inner_sum))
 
         total = float(sum(raw))
         return [w / total for w in raw]

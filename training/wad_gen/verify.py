@@ -30,7 +30,7 @@ from training.wad_gen.udmf import (
     PolygonSector,
     ThingSpec,
     _door_code_from_kind,
-    _parse_grid,
+    _parse_grid_with_offset,
     _signed_area,
     _snap_pt,
 )
@@ -66,13 +66,37 @@ class WadVerificationResult:
     errors: tuple[str, ...] = ()
 
 
-def verify_grid_solvability(grid: str) -> GridVerificationResult:
+def verify_grid_solvability(
+    grid: str,
+    *,
+    floor_heights: dict[tuple[int, int], int] | None = None,
+    ceiling_heights: dict[tuple[int, int], int] | None = None,
+) -> GridVerificationResult:
     """Verify via progression-aware graph search that a grid map has no soft-locks.
 
     (Offline map verification only — never imported or used by `submission/`.)
     """
-    rows = _parse_grid(grid)
+    rows, pad_off = _parse_grid_with_offset(grid)
     h, w = len(rows), len(rows[0])
+    fh_map = floor_heights or {}
+    ch_map = ceiling_heights or {}
+    has_height_override = floor_heights is not None or ceiling_heights is not None
+
+    def _cell_hf_hc(r: int, c: int) -> tuple[int, int]:
+        ch = rows[r][c]
+        ok = (r - pad_off, c - pad_off)
+        hc = int(ch_map.get(ok, 128))
+        if ch in DOOR_CHARS and ok not in fh_map:
+            nbr = [
+                int(fh_map.get((nr - pad_off, nc - pad_off), 0))
+                for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1))
+                if 0 <= nr < h and 0 <= nc < w and rows[nr][nc] != "#"
+            ]
+            hf = min(nbr) if nbr else 0
+        else:
+            hf = int(fh_map.get(ok, 0))
+        return hf, hc
+
     errors: list[str] = []
 
     spawns: list[tuple[int, int]] = []
@@ -173,6 +197,13 @@ def verify_grid_solvability(grid: str) -> GridVerificationResult:
                     continue
                 if nch in LOCKED_DOOR_CHARS and _LOCK_TO_KEY[nch] not in held_keys:
                     continue
+                if has_height_override:
+                    cur_hf, cur_hc = _cell_hf_hc(cr, cc)
+                    nxt_hf, nxt_hc = _cell_hf_hc(nr, nc)
+                    if nxt_hf - cur_hf > MAX_STEP_UP:
+                        continue
+                    if min(cur_hc, nxt_hc) - max(cur_hf, nxt_hf) < PLAYER_HEIGHT:
+                        continue
                 reachable.add((nr, nc))
                 q.append((nr, nc))
 
@@ -241,9 +272,11 @@ def verify_polygon_solvability(
             a, b = owners
             first, second = poly_sectors[a], poly_sectors[b]
             opening = min(first.height_ceiling, second.height_ceiling) - max(first.height_floor, second.height_floor)
-            if opening >= PLAYER_HEIGHT and abs(first.height_floor - second.height_floor) <= MAX_STEP_UP:
-                adj[a].add(b)
-                adj[b].add(a)
+            if opening >= PLAYER_HEIGHT:
+                if second.height_floor - first.height_floor <= MAX_STEP_UP:
+                    adj[a].add(b)
+                if first.height_floor - second.height_floor <= MAX_STEP_UP:
+                    adj[b].add(a)
 
     def locate_sector(pt: tuple[float, float]) -> int | None:
         for sid, ps in enumerate(poly_sectors):

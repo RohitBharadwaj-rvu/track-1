@@ -80,24 +80,30 @@ One NVIDIA **RTX 3090 (24 GB)** shared between evaluation workers. Each agent ge
 | [docs/EVALUATION.md](docs/EVALUATION.md) | Map tiers, scoring categories, timeouts, replays |
 | [track_1_strategy_telemetry_world_model.md](track_1_strategy_telemetry_world_model.md) | Our Track 1 strategy & implementation plan |
 
-## Navigation stress evaluation
+## Navigation stress, OOD & Freedoom evaluation
 
-Run the submission checkpoint on the ten held-out navigation/combat stress maps or on bundled
-Freedoom2 MAP01 through MAP04. Run each suite separately so its scores can be compared across checkpoints.
+Run the submission checkpoint on the 14 held-out navigation/combat stress probes, the 8 untouched
+out-of-distribution `final_ood` test maps, or bundled Freedoom2 MAP01 through MAP08. Run each suite
+separately so its scores can be compared across checkpoints.
 
 ```shell
 uv run python -m training.eval --suite stress --seeds 0 1 2 --out eval_stress.json
+uv run python -m training.eval --suite final_ood --seeds 0 1 --out eval_final_ood.json
 uv run python -m training.eval --suite freedoom --seeds 0 --out eval_freedoom.json
 uv run python -m training.maps --split stress --generate --verify
+uv run python -m training.maps --split final_ood --generate --verify
+uv run python -m training.data_audit
 ```
 
 The stress suite varies the spawn heading in one hall, replaces its walk-over exit with a
 wall switch, compares a direct skull pickup with a low-window detour, tests a long
 key return through repeated junctions, climbs a 3-step staircase to bypass a 48-unit cliff,
-activates a remote switch to raise a tagged door, and flanks diverse monsters behind an
-impassable mid-grate. The existing Dev suite and the 38-map `all`
-suite retain their original membership. The Freedoom suite uses the local Tier 4
-reporting bucket and a 4,200-tick cap. Its four maps have no official tier assignment.
+activates a remote switch to raise a tagged door, flanks diverse monsters behind an
+impassable mid-grate, traverses damaging nukage (`RadSuit`), jumps a one-way 64-unit drop-off,
+fights in a wide `>1024u` open horde arena, and unlocks a 3-lock citadel. The existing Dev suite,
+Final suite, and 38-map `all` suite retain their original membership. `final_ood` provides 8
+untouched polygon/verticality test maps (2 per Tier 1-4, balanced spawn bearings). The Freedoom
+suite covers `MAP01..MAP08` under Tier 4 reporting with a 4,200-tick cap.
 
 The repository's Stage 1 Connect smoke checkpoint used stochastic actions for these
 initial runs. Seeds select the engine episode. The reports include the weight hash and

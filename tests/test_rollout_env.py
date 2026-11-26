@@ -222,3 +222,24 @@ def test_resolve_train_maps_wires_role3_curriculum_and_procedural(tmp_path):
     assert {"combat", "multi_room", "key_return"} <= families
     # Procedural WADs were materialized into tmp_path
     assert any(tmp_path.glob("*.wad"))
+
+
+def test_sync_vec_env_set_map_specs_hotswap(tmp_path):
+    from pathlib import Path
+    from training.rollout import SyncVecDoomEnv
+    from training.wad_gen.udmf import build_grid_wad
+
+    wad1 = str(build_grid_wad(tmp_path / "m1.wad", "#######\n#P...E#\n#######"))
+    wad2 = str(build_grid_wad(tmp_path / "m2.wad", "#######\n#P.D.E#\n#######"))
+    s1 = [MapSpec(wad=wad1, family="combat", tier=1, split="train", episode_ticks=40)]
+    s2 = [MapSpec(wad=wad2, family="door_exit", tier=2, split="train", episode_ticks=40)]
+    vec = SyncVecDoomEnv(s1, num_envs=1, max_cached_envs=4)
+    try:
+        vec.reset()
+        assert vec.slots[0]._active_spec.wad == wad1
+        vec.set_map_specs(s2, [1.0])
+        vec.reset()
+        assert vec.slots[0]._active_spec.wad == wad2
+        assert str(Path(wad1).resolve()) not in {k[0] for k in vec.slots[0]._pbrs_cache}
+    finally:
+        vec.close()
