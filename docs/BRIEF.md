@@ -9,15 +9,15 @@
 ### 1. Problem & Telemetry Choice
 Our agent plays unseen `freedoom2.wad` (`skill 3`) levels zero-shot under strict inference limits (`2 GB VRAM`, `8 GB RAM`, `1 CPU thread`, `40 ms/step`). Rather than spending compute on raw pixel CNNs, we operate directly on `doom_env`'s ego-centric telemetry signals (`rays`, `visible_entities`, `vitals`) with `render_buffers=False` during training.
 
-### 2. Policy & Recurrent Memory (`submission/policy.py`, `telemetry_gru_v1`, `687,098` params)
-- **Raycast Encoder:** Circular 1D convolutions over the 64 ego-centric rays (normalized distance + hit type) to preserve directional left/right bins across 360°.
-- **Entity Encoder:** Learned class embeddings + relative geometry/velocity features `(32, 5)` pooled with masked attention conditioned on `vitals` and ray context, with a deterministic empty-set fallback.
-- **Temporal & Button-Edge Memory:** A GRU fuses `[ray_emb, entity_emb, normalized_vitals, prev_action]` so the policy respects ViZDoom's button-down edge semantics for `USE` and `SELECT_NEXT_WEAPON` and tracks short-term navigation state.
-- **Action & Value Heads:** 9 independent binary button logits (`MultiBinary(9)`) and a scalar value critic trained via Recurrent PPO with GAE and episode-boundary hidden-state masking.
+### 2. Policy & Recurrent Memory (`submission/policy.py`, `telemetry_gru_v1`, `730,109` params)
+- **Raycast Encoder:** Circular 1D convolutions over the 64 ego-centric rays (normalized distance + hit type) preserving left/right directional bins across 360°.
+- **Entity Encoder:** Learned class embeddings + derived ego-frame combat kinematics (closing speed, lateral speed, inverse time-to-impact, crosshair alignment) + per-category threat/item counts, pooled with masked multi-query attention conditioned on vitals and ray context (with deterministic empty-set fallback).
+- **Vitals & Temporal Memory:** GRU fusing `[ray_emb, entity_emb, vitals_action_emb]` with explicit `selected_ammo_empty`, `has_any_other_ammo`, `low_health`, horizontal speed, and `prev_action` features so the policy detects wall-snags and respects ViZDoom's button-down edge semantics for `USE` and `SELECT_NEXT_WEAPON`.
+- **Factorized Action Heads & Training Pipeline:** Three 3-way categorical heads (forward/backward/none, strafe left/right/none, turn left/right/none) + three independent Bernoulli heads (`ATTACK`, `USE`, `SELECT_NEXT_WEAPON`) mapped deterministically to `MultiBinary(9)`, trained via Recurrent PPO (`gamma=0.995`, `chunk_len=64`) with a training-only asymmetric critic, auxiliary door-bearing supervision, intrinsic curiosity, and weighted curriculum sampling.
 
 ### 3. Curriculum & Failure-Driven Upgrades
-- Training curriculum covers Tier 1 combat, Tier 2 multi-room exploration, Tier 3 key-and-return progression, and Tier 4 gauntlets using separate train/dev/final map families.
-- Architectural upgrades (e.g., learned landmark memory slots for long-horizon key/door backtracking) are promoted only when independent evaluation on identical held-out seeds confirms improvement on Tier 3–4 exits and unlocks.
+- Training curriculum covers Tier 1 combat, Tier 2 multi-room exploration, Tier 3 key-and-return progression, and Tier 4 gauntlets using separate train/dev/final map families plus procedural variations.
+- Memory challenger branches (`telemetry_landmark_v1` persistent landmark slots and `EgocentricSpatialMap` 2D grid) are promoted only when independent evaluation on identical held-out Tier 3–4 dev seeds confirms higher unlocks and exits.
 
 ---
 
