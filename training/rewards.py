@@ -13,6 +13,7 @@ import numpy as np
 
 from training.interfaces import PrivilegedEventTracker, StepEvents
 
+_MOVE_BACKWARD_IDX = 1
 _TURN_LEFT_IDX = 4
 _TURN_RIGHT_IDX = 5
 _ATTACK_IDX = 6
@@ -38,10 +39,10 @@ class RewardConfig:
     max_post_key_cells: int = 30
     kill_reward: float = 0.8
     damage_penalty: float = -0.032
-    death_penalty: float = -3.0
+    death_penalty: float = -5.0
     door_bounce_penalty: float = -0.25
     use_waste_penalty: float = -0.008
-    use_hold_penalty: float = -0.025
+    use_hold_penalty: float = -0.08
     wasted_ammo_penalty: float = -0.02
     weapon_switch_waste_penalty: float = -0.02
     weapon_pickup_reward: float = 0.6
@@ -50,7 +51,8 @@ class RewardConfig:
     pbrs_gamma: float = 1.0
     spin_penalty: float = -0.015
     spin_threshold_steps: int = 6
-    step_penalty: float = -0.005
+    blind_backward_penalty: float = -0.012
+    step_penalty: float = -0.008
     cell_size: float = 64.0
     open_threshold: float = 8.0
 
@@ -262,6 +264,10 @@ class RewardShaper:
             if self._consec_turn_steps > cfg.spin_threshold_steps:
                 spin_pen = cfg.spin_penalty
 
+        backward_pen = 0.0
+        if action is not None and int(action[_MOVE_BACKWARD_IDX]) == 1 and not _has_visible_enemy(obs):
+            backward_pen = cfg.blind_backward_penalty
+
         self._prev_health = curr_health
         self._prev_armor = curr_armor
         if curr_ammo is not None:
@@ -284,6 +290,7 @@ class RewardShaper:
             "pickup": pickup,
             "pbrs": pbrs_rew,
             "spin_penalty": spin_pen,
+            "backward_penalty": backward_pen,
             "time": cfg.step_penalty,
         }
         return float(sum(components.values())), events, components

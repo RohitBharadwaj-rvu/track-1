@@ -344,3 +344,40 @@ def test_continuous_spin_penalty_allows_normal_turns_and_penalizes_spinning():
         prev_action=turn_r,
     )
     assert comp_str["spin_penalty"] == pytest.approx(0.0)
+
+
+def test_blind_backward_penalty_only_without_visible_enemy():
+    cfg = RewardConfig()
+    shaper = RewardShaper(cfg)
+    shaper.reset(_priv(tic=0, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]))
+
+    back_act = np.zeros(9, dtype=np.int8)
+    back_act[1] = 1
+    fwd_act = np.zeros(9, dtype=np.int8)
+    fwd_act[0] = 1
+    zero_act = np.zeros(9, dtype=np.int8)
+
+    r_blind, _, comp_blind = shaper.step(
+        _priv(tic=4, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=back_act,
+        prev_action=zero_act,
+        obs=_obs(enemy_visible=False),
+    )
+    assert comp_blind["backward_penalty"] == pytest.approx(cfg.blind_backward_penalty)
+    assert r_blind == pytest.approx(sum(comp_blind.values()))
+
+    _, _, comp_kite = shaper.step(
+        _priv(tic=8, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=back_act,
+        prev_action=back_act,
+        obs=_obs(enemy_visible=True),
+    )
+    assert comp_kite["backward_penalty"] == pytest.approx(0.0)
+
+    _, _, comp_fwd = shaper.step(
+        _priv(tic=12, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=fwd_act,
+        prev_action=back_act,
+        obs=_obs(enemy_visible=False),
+    )
+    assert comp_fwd["backward_penalty"] == pytest.approx(0.0)
