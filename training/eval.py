@@ -92,6 +92,17 @@ def resolve_maps(
         return [parse_map_arg(m, split=split) for m in map_args]
 
     target = suite or split
+    if target == "freedoom":
+        return [
+            MapSpec("vizdoom/freedoom2.wad", map_name=f"MAP{i:02d}", family="freedoom", tier=4,
+                    split="stress", episode_ticks=4200)
+            for i in range(1, 5)
+        ]
+    if target == "stress":
+        from training.maps import STRESS_MAPS
+
+        return list(STRESS_MAPS)
+
     try:
         maps_mod = importlib.import_module("training.maps")
     except ModuleNotFoundError:
@@ -129,6 +140,10 @@ def resolve_maps(
 
 
 def _resolve_wad_path(wad: str) -> str:
+    if wad == "vizdoom/freedoom2.wad":
+        from doom_env.wrapper import IWAD
+
+        return IWAD
     p = Path(wad)
     if p.is_absolute() or p.exists():
         return str(p)
@@ -888,11 +903,11 @@ def format_report_markdown(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Role 4 independent DoomAgent evaluator.")
-    parser.add_argument("--split", default="dev", choices=("train", "dev", "final", "all"))
+    parser.add_argument("--split", default="dev", choices=("train", "dev", "final", "stress", "all"))
     parser.add_argument(
         "--suite",
         default=None,
-        choices=("connect", "mvp_gate", "dev", "final", "train", "all"),
+        choices=("connect", "mvp_gate", "dev", "final", "train", "stress", "freedoom", "all"),
         help="Named map suite (overrides --split)",
     )
     parser.add_argument("--map", action="append", default=None, help="wad[:map[:family[:tier[:ticks]]]]")

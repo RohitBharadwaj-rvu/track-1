@@ -96,8 +96,11 @@ def test_progression_and_exit_time_plus_health_efficiency():
             keys=[0, 0, 1, 0, 0, 0],
             sector_ceiling=[64.0, 64.0, 128.0],
             exit_reached=True,
-        )
+        ),
+        action=np.eye(9, dtype=np.int8)[7],
+        prev_action=np.zeros(9, dtype=np.int8),
     )
+    assert c3["use_penalty"] == 0
     assert ev3.exit_reached is True
     assert c3["exit"] == pytest.approx(cfg.exit_reward)
     expected_eff = cfg.efficiency_bonus * 0.75 + cfg.health_efficiency_bonus * 0.80

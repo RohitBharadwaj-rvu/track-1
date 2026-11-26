@@ -19,7 +19,7 @@ import numpy as np
 
 from doom_env import make_env
 from doom_env.mapinfo import load_mapinfo
-from doom_env.sensors import RAY_DOOR, RAY_LOCKED
+from doom_env.sensors import MAX_STEP_UP, PLAYER_HEIGHT, RAY_DOOR, RAY_LOCKED
 from training.interfaces import PrivilegedEventTracker
 from training.wad_gen.udmf import (
     DOOR_CHARS,
@@ -36,7 +36,7 @@ from training.wad_gen.udmf import (
 )
 
 _LOCK_TO_KEY = {"R": "r", "B": "b", "Y": "y"}
-_KEY_DOOMEDNUM_TO_CHAR = {13: "r", 5: "b", 6: "y"}
+_KEY_DOOMEDNUM_TO_CHAR = {13: "r", 5: "b", 6: "y", 38: "r", 40: "b", 39: "y"}
 _DOOR_KIND_TO_KEY = {"door_red": "r", "door_blue": "b", "door_yellow": "y"}
 
 
@@ -234,8 +234,11 @@ def verify_polygon_solvability(
     for owners in edge_map.values():
         if len(owners) == 2:
             a, b = owners
-            adj[a].add(b)
-            adj[b].add(a)
+            first, second = poly_sectors[a], poly_sectors[b]
+            opening = min(first.height_ceiling, second.height_ceiling) - max(first.height_floor, second.height_floor)
+            if opening >= PLAYER_HEIGHT and abs(first.height_floor - second.height_floor) <= MAX_STEP_UP:
+                adj[a].add(b)
+                adj[b].add(a)
 
     def locate_sector(pt: tuple[float, float]) -> int | None:
         for sid, ps in enumerate(poly_sectors):
@@ -261,7 +264,7 @@ def verify_polygon_solvability(
         errors.append("Player start is missing or outside walkable sectors")
         return False, tuple(errors)
 
-    exit_secs = {i for i, ps in enumerate(poly_sectors) if ps.kind == "exit"}
+    exit_secs = {i for i, ps in enumerate(poly_sectors) if ps.kind == "exit" or ps.exit_switch is not None}
     if not exit_secs:
         errors.append("No exit polygon sector defined")
         return False, tuple(errors)

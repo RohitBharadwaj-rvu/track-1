@@ -144,6 +144,10 @@ def test_registry_splits_and_zero_overlap():
     assert split_hashes["train"].isdisjoint(split_hashes["final"])
     assert split_hashes["dev"].isdisjoint(split_hashes["final"])
 
+    stress_hashes = {get_definition(s.wad).blueprint_hash() for s in get_maps("stress")}
+    assert len(stress_hashes) == len(get_maps("stress")) == 7
+    assert all(stress_hashes.isdisjoint(group) for group in split_hashes.values())
+
     # Reserve seeds never overlap nominal seeds
     for spec in DEV_MAPS:
         res = get_reserve_seeds(spec, count=3)
@@ -281,3 +285,51 @@ def test_procedural_generator_all_families_engine_valid(tmp_path: Path):
     for spec in specs:
         res = verify_wad_in_engine(spec.wad, map_name=spec.map_name, episode_ticks=spec.episode_ticks)
         assert res.ok, f"Procedural map {spec.wad} failed engine verification: {res.errors}"
+
+@pytest.mark.parametrize("name", ["exit_ahead", "exit_left", "exit_behind", "exit_switch",
+                                  "key_open", "key_window", "junction_return"])
+def test_stress_playthrough(name):
+    spec = next(s for s in get_maps("stress") if Path(s.wad).stem == name)
+    env = make_env(str(ROOT / spec.wad), spec.map_name, episode_ticks=spec.episode_ticks,
+                   render_buffers=False)
+    try:
+        obs, _ = env.reset(seed=0)
+        tracker = PrivilegedEventTracker()
+        tracker.reset(env.privileged_state())
+        if name.startswith("exit_"):
+            _turn_toward(env, 0)
+            if name == "exit_switch":
+                for _ in range(60):
+                    _, _, term, trunc, _ = env.step(FWD)
+                    assert not (term or trunc)
+                env.step(USE)
+            else:
+                _walk_toward(env, tracker, 432, 96)
+        elif name.startswith("key_"):
+            assert 9 in obs["visible_entities"]["entity_type"]
+            if name == "key_window":
+                assert _ray_ahead_type(obs) == 1
+                for _ in range(30):
+                    env.step(FWD)
+                assert env.privileged_state()["x"] < 192
+                for x, y in ((128, 240), (352, 240)):
+                    _walk_toward(env, tracker, x, y)
+            _walk_toward(env, tracker, 352, 80)
+            obs, *_ = env.step(NOOP)
+            assert obs["vitals"][11] == 1
+            if name == "key_window":
+                for x, y in ((352, 240), (96, 240)):
+                    _walk_toward(env, tracker, x, y)
+            _walk_toward(env, tracker, 80, 80)
+            _walk_toward(env, tracker, -220, 80)
+        else:
+            for x in range(240, 1681, 160):
+                _walk_toward(env, tracker, x, 64)
+            _walk_toward(env, tracker, 1680, 320)
+            _walk_toward(env, tracker, 1680, 64)
+            for x in range(1520, 79, -160):
+                _walk_toward(env, tracker, x, 64)
+            _walk_toward(env, tracker, -220, 64)
+        assert env.privileged_state()["exit_reached"]
+    finally:
+        env.close()

@@ -80,6 +80,27 @@ One NVIDIA **RTX 3090 (24 GB)** shared between evaluation workers. Each agent ge
 | [docs/EVALUATION.md](docs/EVALUATION.md) | Map tiers, scoring categories, timeouts, replays |
 | [track_1_strategy_telemetry_world_model.md](track_1_strategy_telemetry_world_model.md) | Our Track 1 strategy & implementation plan |
 
+## Navigation stress evaluation
+
+Run the submission checkpoint on the seven held-out navigation maps or on bundled
+Freedoom2 MAP01 through MAP04. Run each suite separately so its scores can be compared across checkpoints.
+
+```shell
+uv run python -m training.eval --suite stress --seeds 0 1 2 --out eval_stress.json
+uv run python -m training.eval --suite freedoom --seeds 0 --out eval_freedoom.json
+uv run python -m training.maps --split stress --generate --verify
+```
+
+The stress suite varies the spawn heading in one hall, replaces its walk-over exit with a
+wall switch, compares a direct skull pickup with a low-window detour, and tests a long
+key return through repeated junctions. The existing Dev suite and the 38-map `all`
+suite retain their original membership. The Freedoom suite uses the local Tier 4
+reporting bucket and a 4,200-tick cap. Its four maps have no official tier assignment.
+
+The repository's Stage 1 Connect smoke checkpoint used stochastic actions for these
+initial runs. Seeds select the engine episode. The reports include the weight hash and
+per-episode outcomes. [Stress results](docs/eval_stress.json) and [Freedoom results](docs/eval_freedoom.json)
+
 ## Rules in one minute
 
 - Actions must come from **trained neural parameters**: no rule trees, no `A*`/Dijkstra, no `atan2` aimbots,

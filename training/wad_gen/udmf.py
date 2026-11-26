@@ -126,6 +126,8 @@ class PolygonSector:
     height_ceiling: int = 128
     light_level: int = 192
     holes: tuple[PolygonHole, ...] = field(default_factory=tuple)
+    # Exterior edge activating Exit_Normal on a USE pulse (either vertex order).
+    exit_switch: tuple[tuple[float, float], tuple[float, float]] | None = None
 
 
 def layout_hash(spec_text: str) -> str:
@@ -271,6 +273,7 @@ def build_grid_textmap(
     theme: str = "techbase",
     monster_angle: int = 180,
     extra_things: Sequence[ThingSpec] = (),
+    skull_keys: bool = False,
     door_close_delay: int = 150,
 ) -> str:
     """Compile a 2D ASCII grid into a valid ZDoom UDMF `TEXTMAP` string.
@@ -510,7 +513,10 @@ def build_grid_textmap(
                 things.append(ThingSpec(x=cx, y=cy, doomednum=1, angle=int(ang)))
             elif ch in THING_DOOMEDNUM:
                 ang = monster_angle if ch in MONSTER_CHARS else 0
-                things.append(ThingSpec(x=cx, y=cy, doomednum=THING_DOOMEDNUM[ch], angle=ang))
+                number = THING_DOOMEDNUM[ch]
+                if skull_keys and ch in KEY_CHARS:
+                    number = {"b": 40, "y": 39, "r": 38}[ch]
+                things.append(ThingSpec(x=cx, y=cy, doomednum=number, angle=ang))
     things.extend(extra_things)
 
     if player_count != 1:
@@ -573,6 +579,7 @@ def build_grid_wad(
     theme: str = "techbase",
     monster_angle: int = 180,
     extra_things: Sequence[ThingSpec] = (),
+    skull_keys: bool = False,
     door_close_delay: int = 150,
 ) -> Path:
     """Compile a 2D ASCII grid and write a complete UDMF PWAD file."""
@@ -583,6 +590,7 @@ def build_grid_wad(
         theme=theme,
         monster_angle=monster_angle,
         extra_things=extra_things,
+        skull_keys=skull_keys,
         door_close_delay=door_close_delay,
     )
     return _write_textmap_wad(path, textmap, map_name=map_name)
@@ -660,17 +668,27 @@ def build_polygon_textmap(
     sidedefs: list[dict[str, object]] = []
     linedefs: list[dict[str, object]] = []
 
+    for sid, ps in enumerate(poly_sectors):
+        if ps.exit_switch is not None:
+            edge = tuple(sorted(_snap_pt(p) for p in ps.exit_switch))
+            owners = edge_owners.get(edge, [])
+            if len(owners) != 1 or owners[0][2] != sid:
+                raise ValueError(f"Exit switch in {ps.name} requires an exterior edge")
+
     for ukey, owners in edge_owners.items():
         if len(owners) == 1:
             p1, p2, sid, wall_tex = owners[0]
+            switch = poly_sectors[sid].exit_switch
+            is_switch = switch is not None and ukey == tuple(sorted(_snap_pt(p) for p in switch))
             sd_front = len(sidedefs)
-            sidedefs.append({"sector": sid, "top": "-", "mid": wall_tex, "bot": "-"})
+            sidedefs.append({"sector": sid, "top": "-", "mid": "SW1EXIT" if is_switch else wall_tex, "bot": "-"})
             linedefs.append({
                 "v1": get_v(p1),
                 "v2": get_v(p2),
                 "front": sd_front,
                 "blocking": True,
                 "dontpegbottom": True,
+                **({"special": 243, "playeruse": True} if is_switch else {}),
             })
         elif len(owners) == 2:
             (p1a, p2a, sa, _), (p1b, p2b, sb, _) = owners
@@ -743,9 +761,14 @@ def build_polygon_textmap(
                 })
             else:
                 sd_front = len(sidedefs)
-                sidedefs.append({"sector": front_sec, "top": "-", "mid": "-", "bot": "-"})
-                sd_back = len(sidedefs)
-                sidedefs.append({"sector": back_sec, "top": "-", "mid": "-", "bot": "-"})
+                sd_back = sd_front + 1
+                for sid, opposite in ((front_sec, back_sec), (back_sec, front_sec)):
+                    room, neighbor = poly_sectors[sid], poly_sectors[opposite]
+                    sidedefs.append({
+                        "sector": sid, "mid": "-",
+                        "top": neighbor.wall_texture if room.height_ceiling > neighbor.height_ceiling else "-",
+                        "bot": neighbor.wall_texture if room.height_floor < neighbor.height_floor else "-",
+                    })
                 linedefs.append({
                     "v1": v1,
                     "v2": v2,

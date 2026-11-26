@@ -11,8 +11,10 @@ from pathlib import Path
 import random
 
 from training.interfaces import MapSpec
-from training.wad_gen.udmf import THEME_NAMES, build_grid_wad
-from training.wad_gen.verify import verify_grid_solvability
+from training.wad_gen.udmf import (
+    THEME_NAMES, PolygonSector, ThingSpec, build_grid_wad, build_polygon_wad,
+)
+from training.wad_gen.verify import verify_grid_solvability, verify_polygon_solvability
 
 
 def _to_grid_str(buf: list[list[str]]) -> str:
@@ -267,7 +269,7 @@ def _gen_key_return_grid(
             buf[8][8] = rng.choice(["z", "s"])
         return _to_grid_str(buf), rng.choice([0, 90, 180, 270]), 64
 
-    branch_len = return_distance if return_distance is not None else rng.choice([3, 5, 7])
+    branch_len = return_distance if return_distance is not None else rng.choice([3, 5, 7, 18, 24])
     key_on_north = rng.choice([True, False])
     use_mid_door = rng.random() < 0.5
     add_distractor = rng.random() < 0.7
@@ -314,6 +316,19 @@ def _gen_key_return_grid(
         buf[total_h - 2][cor_c] = key_char
         if with_combat:
             buf[total_h - 3][cor_c] = rng.choice(["z", "i"])
+
+    # Long routes place the key around a corner among repeated side passages.
+    if branch_len >= 18:
+        end_row = 1 if key_on_north else total_h - 2
+        buf[end_row][cor_c] = "."
+        toward_hub = 1 if key_on_north else -1
+        for offset in range(0, branch_len - 3, 4):
+            row = end_row + toward_hub * offset
+            reach = rng.randint(4, 8)
+            adjacent = row + toward_hub
+            _carve_rect(buf, min(row, adjacent), cor_c + 1, max(row, adjacent), cor_c + reach)
+            if offset == 0:
+                buf[row][cor_c + reach] = key_char
 
     if add_distractor:
         if key_on_north and south_h >= 3:
@@ -444,6 +459,28 @@ def _gen_gauntlet_grid(rng: random.Random) -> tuple[str, int, int]:
     return _to_grid_str(buf), rng.choice([0, 90, 180, 270]), 80
 
 
+def _build_angled_door_exit(path: Path, rng: random.Random) -> None:
+    """A manual door leads through an offset passage to a walk-over pad or wall switch."""
+    width = rng.choice((96, 128, 160, 192))
+    run = rng.randrange(224, 449, 32)
+    bend = rng.choice((-128, -64, 64, 128))
+    end = 48 + run
+    far_wall = ((end + 80, bend), (end + 80, bend + width))
+    switch = rng.choice((True, False))
+    sectors = (
+        PolygonSector("start", ((-256, -96), (0, 0), (0, width), (-256, width + 96))),
+        PolygonSector("door", ((0, 0), (48, 0), (48, width), (0, width)), kind="door"),
+        PolygonSector("passage", ((48, 0), (end, bend), (end, bend + width), (48, width))),
+        PolygonSector("destination", ((end, bend), *far_wall, (end, bend + width)),
+                      kind="room" if switch else "exit", exit_switch=far_wall if switch else None),
+    )
+    things = (ThingSpec(-160, width // 2, 1, rng.randrange(0, 360, 45)),)
+    ok, errors = verify_polygon_solvability(sectors, things)
+    if not ok:
+        raise ValueError(f"Invalid procedural polygon map: {errors}")
+    build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((100, 150, 200)))
+
+
 def generate_procedural_wad(
     family: str,
     seed: int,
@@ -459,6 +496,10 @@ def generate_procedural_wad(
     """
     rng = random.Random(int(seed))
     theme = rng.choice(THEME_NAMES)
+    out_path = Path(out_dir) / f"proc_{family}_s{seed}.wad"
+    if family == "door_exit" and rng.randrange(4) == 0:
+        _build_angled_door_exit(out_path, rng)
+        return MapSpec(str(out_path), family=family, tier=2, split=split, episode_ticks=2100)
     if family == "door_exit":
         grid, angle, cell_size = _gen_door_exit_grid(rng)
         tier, ticks = 2, 2100
@@ -472,7 +513,9 @@ def generate_procedural_wad(
         grid, angle, cell_size = _gen_key_return_grid(
             rng, return_distance=return_distance, with_combat=with_combat
         )
-        tier, ticks = 3, 3150 if (return_distance or 0) >= 6 else 2100
+        tier = 3
+        span = max(len(grid.splitlines()), max(map(len, grid.splitlines()))) * cell_size
+        ticks = 4200 if span >= 1500 else (3150 if (return_distance or 0) >= 6 else 2100)
     elif family == "gauntlet":
         grid, angle, cell_size = _gen_gauntlet_grid(rng)
         tier, ticks = 4, 4200
@@ -483,13 +526,14 @@ def generate_procedural_wad(
     if not check.ok:
         raise RuntimeError(f"Procedural generator produced unsolvable {family} seed={seed}: {check.errors}")
 
-    out_path = Path(out_dir) / f"proc_{family}_s{seed}.wad"
     build_grid_wad(
         out_path,
         grid,
         map_name="MAP01",
         cell_size=cell_size,
-        player_angle=angle,
+        player_angle=(angle + rng.choice((0, 90, 180, 270))) % 360,
+        monster_angle=rng.randrange(0, 360, 45),
+        skull_keys=rng.choice((False, True)),
         theme=theme,
     )
     return MapSpec(

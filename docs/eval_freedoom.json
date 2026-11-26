@@ -1,0 +1,311 @@
+{
+  "metadata": {
+    "timestamp_utc": "2026-11-26T16:06:14.761288+00:00",
+    "git_commit": "43cbb6f",
+    "weights_sha256": {
+      "submission/weights/policy.pt": "6ecb7c4f475b80c439d0783bc529a3b40800f8b5ddc7b79be6d18c71af57c4eb"
+    },
+    "agent_spec": "submission.agent:DoomAgent",
+    "device": "cpu",
+    "eval_mode": "default",
+    "eval_mode_applied": false,
+    "render_buffers": false,
+    "init_time_s": 0.0558,
+    "wall_time_s": 84.2878,
+    "maps_manifest": [
+      {
+        "wad": "vizdoom/freedoom2.wad",
+        "map_name": "MAP01",
+        "family": "freedoom",
+        "tier": 4,
+        "split": "stress",
+        "episode_ticks": 4200,
+        "seeds": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "wad": "vizdoom/freedoom2.wad",
+        "map_name": "MAP02",
+        "family": "freedoom",
+        "tier": 4,
+        "split": "stress",
+        "episode_ticks": 4200,
+        "seeds": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "wad": "vizdoom/freedoom2.wad",
+        "map_name": "MAP03",
+        "family": "freedoom",
+        "tier": 4,
+        "split": "stress",
+        "episode_ticks": 4200,
+        "seeds": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "wad": "vizdoom/freedoom2.wad",
+        "map_name": "MAP04",
+        "family": "freedoom",
+        "tier": 4,
+        "split": "stress",
+        "episode_ticks": 4200,
+        "seeds": [
+          0,
+          1,
+          2
+        ]
+      }
+    ]
+  },
+  "summary": {
+    "overall": {
+      "episodes": 4,
+      "exits": 0,
+      "deaths": 3,
+      "timeouts": 1,
+      "errors": 0,
+      "exit_rate": 0.0,
+      "keys_picked_up": 0,
+      "doors_opened": 0,
+      "locked_doors_unlocked": 0,
+      "kills": 2,
+      "episodes_with_pickup": 0,
+      "episodes_with_unlock": 0,
+      "deaths_after_pickup": 0,
+      "unlock_given_pickup_rate": null,
+      "exit_given_unlock_rate": null,
+      "mean_unique_cells": 31.0,
+      "total_steps": 2059,
+      "use_presses": 376,
+      "consecutive_use_presses": 57,
+      "opposing_button_steps": 0,
+      "attack_steps": 1013,
+      "wasted_attack_steps": 790,
+      "total_agent_time_s": 9.2104,
+      "max_step_ms": 21.028,
+      "all_within_budget": true,
+      "tier12_exits": 0,
+      "tier34_exits": 0
+    },
+    "by_tier": {
+      "4": {
+        "episodes": 4,
+        "exits": 0,
+        "deaths": 3,
+        "timeouts": 1,
+        "errors": 0,
+        "exit_rate": 0.0,
+        "keys_picked_up": 0,
+        "doors_opened": 0,
+        "locked_doors_unlocked": 0,
+        "kills": 2,
+        "episodes_with_pickup": 0,
+        "episodes_with_unlock": 0,
+        "deaths_after_pickup": 0,
+        "unlock_given_pickup_rate": null,
+        "exit_given_unlock_rate": null,
+        "mean_unique_cells": 31.0,
+        "total_steps": 2059,
+        "use_presses": 376,
+        "consecutive_use_presses": 57,
+        "opposing_button_steps": 0,
+        "attack_steps": 1013,
+        "wasted_attack_steps": 790,
+        "total_agent_time_s": 9.2104,
+        "max_step_ms": 21.028,
+        "all_within_budget": true
+      }
+    },
+    "by_family": {
+      "freedoom": {
+        "episodes": 4,
+        "exits": 0,
+        "deaths": 3,
+        "timeouts": 1,
+        "errors": 0,
+        "exit_rate": 0.0,
+        "keys_picked_up": 0,
+        "doors_opened": 0,
+        "locked_doors_unlocked": 0,
+        "kills": 2,
+        "episodes_with_pickup": 0,
+        "episodes_with_unlock": 0,
+        "deaths_after_pickup": 0,
+        "unlock_given_pickup_rate": null,
+        "exit_given_unlock_rate": null,
+        "mean_unique_cells": 31.0,
+        "total_steps": 2059,
+        "use_presses": 376,
+        "consecutive_use_presses": 57,
+        "opposing_button_steps": 0,
+        "attack_steps": 1013,
+        "wasted_attack_steps": 790,
+        "total_agent_time_s": 9.2104,
+        "max_step_ms": 21.028,
+        "all_within_budget": true
+      }
+    }
+  },
+  "episodes": [
+    {
+      "wad": "vizdoom/freedoom2.wad",
+      "map_name": "MAP01",
+      "family": "freedoom",
+      "tier": 4,
+      "seed": 0,
+      "steps": 460,
+      "ticks": 1841,
+      "outcome": "death",
+      "keys_picked_up": 0,
+      "doors_opened": 0,
+      "locked_doors_unlocked": 0,
+      "kills": 0,
+      "damage_taken": 102.0,
+      "final_health": -2.0,
+      "unique_cells_visited": 44,
+      "total_reward": -1.0,
+      "agent_time_s": 2.0834,
+      "extra": {
+        "first_act_ms": 3.699,
+        "p50_act_ms": 4.492,
+        "p99_act_ms": 11.305,
+        "max_act_ms": 15.251,
+        "budget_s": 42.0,
+        "within_budget": true,
+        "use_presses": 78,
+        "consecutive_use_presses": 13,
+        "opposing_button_steps": 0,
+        "attack_steps": 216,
+        "wasted_attack_steps": 176,
+        "had_key_pickup": false,
+        "died_after_pickup": false
+      }
+    },
+    {
+      "wad": "vizdoom/freedoom2.wad",
+      "map_name": "MAP02",
+      "family": "freedoom",
+      "tier": 4,
+      "seed": 0,
+      "steps": 438,
+      "ticks": 1750,
+      "outcome": "death",
+      "keys_picked_up": 0,
+      "doors_opened": 0,
+      "locked_doors_unlocked": 0,
+      "kills": 2,
+      "damage_taken": 105.0,
+      "final_health": -5.0,
+      "unique_cells_visited": 30,
+      "total_reward": -0.8,
+      "agent_time_s": 1.9655,
+      "extra": {
+        "first_act_ms": 3.765,
+        "p50_act_ms": 4.169,
+        "p99_act_ms": 10.229,
+        "max_act_ms": 21.028,
+        "budget_s": 42.0,
+        "within_budget": true,
+        "use_presses": 90,
+        "consecutive_use_presses": 13,
+        "opposing_button_steps": 0,
+        "attack_steps": 203,
+        "wasted_attack_steps": 68,
+        "had_key_pickup": false,
+        "died_after_pickup": false
+      }
+    },
+    {
+      "wad": "vizdoom/freedoom2.wad",
+      "map_name": "MAP03",
+      "family": "freedoom",
+      "tier": 4,
+      "seed": 0,
+      "steps": 1050,
+      "ticks": 4201,
+      "outcome": "timeout",
+      "keys_picked_up": 0,
+      "doors_opened": 0,
+      "locked_doors_unlocked": 0,
+      "kills": 0,
+      "damage_taken": 0.0,
+      "final_health": 104.0,
+      "unique_cells_visited": 34,
+      "total_reward": 0.0,
+      "agent_time_s": 4.6393,
+      "extra": {
+        "first_act_ms": 8.201,
+        "p50_act_ms": 4.33,
+        "p99_act_ms": 8.378,
+        "max_act_ms": 13.368,
+        "budget_s": 42.0,
+        "within_budget": true,
+        "use_presses": 189,
+        "consecutive_use_presses": 27,
+        "opposing_button_steps": 0,
+        "attack_steps": 535,
+        "wasted_attack_steps": 535,
+        "had_key_pickup": false,
+        "died_after_pickup": false
+      }
+    },
+    {
+      "wad": "vizdoom/freedoom2.wad",
+      "map_name": "MAP04",
+      "family": "freedoom",
+      "tier": 4,
+      "seed": 0,
+      "steps": 111,
+      "ticks": 445,
+      "outcome": "death",
+      "keys_picked_up": 0,
+      "doors_opened": 0,
+      "locked_doors_unlocked": 0,
+      "kills": 0,
+      "damage_taken": 105.0,
+      "final_health": -5.0,
+      "unique_cells_visited": 16,
+      "total_reward": -1.0,
+      "agent_time_s": 0.5222,
+      "extra": {
+        "first_act_ms": 4.127,
+        "p50_act_ms": 4.458,
+        "p99_act_ms": 10.297,
+        "max_act_ms": 16.856,
+        "budget_s": 42.0,
+        "within_budget": true,
+        "use_presses": 19,
+        "consecutive_use_presses": 4,
+        "opposing_button_steps": 0,
+        "attack_steps": 59,
+        "wasted_attack_steps": 11,
+        "had_key_pickup": false,
+        "died_after_pickup": false
+      }
+    }
+  ],
+  "diagnosis": [
+    {
+      "priority": 3,
+      "code": "use_bounce_or_no_doors",
+      "evidence": "doors_opened=0, locked_doors_unlocked=0, consecutive_use_presses=57",
+      "recommendation": "Check USE button-edge handling, add USE-spam penalty in training/rewards.py, and verify door_open_reward (updates.md §2)."
+    },
+    {
+      "priority": 7,
+      "code": "wasted_ammo",
+      "evidence": "wasted_attack_steps=790/1013 (78.0%)",
+      "recommendation": "Add a small wasted-ammo penalty in training/rewards.py when firing with no enemy in FOV (TRACK1_IMPROVEMENTS.md §5.3)."
+    }
+  ]
+}

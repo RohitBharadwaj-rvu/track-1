@@ -186,7 +186,8 @@ class RewardShaper:
             use_penalty += cfg.door_bounce_penalty
         elif action is not None and prev_action is not None:
             if (
-                events.doors_opened == 0
+                not events.exit_reached
+                and events.doors_opened == 0
                 and events.locked_doors_unlocked == 0
                 and not started_or_rising
             ):
