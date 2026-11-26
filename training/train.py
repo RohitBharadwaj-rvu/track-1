@@ -46,15 +46,15 @@ class TrainConfig:
     tier_weights: dict[int, float] | None = None
     auto_curriculum: bool = True
     adaptive_weights: bool = True
-    tier12_promote_threshold: float = 0.70
-    tier3_promote_threshold: float = 0.55
+    tier12_promote_threshold: float = 0.65
+    tier3_promote_threshold: float = 0.50
     min_promote_episodes: int = 32
     promote_window_size: int = 48
     tier3_require_exit: bool = True
     maps: tuple[str, ...] = ()
     num_envs: int = 4
     vec_mode: str = "subproc"  # "subproc" | "sync"
-    max_cached_envs: int = 32
+    max_cached_envs: int = 24
     rollout_steps: int = 256
     chunk_len: int = 64
     num_minibatches: int = 4
@@ -118,7 +118,7 @@ def _make_vec_env(
     max_cached_envs: int = 32,
     use_ego_map: bool = False,
 ):
-    cache_size = max(int(max_cached_envs), len(map_specs))
+    cache_size = max(1, min(int(max_cached_envs), len(map_specs)))
     if vec_mode == "sync":
         return SyncVecDoomEnv(
             map_specs=map_specs,
@@ -206,7 +206,6 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
             adaptive_weights=cfg.adaptive_weights,
         )
     )
-    initial_weights = scheduler.compute_map_weights(map_specs)
 
     ppo_cfg = PPOConfig(
         lr=cfg.lr,
@@ -236,6 +235,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
         start_update = int(step_info.get("updates", 0))
         total_decisions = int(step_info.get("total_decisions", 0))
         episodes_completed = int(step_info.get("episodes_completed", 0))
+        scheduler.phase = int(step_info.get("curriculum_phase", 0))
         trainer = RecurrentPPOTrainer(
             policy,
             ppo_cfg,
@@ -260,6 +260,8 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
         )
         policy = build_policy(policy_cfg).to(device)
         trainer = RecurrentPPOTrainer(policy, ppo_cfg, device=device)
+
+    initial_weights = scheduler.compute_map_weights(map_specs)
 
     use_ego_map = bool(getattr(policy_cfg, "use_ego_map", False))
     steps_per_update = cfg.rollout_steps * cfg.num_envs
@@ -381,6 +383,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                             "updates": update_idx,
                             "total_decisions": total_decisions,
                             "episodes_completed": episodes_completed,
+                            "curriculum_phase": scheduler.phase,
                         },
                         asymmetric_critic=trainer.asymmetric_critic,
                         aux_head=trainer.aux_head,
@@ -400,6 +403,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                     "updates": start_update + target_updates,
                     "total_decisions": total_decisions,
                     "episodes_completed": episodes_completed,
+                    "curriculum_phase": scheduler.phase,
                 },
                 asymmetric_critic=trainer.asymmetric_critic,
                 aux_head=trainer.aux_head,
@@ -626,8 +630,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-auto-curriculum", dest="auto_curriculum", action="store_false")
     p.add_argument("--adaptive-weights", dest="adaptive_weights", action="store_true", default=True)
     p.add_argument("--no-adaptive-weights", dest="adaptive_weights", action="store_false")
-    p.add_argument("--tier12-promote-threshold", type=float, default=0.70)
-    p.add_argument("--tier3-promote-threshold", type=float, default=0.55)
+    p.add_argument("--tier12-promote-threshold", type=float, default=0.65)
+    p.add_argument("--tier3-promote-threshold", type=float, default=0.50)
     p.add_argument("--min-promote-episodes", type=int, default=32)
     p.add_argument("--promote-window-size", type=int, default=48)
     p.add_argument("--asymmetric-critic", dest="use_asymmetric_critic", action="store_true", default=True)
@@ -637,6 +641,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pbrs-scale", type=float, default=2.0)
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--vec-mode", choices=("subproc", "sync"), default="subproc")
+    p.add_argument("--max-cached-envs", type=int, default=24)
     p.add_argument("--rollout-steps", type=int, default=256)
     p.add_argument("--chunk-len", type=int, default=64)
     p.add_argument("--num-minibatches", type=int, default=4)
@@ -714,6 +719,7 @@ def main(argv: list[str] | None = None) -> None:
         maps=tuple(args.maps),
         num_envs=args.num_envs,
         vec_mode=args.vec_mode,
+        max_cached_envs=args.max_cached_envs,
         rollout_steps=args.rollout_steps,
         chunk_len=args.chunk_len,
         num_minibatches=args.num_minibatches,

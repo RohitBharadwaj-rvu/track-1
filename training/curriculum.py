@@ -26,7 +26,7 @@ class CurriculumConfig:
     tier3_require_exit: bool = False
     adaptive_weights: bool = False
     adaptive_window: int = 16
-    adaptive_floor: float = 0.15
+    adaptive_floor: float = 0.25
 
 
 class CurriculumScheduler:
