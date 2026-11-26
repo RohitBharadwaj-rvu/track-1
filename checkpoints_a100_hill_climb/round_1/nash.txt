@@ -1,0 +1,116 @@
+## Nash Averaging Comparison
+| Candidate | Nash Value | Minimax Regret | Mean Rubric | CVaR-25 | Polytope Min | Nash Weight |
+|---|---|---|---|---|---|---|
+| s6b_panel_s0 | 0.3038 | 0.7750 | 0.2170 | 0.0000 | 0.1327 | 0.659 |
+| round_1_panel_s0 | 0.2005 | 0.9000 | 0.1798 | 0.0000 | 0.0953 | 0.341 |
+
+Top Frontier Maps:
+- `c01735_proc_poly_gauntlet.wad:MAP01` (q*=0.560): {'s6b_panel_s0': 0.0, 'round_1_panel_s0': 0.3067}
+- `c04149_dungeon_key_return.wad:MAP01` (q*=0.294): {'s6b_panel_s0': 0.9, 'round_1_panel_s0': 0.0}
+- `c04680_extreme_poly_grate_window_backtrack.wad:MAP01` (q*=0.039): {'s6b_panel_s0': 0.0, 'round_1_panel_s0': 0.2533}
+- `c02779_proc_poly_key_return.wad:MAP01` (q*=0.033): {'s6b_panel_s0': 0.775, 'round_1_panel_s0': 0.0}
+- `c02460_proc_poly_combat.wad:MAP01` (q*=0.010): {'s6b_panel_s0': 0.0, 'round_1_panel_s0': 0.775}
+
+{
+  "corner": "balanced",
+  "common_maps": 36,
+  "total_maps": 36,
+  "game_value": 0.2686,
+  "minimax_regret_game_value": 0.7404,
+  "agents": [
+    {
+      "name": "s6b_panel_s0",
+      "nash_regret": 0.7398,
+      "nash_value": 0.3038,
+      "nash_weight": 0.6591,
+      "minimax_regret": 0.775,
+      "mean_rubric": 0.217,
+      "cvar_25": 0.0,
+      "polytope_min": 0.1327
+    },
+    {
+      "name": "round_1_panel_s0",
+      "nash_regret": 0.7417,
+      "nash_value": 0.2005,
+      "nash_weight": 0.3409,
+      "minimax_regret": 0.9,
+      "mean_rubric": 0.1798,
+      "cvar_25": 0.0,
+      "polytope_min": 0.0953
+    }
+  ],
+  "frontier_maps": [
+    {
+      "map": "c01735_proc_poly_gauntlet.wad:MAP01",
+      "tier": 4,
+      "nash_weight": 0.56,
+      "scores": {
+        "s6b_panel_s0": 0.0,
+        "round_1_panel_s0": 0.3067
+      }
+    },
+    {
+      "map": "c04149_dungeon_key_return.wad:MAP01",
+      "tier": 3,
+      "nash_weight": 0.2944,
+      "scores": {
+        "s6b_panel_s0": 0.9,
+        "round_1_panel_s0": 0.0
+      }
+    },
+    {
+      "map": "c04680_extreme_poly_grate_window_backtrack.wad:MAP01",
+      "tier": 4,
+      "nash_weight": 0.0387,
+      "scores": {
+        "s6b_panel_s0": 0.0,
+        "round_1_panel_s0": 0.2533
+      }
+    },
+    {
+      "map": "c02779_proc_poly_key_return.wad:MAP01",
+      "tier": 3,
+      "nash_weight": 0.0332,
+      "scores": {
+        "s6b_panel_s0": 0.775,
+        "round_1_panel_s0": 0.0
+      }
+    },
+    {
+      "map": "c02460_proc_poly_combat.wad:MAP01",
+      "tier": 1,
+      "nash_weight": 0.0099,
+      "scores": {
+        "s6b_panel_s0": 0.0,
+        "round_1_panel_s0": 0.775
+      }
+    },
+    {
+      "map": "c04125_proc_poly_combat.wad:MAP01",
+      "tier": 1,
+      "nash_weight": 0.005,
+      "scores": {
+        "s6b_panel_s0": 0.0,
+        "round_1_panel_s0": 0.5873
+      }
+    },
+    {
+      "map": "c00687_proc_poly_gauntlet.wad:MAP01",
+      "tier": 4,
+      "nash_weight": 0.0048,
+      "scores": {
+        "s6b_panel_s0": 0.2733,
+        "round_1_panel_s0": 0.0
+      }
+    },
+    {
+      "map": "c01446_dungeon_multi_room.wad:MAP01",
+      "tier": 2,
+      "nash_weight": 0.0037,
+      "scores": {
+        "s6b_panel_s0": 0.781,
+        "round_1_panel_s0": 0.19
+      }
+    }
+  ]
+}

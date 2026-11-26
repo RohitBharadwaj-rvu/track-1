@@ -1,0 +1,248 @@
+{
+  "verdict": "keep_incumbent",
+  "reason": "Challenger regressed tier34_exits (-2).",
+  "deltas": {
+    "errors": 0,
+    "tier34_exits": -2,
+    "locked_doors_unlocked": -9,
+    "tier12_exits": 1,
+    "kills": 4,
+    "keys_picked_up": -4,
+    "mean_unique_cells": -7.75
+  },
+  "per_map_deltas": {
+    "c00128_extreme_poly_vertical_switch_citadel.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": -1,
+      "deaths_delta": 0
+    },
+    "c00162_dungeon_key_return.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": -1,
+      "deaths_delta": 1
+    },
+    "c00282_proc_poly_gauntlet.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c00381_proc_poly_multi_room.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": -1,
+      "deaths_delta": 0
+    },
+    "c00393_dungeon_hard_key_return.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": -2,
+      "kills_delta": -2,
+      "deaths_delta": -1
+    },
+    "c00405_dungeon_hard_key_return.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c00618_proc_poly_door_exit.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c00685_dungeon_multi_room.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 1,
+      "deaths_delta": 0
+    },
+    "c00687_proc_poly_gauntlet.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": -3,
+      "deaths_delta": 1
+    },
+    "c00750_extreme_poly_nukage_compound_fortress.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": -1,
+      "kills_delta": 1,
+      "deaths_delta": -1
+    },
+    "c01195_dungeon_multi_room.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c01333_extreme_poly_grate_window_backtrack.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 1,
+      "deaths_delta": 0
+    },
+    "c01446_dungeon_multi_room.wad:MAP01": {
+      "exits_delta": -1,
+      "unlocks_delta": 0,
+      "kills_delta": -1,
+      "deaths_delta": 1
+    },
+    "c01654_dungeon_door_exit.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c01735_proc_poly_gauntlet.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 5,
+      "deaths_delta": -1
+    },
+    "c01833_extreme_poly_remote_key_relay.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c02262_extreme_poly_remote_key_relay.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c02319_proc_poly_multi_room.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c02348_extreme_poly_nukage_compound_fortress.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 2,
+      "deaths_delta": 0
+    },
+    "c02350_dungeon_combat.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": -3,
+      "deaths_delta": 0
+    },
+    "c02460_proc_poly_combat.wad:MAP01": {
+      "exits_delta": 1,
+      "unlocks_delta": 0,
+      "kills_delta": 5,
+      "deaths_delta": -1
+    },
+    "c02603_proc_poly_key_return.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c02634_extreme_poly_grate_window_backtrack.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": -1,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c02779_proc_poly_key_return.wad:MAP01": {
+      "exits_delta": -1,
+      "unlocks_delta": -1,
+      "kills_delta": 0,
+      "deaths_delta": 1
+    },
+    "c02848_extreme_poly_aliased_labyrinth.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": -2,
+      "deaths_delta": 0
+    },
+    "c03252_extreme_dungeon_gauntlet.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": -1,
+      "deaths_delta": 0
+    },
+    "c03336_extreme_poly_decoy_multilock.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": -1,
+      "deaths_delta": -1
+    },
+    "c03571_extreme_poly_decoy_multilock.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c03799_dungeon_hard_key_return.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 2,
+      "deaths_delta": 0
+    },
+    "c04074_extreme_poly_revisit_wing.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": -1,
+      "kills_delta": 0,
+      "deaths_delta": 0
+    },
+    "c04125_proc_poly_combat.wad:MAP01": {
+      "exits_delta": 1,
+      "unlocks_delta": 0,
+      "kills_delta": -1,
+      "deaths_delta": -1
+    },
+    "c04139_extreme_poly_scarce_crossfire_gauntlet.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 2,
+      "deaths_delta": -1
+    },
+    "c04149_dungeon_key_return.wad:MAP01": {
+      "exits_delta": -1,
+      "unlocks_delta": -1,
+      "kills_delta": -1,
+      "deaths_delta": 1
+    },
+    "c04354_dungeon_key_return.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 0,
+      "deaths_delta": 1
+    },
+    "c04680_extreme_poly_grate_window_backtrack.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": 0,
+      "kills_delta": 4,
+      "deaths_delta": 0
+    },
+    "c04988_extreme_poly_aliased_labyrinth.wad:MAP01": {
+      "exits_delta": 0,
+      "unlocks_delta": -2,
+      "kills_delta": -1,
+      "deaths_delta": 0
+    }
+  },
+  "regressed_maps": [
+    "c00393_dungeon_hard_key_return.wad:MAP01",
+    "c00750_extreme_poly_nukage_compound_fortress.wad:MAP01",
+    "c01446_dungeon_multi_room.wad:MAP01",
+    "c02634_extreme_poly_grate_window_backtrack.wad:MAP01",
+    "c02779_proc_poly_key_return.wad:MAP01",
+    "c04074_extreme_poly_revisit_wing.wad:MAP01",
+    "c04149_dungeon_key_return.wad:MAP01",
+    "c04988_extreme_poly_aliased_labyrinth.wad:MAP01"
+  ],
+  "single_map_gain_warning": false,
+  "game_theory": {
+    "nominal_rubric_delta": -0.0417,
+    "min_corner_delta": -0.0374,
+    "polytope_dominates": false,
+    "cvar_25_rubric_delta": 0.0
+  }
+}
