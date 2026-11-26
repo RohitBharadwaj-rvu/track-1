@@ -230,9 +230,14 @@ def verify_polygon_solvability(
             p1, p2 = pts[i], pts[(i + 1) % len(pts)]
             edge_map.setdefault((min(p1, p2), max(p1, p2)), []).append(sid)
 
+    blocking_edge_keys: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    for ps in poly_sectors:
+        for bp1, bp2 in ps.blocking_edges:
+            blocking_edge_keys.add(tuple(sorted((_snap_pt(bp1), _snap_pt(bp2)))))
+
     adj: dict[int, set[int]] = {i: set() for i in range(len(poly_sectors))}
-    for owners in edge_map.values():
-        if len(owners) == 2:
+    for ukey, owners in edge_map.items():
+        if len(owners) == 2 and ukey not in blocking_edge_keys:
             a, b = owners
             first, second = poly_sectors[a], poly_sectors[b]
             opening = min(first.height_ceiling, second.height_ceiling) - max(first.height_floor, second.height_floor)
@@ -269,8 +274,9 @@ def verify_polygon_solvability(
         errors.append("No exit polygon sector defined")
         return False, tuple(errors)
 
-    # Progression BFS across sectors
+    # Progression BFS across sectors (keys + remote door switches)
     held_keys: set[str] = set()
+    triggered_door_ids: set[int] = set()
     reachable: set[int] = set()
     changed = True
     while changed:
@@ -283,11 +289,18 @@ def verify_polygon_solvability(
                 if k not in held_keys:
                     held_keys.add(k)
                     changed = True
+            dsw = poly_sectors[cur].door_switch
+            if dsw is not None and int(dsw[2]) not in triggered_door_ids:
+                triggered_door_ids.add(int(dsw[2]))
+                changed = True
             for nxt in adj[cur]:
                 if nxt in reachable:
                     continue
-                req_key = _DOOR_KIND_TO_KEY.get(poly_sectors[nxt].kind)
+                nxt_ps = poly_sectors[nxt]
+                req_key = _DOOR_KIND_TO_KEY.get(nxt_ps.kind)
                 if req_key is not None and req_key not in held_keys:
+                    continue
+                if nxt_ps.kind == "remote_door" and int(nxt_ps.sector_id) not in triggered_door_ids:
                     continue
                 reachable.add(nxt)
                 q.append(nxt)

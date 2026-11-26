@@ -12,13 +12,75 @@ import random
 
 from training.interfaces import MapSpec
 from training.wad_gen.udmf import (
-    THEME_NAMES, PolygonSector, ThingSpec, build_grid_wad, build_polygon_wad,
+    THEME_NAMES,
+    PolygonHole,
+    PolygonSector,
+    ThingSpec,
+    build_grid_wad,
+    build_polygon_wad,
 )
 from training.wad_gen.verify import verify_grid_solvability, verify_polygon_solvability
+
+_KEY_SPECS: tuple[tuple[str, int, int], ...] = (
+    ("door_red", 13, 38),
+    ("door_blue", 5, 40),
+    ("door_yellow", 6, 39),
+)
+
+_COMBAT_MONSTER_IDS: tuple[int, ...] = (3004, 9, 3001, 3002, 65, 3005, 69, 3006, 58)
+_WEAPON_AMMO_PAIRS: tuple[tuple[int, int], ...] = (
+    (2001, 2049),  # Shotgun + ShellBox
+    (2002, 2048),  # Chaingun + ClipBox
+    (82, 2049),    # SuperShotgun + ShellBox
+    (2003, 2046),  # RocketLauncher + RocketBox
+    (2004, 2047),  # PlasmaRifle + CellPack
+)
 
 
 def _to_grid_str(buf: list[list[str]]) -> str:
     return "\n".join("".join(row) for row in buf)
+
+
+def _transform_grid(grid: str, rng: random.Random) -> str:
+    """Apply a random D4 symmetry (flips / 90-deg transpose) to eliminate spatial bias."""
+    rows = [list(line) for line in grid.splitlines() if line]
+    if rng.random() < 0.5:
+        rows = [list(reversed(r)) for r in rows]
+    if rng.random() < 0.5:
+        rows = list(reversed(rows))
+    if rng.random() < 0.5:
+        rows = [list(col) for col in zip(*rows)]
+    return _to_grid_str(rows)
+
+
+def _rect(name: str, x0: float, y0: float, x1: float, y1: float, **kwargs) -> PolygonSector:
+    xa, xb = (x0, x1) if x0 <= x1 else (x1, x0)
+    ya, yb = (y0, y1) if y0 <= y1 else (y1, y0)
+    return PolygonSector(name, ((xa, ya), (xa, yb), (xb, yb), (xb, ya)), **kwargs)
+
+
+def _octagon(cx: float, cy: float, r: float, a: float) -> tuple[tuple[float, float], ...]:
+    return (
+        (cx - r, cy - a),
+        (cx - r, cy + a),
+        (cx - a, cy + r),
+        (cx + a, cy + r),
+        (cx + r, cy + a),
+        (cx + r, cy - a),
+        (cx + a, cy - r),
+        (cx - a, cy - r),
+    )
+
+
+def _extrude(
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    dx: float,
+    dy: float,
+) -> tuple[tuple[float, float], ...]:
+    q1 = (round(p1[0] + dx, 2), round(p1[1] + dy, 2))
+    q2 = (round(p2[0] + dx, 2), round(p2[1] + dy, 2))
+    return (p2, p1, q1, q2)
 
 
 def _carve_rect(buf: list[list[str]], r0: int, c0: int, r1: int, c1: int, ch: str = ".") -> None:
@@ -111,12 +173,13 @@ def _gen_combat_grid(rng: random.Random) -> tuple[str, int, int]:
         e_lo, e_hi = 2, w // 2
         sup_c = w - 3
 
-    # Weapon & supplies near player
-    buf[max(1, mid_r - 1)][sup_c] = rng.choice(["g", "G", "a", "h"])
-    buf[min(h - 2, mid_r + 1)][sup_c] = rng.choice(["e", "h", "H", "A"])
+    # Weapon & supplies near player (covers all weapon slots, ammo types, armor, powerups)
+    wpn_ch, ammo_ch = rng.choice([("g", "e"), ("G", "a"), ("W", "e"), ("L", "o"), ("F", "u")])
+    buf[max(1, mid_r - 1)][sup_c] = wpn_ch
+    buf[min(h - 2, mid_r + 1)][sup_c] = rng.choice([ammo_ch, "H", "A", "M", "O"])
 
-    # 2-4 enemies on opposite half
-    enemy_pool = ["z", "z", "i", "s", "m"]
+    # 2-4 enemies on opposite half (full monster roster incl. ChaingunGuy, Cacodemon, HellKnight, LostSoul, Spectre)
+    enemy_pool = ["z", "s", "i", "m", "c", "k", "n", "l", "S"]
     num_enemies = rng.randint(2, 4)
     candidates = [
         (r, c)
@@ -460,24 +523,473 @@ def _gen_gauntlet_grid(rng: random.Random) -> tuple[str, int, int]:
 
 
 def _build_angled_door_exit(path: Path, rng: random.Random) -> None:
-    """A manual door leads through an offset passage to a walk-over pad or wall switch."""
+    """Manual/remote door + angled passage with optional stairs to a walk-over pad or wall switch."""
     width = rng.choice((96, 128, 160, 192))
     run = rng.randrange(224, 449, 32)
     bend = rng.choice((-128, -64, 64, 128))
-    end = 48 + run
-    far_wall = ((end + 80, bend), (end + 80, bend + width))
     switch = rng.choice((True, False))
-    sectors = (
-        PolygonSector("start", ((-256, -96), (0, 0), (0, width), (-256, width + 96))),
-        PolygonSector("door", ((0, 0), (48, 0), (48, width), (0, width)), kind="door"),
-        PolygonSector("passage", ((48, 0), (end, bend), (end, bend + width), (48, width))),
-        PolygonSector("destination", ((end, bend), *far_wall, (end, bend + width)),
-                      kind="room" if switch else "exit", exit_switch=far_wall if switch else None),
-    )
-    things = (ThingSpec(-160, width // 2, 1, rng.randrange(0, 360, 45)),)
+
+    if rng.random() < 0.45:
+        # Remote switch-triggered door in side alcove + angled exit passage
+        end = 304 + run
+        far_wall = ((end + 80, bend), (end + 80, bend + width))
+        sectors = (
+            _rect("start", 0, 0, 256, width),
+            _rect(
+                "switch_alcove",
+                0,
+                width,
+                256,
+                width + 160,
+                wall_texture="METAL1",
+                door_switch=((0, width + 160), (256, width + 160), 1),
+            ),
+            _rect("rdoor", 256, 0, 304, width, kind="remote_door", sector_id=1),
+            PolygonSector("passage", ((304, 0), (end, bend), (end, bend + width), (304, width))),
+            PolygonSector(
+                "destination",
+                ((end, bend), *far_wall, (end, bend + width)),
+                kind="room" if switch else "exit",
+                exit_switch=far_wall if switch else None,
+            ),
+        )
+        things = (ThingSpec(80, width // 2, 1, rng.randrange(0, 360, 45)),)
+    else:
+        end = 48 + run
+        far_wall = ((end + 80, bend), (end + 80, bend + width))
+        use_stairs = rng.random() < 0.5
+        if use_stairs:
+            mid_x = 48 + run // 2
+            mid_y = bend // 2
+            sectors = (
+                PolygonSector("start", ((-256, -96), (0, 0), (0, width), (-256, width + 96)), height_floor=0, height_ceiling=160),
+                PolygonSector("door", ((0, 0), (48, 0), (48, width), (0, width)), kind="door", height_floor=0, height_ceiling=160),
+                PolygonSector("step1", ((48, 0), (mid_x, mid_y), (mid_x, mid_y + width), (48, width)), height_floor=16, height_ceiling=160, wall_texture="BROWN1"),
+                PolygonSector("step2", ((mid_x, mid_y), (end, bend), (end, bend + width), (mid_x, mid_y + width)), height_floor=32, height_ceiling=160, wall_texture="STONE2"),
+                PolygonSector(
+                    "destination",
+                    ((end, bend), *far_wall, (end, bend + width)),
+                    kind="room" if switch else "exit",
+                    height_floor=32,
+                    height_ceiling=160,
+                    exit_switch=far_wall if switch else None,
+                ),
+            )
+        else:
+            sectors = (
+                PolygonSector("start", ((-256, -96), (0, 0), (0, width), (-256, width + 96))),
+                PolygonSector("door", ((0, 0), (48, 0), (48, width), (0, width)), kind="door"),
+                PolygonSector("passage", ((48, 0), (end, bend), (end, bend + width), (48, width))),
+                PolygonSector(
+                    "destination",
+                    ((end, bend), *far_wall, (end, bend + width)),
+                    kind="room" if switch else "exit",
+                    exit_switch=far_wall if switch else None,
+                ),
+            )
+        things = (ThingSpec(-160, width // 2, 1, rng.randrange(0, 360, 45)),)
+
     ok, errors = verify_polygon_solvability(sectors, things)
     if not ok:
-        raise ValueError(f"Invalid procedural polygon map: {errors}")
+        raise ValueError(f"Invalid procedural polygon door_exit map: {errors}")
+    build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((100, 150, 200)))
+
+
+def _build_poly_combat(path: Path, rng: random.Random) -> None:
+    """Angled combat arena with diamond pillar, sight!=movement (48u cliff+stairs or mid-grate), diverse foes."""
+    use_stairs = rng.choice((True, False))
+    switch = rng.random() < 0.25
+    wpn_id, ammo_id = rng.choice(_WEAPON_AMMO_PAIRS)
+    m_ang = rng.randrange(0, 360, 45)
+    p_ang = rng.randrange(0, 360, 45)
+
+    if use_stairs:
+        pillar = PolygonHole(
+            vertices=((480, 88), (520, 128), (480, 168), (440, 128)),
+            wall_texture="METAL1",
+        )
+        far_wall = ((720, 0), (720, 256))
+        sectors = (
+            _rect("west", 0, 0, 256, 256, height_floor=0, height_ceiling=176, wall_texture="STARTAN2"),
+            _rect("east_lip", 256, 0, 320, 256, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("east_arena", 320, 0, 640, 256, height_floor=48, height_ceiling=176, wall_texture="BRICK1", holes=(pillar,)),
+            _rect("step1", 0, 256, 256, 320, height_floor=16, height_ceiling=176, wall_texture="BROWN1"),
+            _rect("step2", 0, 320, 256, 384, height_floor=32, height_ceiling=176, wall_texture="BROWN1"),
+            _rect("top_w", 0, 384, 256, 512, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("top_mid", 256, 384, 320, 512, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("top_e", 320, 384, 640, 512, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("east_north", 320, 256, 640, 384, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect(
+                "exit",
+                640,
+                0,
+                720,
+                256,
+                kind="room" if switch else "exit",
+                height_floor=48,
+                height_ceiling=176,
+                exit_switch=far_wall if switch else None,
+            ),
+        )
+        enemy_spots = [(368, 64), (368, 192), (576, 64), (576, 192)]
+    else:
+        pillar = PolygonHole(
+            vertices=((448, 84), (492, 128), (448, 172), (404, 128)),
+            wall_texture="METAL1",
+        )
+        grate = ((256, 0), (256, 256))
+        far_wall = ((720, 0), (720, 256))
+        sectors = (
+            _rect("west", 0, 0, 256, 256, wall_texture="BRICK1", blocking_edges=(grate,)),
+            _rect("east", 256, 0, 640, 256, wall_texture="STONE2", holes=(pillar,)),
+            PolygonSector("flank_w", ((0, 256), (64, 416), (256, 416), (256, 256)), wall_texture="METAL1"),
+            PolygonSector("flank_e", ((256, 256), (256, 416), (576, 416), (640, 256)), wall_texture="METAL1"),
+            _rect(
+                "exit",
+                640,
+                0,
+                720,
+                256,
+                kind="room" if switch else "exit",
+                exit_switch=far_wall if switch else None,
+            ),
+        )
+        enemy_spots = [(336, 64), (336, 192), (560, 64), (560, 192)]
+
+    rng.shuffle(enemy_spots)
+    n_enemies = rng.randint(2, 4)
+    things: list[ThingSpec] = [
+        ThingSpec(80, 128, 1, p_ang),
+        ThingSpec(128, 80, wpn_id, 0),
+        ThingSpec(128, 176, ammo_id, 0),
+        ThingSpec(176, 64, rng.choice((2012, 2018, 2019, 2024)), 0),
+    ]
+    for ex, ey in enemy_spots[:n_enemies]:
+        things.append(ThingSpec(ex, ey, rng.choice(_COMBAT_MONSTER_IDS), m_ang))
+
+    ok, errors = verify_polygon_solvability(sectors, things)
+    if not ok:
+        raise ValueError(f"Invalid procedural polygon combat map: {errors}")
+    build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((100, 150, 200)))
+
+
+def _build_poly_multi_room(path: Path, rng: random.Random) -> None:
+    """Octagonal hub with diagonal branches, stairs (+16/+32/+48), low-window lure, optional switch exit."""
+    hub = _octagon(0, 0, 192, 64)
+    s_entry = _extrude(hub[6], hub[7], 0, -128)
+    exit_on_ne = rng.choice((True, False))
+    switch = rng.random() < 0.3
+    remote_exit_door = rng.random() < 0.45
+
+    # NW branch
+    nw_door = _extrude(hub[1], hub[2], -48, 48)
+    # NE branch
+    ne_door = _extrude(hub[3], hub[4], 48, 48)
+    # SE low-window dead-end lure (sight open, movement blocked -> RAY_WALL)
+    se_win = _extrude(hub[5], hub[6], 48, -48)
+    se_room = _extrude(se_win[3], se_win[2], 128, -128)
+
+    if exit_on_ne:
+        nw_room = _extrude(nw_door[3], nw_door[2], -144, 144)
+        nw_far = (nw_room[2], nw_room[3])
+        ne_s1 = _extrude(ne_door[3], ne_door[2], 64, 64)
+        ne_s2 = _extrude(ne_s1[3], ne_s1[2], 64, 64)
+        ne_top = _extrude(ne_s2[3], ne_s2[2], 128, 128)
+        ne_ex = _extrude(ne_top[3], ne_top[2], 64, 64)
+        ex_far = (ne_ex[2], ne_ex[3])
+        sectors = (
+            PolygonSector("hub", hub, "room", wall_texture="STONE2", height_floor=0, height_ceiling=176),
+            PolygonSector("s_entry", s_entry, "room", wall_texture="STARTAN2", height_floor=0, height_ceiling=176),
+            PolygonSector("nw_door", nw_door, "door", height_floor=0, height_ceiling=176),
+            PolygonSector(
+                "nw_dead",
+                nw_room,
+                "room",
+                wall_texture="BROWN1",
+                height_floor=0,
+                height_ceiling=176,
+                door_switch=(nw_far[0], nw_far[1], 1) if remote_exit_door else None,
+            ),
+            PolygonSector(
+                "ne_door",
+                ne_door,
+                "remote_door" if remote_exit_door else "door",
+                height_floor=0,
+                height_ceiling=176,
+                sector_id=1 if remote_exit_door else 0,
+            ),
+            PolygonSector("ne_s1", ne_s1, "room", wall_texture="GRAY1", height_floor=16, height_ceiling=176),
+            PolygonSector("ne_s2", ne_s2, "room", wall_texture="GRAY1", height_floor=32, height_ceiling=176),
+            PolygonSector("ne_top", ne_top, "room", wall_texture="METAL1", height_floor=48, height_ceiling=176),
+            PolygonSector(
+                "ne_exit",
+                ne_ex,
+                "room" if switch else "exit",
+                wall_texture="GRAY1",
+                height_floor=48,
+                height_ceiling=176,
+                exit_switch=ex_far if switch else None,
+            ),
+            PolygonSector("se_win", se_win, "room", wall_texture="BRICK1", height_floor=0, height_ceiling=40),
+            PolygonSector("se_lure", se_room, "room", wall_texture="BRICK1", height_floor=0, height_ceiling=176),
+        )
+        things = (
+            ThingSpec(0, -256, 1, rng.randrange(0, 360, 45)),
+            ThingSpec(-224, 224, 2012, 0),
+            ThingSpec(-192, 192, rng.choice((3004, 9, 3001)), rng.randrange(0, 360, 45)),
+            ThingSpec(336, 336, rng.choice((3004, 3001, 65)), rng.randrange(0, 360, 45)),
+            ThingSpec(240, -240, 2024, 0),
+        )
+    else:
+        ne_room = _extrude(ne_door[3], ne_door[2], 144, 144)
+        ne_far = (ne_room[2], ne_room[3])
+        nw_s1 = _extrude(nw_door[3], nw_door[2], -64, 64)
+        nw_s2 = _extrude(nw_s1[3], nw_s1[2], -64, 64)
+        nw_top = _extrude(nw_s2[3], nw_s2[2], -128, 128)
+        nw_ex = _extrude(nw_top[3], nw_top[2], -64, 64)
+        ex_far = (nw_ex[2], nw_ex[3])
+        sectors = (
+            PolygonSector("hub", hub, "room", wall_texture="STONE2", height_floor=0, height_ceiling=176),
+            PolygonSector("s_entry", s_entry, "room", wall_texture="STARTAN2", height_floor=0, height_ceiling=176),
+            PolygonSector("ne_door", ne_door, "door", height_floor=0, height_ceiling=176),
+            PolygonSector(
+                "ne_dead",
+                ne_room,
+                "room",
+                wall_texture="BROWN1",
+                height_floor=0,
+                height_ceiling=176,
+                door_switch=(ne_far[0], ne_far[1], 1) if remote_exit_door else None,
+            ),
+            PolygonSector(
+                "nw_door",
+                nw_door,
+                "remote_door" if remote_exit_door else "door",
+                height_floor=0,
+                height_ceiling=176,
+                sector_id=1 if remote_exit_door else 0,
+            ),
+            PolygonSector("nw_s1", nw_s1, "room", wall_texture="GRAY1", height_floor=16, height_ceiling=176),
+            PolygonSector("nw_s2", nw_s2, "room", wall_texture="GRAY1", height_floor=32, height_ceiling=176),
+            PolygonSector("nw_top", nw_top, "room", wall_texture="METAL1", height_floor=48, height_ceiling=176),
+            PolygonSector(
+                "nw_exit",
+                nw_ex,
+                "room" if switch else "exit",
+                wall_texture="GRAY1",
+                height_floor=48,
+                height_ceiling=176,
+                exit_switch=ex_far if switch else None,
+            ),
+            PolygonSector("se_win", se_win, "room", wall_texture="BRICK1", height_floor=0, height_ceiling=40),
+            PolygonSector("se_lure", se_room, "room", wall_texture="BRICK1", height_floor=0, height_ceiling=176),
+        )
+        things = (
+            ThingSpec(0, -256, 1, rng.randrange(0, 360, 45)),
+            ThingSpec(224, 224, 2012, 0),
+            ThingSpec(192, 192, rng.choice((3004, 9, 3001)), rng.randrange(0, 360, 45)),
+            ThingSpec(-336, 336, rng.choice((3004, 3001, 65)), rng.randrange(0, 360, 45)),
+            ThingSpec(240, -240, 2024, 0),
+        )
+
+    ok, errors = verify_polygon_solvability(sectors, things)
+    if not ok:
+        raise ValueError(f"Invalid procedural polygon multi_room map: {errors}")
+    build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((100, 150, 200)))
+
+
+def _build_poly_key_return(path: Path, rng: random.Random, *, with_combat: bool = False) -> None:
+    """Polygonal key-return with window/grate/cliff sightlines, stairs, skull/card keys, optional switch exit."""
+    door_kind, card_id, skull_id = rng.choice(_KEY_SPECS)
+    key_id = skull_id if rng.choice((True, False)) else card_id
+    switch = rng.random() < 0.25
+    p_ang = rng.randrange(0, 360, 45)
+    m_ang = rng.randrange(0, 360, 45)
+
+    mode = rng.choice(("window", "grate", "cliff_stairs", "octagonal_stairs"))
+    if mode in ("window", "grate"):
+        # Visible key across a low-ceiling window (hc=40) or impassable grate; detour north or south
+        detour_north = rng.choice((True, False))
+        y_det0, y_det1 = (160, 320) if detour_north else (-160, 0)
+        grate_edge = (((192, 0), (192, 160)),) if mode == "grate" else ()
+        far_wall = ((-240, 0), (-240, 160))
+        sectors = (
+            _rect("spawn", 0, 0, 192, 160, blocking_edges=grate_edge),
+            _rect("divider", 192, 0, 256, 160, height_ceiling=40 if mode == "window" else 128),
+            _rect("key_room", 256, 0, 448, 160, wall_texture="BRICK1"),
+            _rect("det_w", 0, y_det0, 192, y_det1, wall_texture="STONE2"),
+            _rect("det_m", 192, y_det0, 256, y_det1, wall_texture="STONE2"),
+            _rect("det_e", 256, y_det0, 448, y_det1, wall_texture="STONE2"),
+            _rect("lock", -48, 0, 0, 160, kind=door_kind),
+            _rect("vestibule", -176, 0, -48, 160, wall_texture="METAL1"),
+            _rect(
+                "exit",
+                -240,
+                0,
+                -176,
+                160,
+                kind="room" if switch else "exit",
+                exit_switch=far_wall if switch else None,
+            ),
+        )
+        things = [ThingSpec(80, 80, 1, p_ang), ThingSpec(352, 80, key_id, 0)]
+        if with_combat or rng.random() < 0.4:
+            wpn_id, ammo_id = rng.choice(_WEAPON_AMMO_PAIRS)
+            things.extend([
+                ThingSpec(96, 240 if detour_north else -80, wpn_id, 0),
+                ThingSpec(144, 240 if detour_north else -80, ammo_id, 0),
+                ThingSpec(352, 240 if detour_north else -80, rng.choice((3004, 9, 3001, 65)), m_ang),
+            ])
+    elif mode == "cliff_stairs":
+        # Visible key across 48u cliff (RAY_WALL); climb 3-step stairs (16u each) to reach key & elevated lock
+        far_wall = ((688, 0), (688, 160))
+        sectors = (
+            _rect("spawn", 0, 0, 192, 160, height_floor=0, height_ceiling=176),
+            _rect("ledge_lip", 192, 0, 256, 160, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("ledge_key", 256, 0, 448, 160, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("step1", 0, 160, 192, 224, height_floor=16, height_ceiling=176, wall_texture="BROWN1"),
+            _rect("step2", 0, 224, 192, 288, height_floor=32, height_ceiling=176, wall_texture="BROWN1"),
+            _rect("top_nw", 0, 288, 192, 416, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("top_mid", 192, 288, 256, 416, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("top_ne", 256, 288, 448, 416, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("east_hall", 256, 160, 448, 288, height_floor=48, height_ceiling=176, wall_texture="STONE2"),
+            _rect("lock", 448, 0, 496, 160, kind=door_kind, height_floor=48, height_ceiling=176),
+            _rect("vestibule", 496, 0, 624, 160, height_floor=48, height_ceiling=176),
+            _rect(
+                "exit",
+                624,
+                0,
+                688,
+                160,
+                kind="room" if switch else "exit",
+                height_floor=48,
+                height_ceiling=176,
+                exit_switch=far_wall if switch else None,
+            ),
+        )
+        things = [ThingSpec(80, 80, 1, p_ang), ThingSpec(352, 80, key_id, 0)]
+        if with_combat or rng.random() < 0.4:
+            things.extend([
+                ThingSpec(96, 352, 2001, 0),
+                ThingSpec(352, 352, rng.choice((3004, 3001, 9)), m_ang),
+            ])
+    else:
+        # Octagonal hub with diagonal stair key wing -> diagonal locked vault
+        hub = _octagon(0, 0, 192, 64)
+        w_entry = _extrude(hub[0], hub[1], -128, 0)
+        nw_door = _extrude(hub[1], hub[2], -48, 48)
+        nw_trap = _extrude(nw_door[3], nw_door[2], -128, 128)
+        se_s1 = _extrude(hub[5], hub[6], 64, -64)
+        se_s2 = _extrude(se_s1[3], se_s1[2], 64, -64)
+        se_key = _extrude(se_s2[3], se_s2[2], 144, -144)
+        ne_lock = _extrude(hub[3], hub[4], 48, 48)
+        ne_vault = _extrude(ne_lock[3], ne_lock[2], 128, 128)
+        ne_exit = _extrude(ne_vault[3], ne_vault[2], 64, 64)
+        hub_pillar = PolygonHole(vertices=((0, -40), (40, 0), (0, 40), (-40, 0)), wall_texture="METAL1")
+        ex_far = (ne_exit[2], ne_exit[3])
+        sectors = (
+            PolygonSector("hub", hub, "room", wall_texture="GRAY1", height_floor=0, height_ceiling=176, holes=(hub_pillar,)),
+            PolygonSector("w_entry", w_entry, "room", wall_texture="STARTAN2", height_floor=0, height_ceiling=176),
+            PolygonSector("nw_door", nw_door, "door", height_floor=0, height_ceiling=176),
+            PolygonSector("nw_trap", nw_trap, "room", wall_texture="BROWN1", height_floor=0, height_ceiling=176),
+            PolygonSector("se_s1", se_s1, "room", wall_texture="STONE2", height_floor=16, height_ceiling=176),
+            PolygonSector("se_s2", se_s2, "room", wall_texture="STONE2", height_floor=32, height_ceiling=176),
+            PolygonSector("se_key", se_key, "room", wall_texture="BRICK1", height_floor=48, height_ceiling=176),
+            PolygonSector("ne_lock", ne_lock, door_kind, height_floor=0, height_ceiling=176),
+            PolygonSector("ne_vault", ne_vault, "room", wall_texture="METAL1", height_floor=0, height_ceiling=176),
+            PolygonSector(
+                "ne_exit",
+                ne_exit,
+                "room" if switch else "exit",
+                height_floor=0,
+                height_ceiling=176,
+                exit_switch=ex_far if switch else None,
+            ),
+        )
+        wpn_id, ammo_id = rng.choice(_WEAPON_AMMO_PAIRS)
+        things = [
+            ThingSpec(-256, 0, 1, p_ang),
+            ThingSpec(-160, 0, wpn_id, 0),
+            ThingSpec(-160, 32, ammo_id, 0),
+            ThingSpec(320, -320, key_id, 0),
+            ThingSpec(280, -280, rng.choice((3001, 65, 9)), m_ang),
+            ThingSpec(-224, 224, 2011, 0),
+            ThingSpec(240, 240, rng.choice((3004, 3001)), m_ang),
+        ]
+
+    ok, errors = verify_polygon_solvability(sectors, things)
+    if not ok:
+        raise ValueError(f"Invalid procedural polygon key_return map ({mode}): {errors}")
+    build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((100, 150, 200)))
+
+
+def _build_poly_gauntlet(path: Path, rng: random.Random) -> None:
+    """Two-lock octagonal citadel with elevated stair sanctum, skull/card keys, diverse foes & weapons."""
+    keys = list(_KEY_SPECS)
+    rng.shuffle(keys)
+    (lock1, c1, s1), (lock2, c2, s2) = keys[0], keys[1]
+    key1_id = s1 if rng.choice((True, False)) else c1
+    key2_id = s2 if rng.choice((True, False)) else c2
+    wpn_id, ammo_id = rng.choice(_WEAPON_AMMO_PAIRS)
+    switch = rng.random() < 0.25
+    m_ang = rng.randrange(0, 360, 45)
+
+    hub = _octagon(0, 0, 224, 64)
+    s_spawn = _extrude(hub[6], hub[7], 0, -128)
+    w_door = _extrude(hub[0], hub[1], -48, 0)
+    w_room = _extrude(w_door[3], w_door[2], -192, 0)
+    e_lock1 = _extrude(hub[4], hub[5], 48, 0)
+    e_room = _extrude(e_lock1[3], e_lock1[2], 224, 0)
+    nw_alcove = _extrude(hub[1], hub[2], -112, 112)
+    # North elevated stair sanctum (0 -> 16 -> 32 -> 48 -> lock2 -> sanctum -> exit)
+    n_s1 = _extrude(hub[2], hub[3], 0, 48)
+    n_s2 = _extrude(n_s1[3], n_s1[2], 0, 48)
+    n_land = _extrude(n_s2[3], n_s2[2], 0, 64)
+    n_lock2 = _extrude(n_land[3], n_land[2], 0, 48)
+    n_sanctum = _extrude(n_lock2[3], n_lock2[2], 0, 160)
+    n_exit = _extrude(n_sanctum[3], n_sanctum[2], 0, 64)
+    ex_far = (n_exit[2], n_exit[3])
+
+    center_diamond = PolygonHole(vertices=((0, -48), (48, 0), (0, 48), (-48, 0)), wall_texture="BRICK1")
+    sectors = (
+        PolygonSector("hub", hub, "room", wall_texture="STONE2", height_floor=0, height_ceiling=176, holes=(center_diamond,)),
+        PolygonSector("s_spawn", s_spawn, "room", wall_texture="STARTAN2", height_floor=0, height_ceiling=176),
+        PolygonSector("w_door", w_door, "door", height_floor=0, height_ceiling=176),
+        PolygonSector("w_room", w_room, "room", wall_texture="BROWN1", height_floor=0, height_ceiling=176),
+        PolygonSector("e_lock1", e_lock1, lock1, height_floor=0, height_ceiling=176),
+        PolygonSector("e_room", e_room, "room", wall_texture="BRICK1", height_floor=0, height_ceiling=176),
+        PolygonSector("nw_alcove", nw_alcove, "room", wall_texture="GRAY1", height_floor=0, height_ceiling=176),
+        PolygonSector("n_s1", n_s1, "room", wall_texture="BROWN1", height_floor=16, height_ceiling=176),
+        PolygonSector("n_s2", n_s2, "room", wall_texture="BROWN1", height_floor=32, height_ceiling=176),
+        PolygonSector("n_land", n_land, "room", wall_texture="STONE2", height_floor=48, height_ceiling=176),
+        PolygonSector("n_lock2", n_lock2, lock2, height_floor=48, height_ceiling=176),
+        PolygonSector("n_sanctum", n_sanctum, "room", wall_texture="METAL1", height_floor=48, height_ceiling=176),
+        PolygonSector(
+            "n_exit",
+            n_exit,
+            "room" if switch else "exit",
+            height_floor=48,
+            height_ceiling=176,
+            exit_switch=ex_far if switch else None,
+        ),
+    )
+    things = (
+        ThingSpec(0, -288, 1, rng.randrange(0, 360, 45)),
+        ThingSpec(0, -224, wpn_id, 0),
+        ThingSpec(-32, -256, ammo_id, 0),
+        ThingSpec(-192, 192, rng.choice((2018, 2019, 2024)), 0),
+        ThingSpec(-160, 160, rng.choice((3004, 65, 3006)), m_ang),
+        ThingSpec(-400, 0, key1_id, 0),
+        ThingSpec(-336, 24, rng.choice((3001, 9, 58)), m_ang),
+        ThingSpec(432, 0, key2_id, 0),
+        ThingSpec(352, -24, rng.choice((65, 3005, 69, 9)), m_ang),
+        ThingSpec(352, 24, 2012, 0),
+        ThingSpec(128, -96, rng.choice((3004, 3002, 3001)), m_ang),
+        ThingSpec(0, 512, rng.choice((3001, 69, 3005)), m_ang),
+    )
+    ok, errors = verify_polygon_solvability(sectors, things)
+    if not ok:
+        raise ValueError(f"Invalid procedural polygon gauntlet map: {errors}")
     build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((100, 150, 200)))
 
 
@@ -541,12 +1053,26 @@ def generate_procedural_wad(
     rng = random.Random(int(seed))
     theme = rng.choice(THEME_NAMES)
     out_path = Path(out_dir) / f"proc_{family}_s{seed}.wad"
-    if family == "door_exit" and rng.randrange(4) == 0:
+    if family == "door_exit" and rng.random() < 0.40:
         _build_angled_door_exit(out_path, rng)
         return MapSpec(str(out_path), family=family, tier=2, split=split, episode_ticks=2100)
-    if family == "key_return" and return_distance is None and rng.randrange(5) == 0:
-        _build_key_window_detour(out_path, rng)
-        return MapSpec(str(out_path), family=family, tier=3, split=split, episode_ticks=3150)
+    if family == "combat" and rng.random() < 0.35:
+        _build_poly_combat(out_path, rng)
+        return MapSpec(str(out_path), family=family, tier=1, split=split, episode_ticks=2100)
+    if family == "multi_room" and rng.random() < 0.35:
+        _build_poly_multi_room(out_path, rng)
+        return MapSpec(str(out_path), family=family, tier=2, split=split, episode_ticks=2100)
+    if family == "key_return" and return_distance is None:
+        roll = rng.random()
+        if roll < 0.15:
+            _build_key_window_detour(out_path, rng)
+            return MapSpec(str(out_path), family=family, tier=3, split=split, episode_ticks=3150)
+        if roll < 0.40:
+            _build_poly_key_return(out_path, rng, with_combat=with_combat)
+            return MapSpec(str(out_path), family=family, tier=3, split=split, episode_ticks=3150)
+    if family == "gauntlet" and rng.random() < 0.30:
+        _build_poly_gauntlet(out_path, rng)
+        return MapSpec(str(out_path), family=family, tier=4, split=split, episode_ticks=4200)
     if family == "door_exit":
         grid, angle, cell_size = _gen_door_exit_grid(rng)
         tier, ticks = 2, 2100
@@ -569,6 +1095,7 @@ def generate_procedural_wad(
     else:
         raise ValueError(f"Unsupported procedural family: {family!r}")
 
+    grid = _transform_grid(grid, rng)
     check = verify_grid_solvability(grid)
     if not check.ok:
         raise RuntimeError(f"Procedural generator produced unsolvable {family} seed={seed}: {check.errors}")
@@ -581,6 +1108,7 @@ def generate_procedural_wad(
         player_angle=(angle + rng.choice((0, 90, 180, 270))) % 360,
         monster_angle=rng.randrange(0, 360, 45),
         skull_keys=rng.choice((False, True)),
+        door_close_delay=rng.choice((100, 150, 200)),
         theme=theme,
     )
     return MapSpec(

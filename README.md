@@ -82,7 +82,7 @@ One NVIDIA **RTX 3090 (24 GB)** shared between evaluation workers. Each agent ge
 
 ## Navigation stress evaluation
 
-Run the submission checkpoint on the seven held-out navigation maps or on bundled
+Run the submission checkpoint on the ten held-out navigation/combat stress maps or on bundled
 Freedoom2 MAP01 through MAP04. Run each suite separately so its scores can be compared across checkpoints.
 
 ```shell
@@ -92,8 +92,10 @@ uv run python -m training.maps --split stress --generate --verify
 ```
 
 The stress suite varies the spawn heading in one hall, replaces its walk-over exit with a
-wall switch, compares a direct skull pickup with a low-window detour, and tests a long
-key return through repeated junctions. The existing Dev suite and the 38-map `all`
+wall switch, compares a direct skull pickup with a low-window detour, tests a long
+key return through repeated junctions, climbs a 3-step staircase to bypass a 48-unit cliff,
+activates a remote switch to raise a tagged door, and flanks diverse monsters behind an
+impassable mid-grate. The existing Dev suite and the 38-map `all`
 suite retain their original membership. The Freedoom suite uses the local Tier 4
 reporting bucket and a 4,200-tick cap. Its four maps have no official tier assignment.
 

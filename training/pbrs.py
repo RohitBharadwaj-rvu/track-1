@@ -25,6 +25,7 @@ from doom_env.mapinfo import (
     load_mapinfo,
     parse_udmf,
 )
+from doom_env.sensors import MAX_STEP_UP, PLAYER_HEIGHT
 from doom_env.wad import map_lumps, read_wad
 
 # ZDoom UDMF lock numbers + binary lock numbers -> canonical color index {0: blue, 1: yellow, 2: red}
@@ -50,8 +51,6 @@ _KEY_THING_TO_COLOR: dict[int, int] = {
 _EXIT_SPECIALS = {11, 52, 243, 244}
 _INF = 1e9
 _MAX_POTENTIAL_DIST = 6.0
-_PLAYER_HEIGHT = 56.0
-_MAX_STEP_UP = 24.0
 
 
 def _segments_intersect_batch(
@@ -141,7 +140,7 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
     imp = info.lines.impassable
 
     one_sided = (front < 0) | (back < 0)
-    solid_mask = one_sided | imp
+    solid_mask = (one_sided | imp).copy()
 
     exit_pts: list[tuple[float, float]] = []
     key_pts: list[tuple[float, float, int]] = []
@@ -153,22 +152,25 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
         sectors = blocks.get("sector", [])
 
         # Block two-sided non-door linedefs whose opening < PLAYER_HEIGHT (windows) or |step| > MAX_STEP_UP (ledges)
-        if sectors:
+        # (matches doom_env.sensors.LevelGeometry.update).
+        if len(sectors) == info.num_sectors and len(sectors) > 0:
             sec_hf = np.array([float(s.get("heightfloor", 0.0)) for s in sectors], dtype=np.float64)
             sec_hc = np.array([float(s.get("heightceiling", 128.0)) for s in sectors], dtype=np.float64)
-            n_sec = len(sectors)
-            door_sec_set = set(info.door_sectors.keys())
-            two_sided_idx = np.flatnonzero((~solid_mask) & (front >= 0) & (back >= 0) & (front < n_sec) & (back < n_sec))
-            for li in two_sided_idx.tolist():
-                sa, sb = int(front[li]), int(back[li])
-                if sa in door_sec_set or sb in door_sec_set:
-                    continue
-                opening = min(sec_hc[sa], sec_hc[sb]) - max(sec_hf[sa], sec_hf[sb])
-                step = abs(sec_hf[sa] - sec_hf[sb])
-                if opening < _PLAYER_HEIGHT or step > _MAX_STEP_UP:
-                    solid_mask[li] = True
+            is_door_sec = np.zeros(len(sectors), dtype=bool)
+            for sid in info.door_sectors:
+                if 0 <= sid < len(sectors):
+                    is_door_sec[sid] = True
+            two_sided_idx = np.flatnonzero((~solid_mask) & (front >= 0) & (back >= 0) & (front < len(sectors)) & (back < len(sectors)))
+            if len(two_sided_idx) > 0:
+                sa_v, sb_v = front[two_sided_idx], back[two_sided_idx]
+                non_door = ~(is_door_sec[sa_v] | is_door_sec[sb_v])
+                opening = np.minimum(sec_hc[sa_v], sec_hc[sb_v]) - np.maximum(sec_hf[sa_v], sec_hf[sb_v])
+                step = np.abs(sec_hf[sa_v] - sec_hf[sb_v])
+                height_blocked = non_door & ((opening < PLAYER_HEIGHT) | (step > MAX_STEP_UP))
+                solid_mask[two_sided_idx[height_blocked]] = True
 
         # Exits via exit linedef special or GATE3 floor sector
+        inward_nudge = min(16.0, float(cell_size) * 0.5)
         for ld in blocks.get("linedef", []):
             spec = int(ld.get("special", 0) or 0)
             if spec in _EXIT_SPECIALS:
@@ -177,15 +179,15 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
                     x1, y1 = verts[v1]
                     x2, y2 = verts[v2]
                     mx, my = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-                    # For one-sided wall switches, offset 16u inward onto the front-side walkable room
-                    sb = ld.get("sideback", -1)
-                    if not (isinstance(sb, int) and sb >= 0):
-                        seg_len = math.hypot(x2 - x1, y2 - y1)
+                    # One-sided wall switch: nudge inward along Doom's right-hand front normal
+                    # so the exit target cell always lands inside the playable room.
+                    has_back = isinstance(ld.get("sideback", -1), int) and int(ld.get("sideback", -1)) >= 0
+                    if not has_back:
+                        dx, dy = x2 - x1, y2 - y1
+                        seg_len = math.hypot(dx, dy)
                         if seg_len > 1e-6:
-                            # Doom front-side normal is to the right of v1 -> v2: (dy/L, -dx/L)
-                            nx_in = (y2 - y1) / seg_len
-                            ny_in = -(x2 - x1) / seg_len
-                            exit_pts.append((mx + 16.0 * nx_in, my + 16.0 * ny_in))
+                            mx += (dy / seg_len) * inward_nudge
+                            my += (-dx / seg_len) * inward_nudge
                     exit_pts.append((mx, my))
 
         exit_sec_ids = {

@@ -174,7 +174,7 @@ def generate_training_variations(
     *,
     count_per_family: int = 2,
     base_seed: int = 1000,
-    families: Sequence[str] = ("combat", "multi_room", "key_return", "gauntlet"),
+    families: Sequence[str] = ("door_exit", "combat", "multi_room", "key_return", "gauntlet"),
 ) -> list[MapSpec]:
     """Generate fresh procedural training variations on demand (not committed to git)."""
     specs: list[MapSpec] = []

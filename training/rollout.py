@@ -109,7 +109,7 @@ def resolve_train_maps(
         if not specs:
             specs = list(DEFAULT_TRAIN_MAPS)
 
-    if procedural_per_family > 0:
+    if procedural_per_family > 0 and not map_args and stage != "connect":
         try:
             maps_mod = importlib.import_module("training.maps")
             if hasattr(maps_mod, "generate_training_variations"):

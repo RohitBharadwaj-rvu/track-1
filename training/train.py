@@ -41,7 +41,7 @@ class TrainConfig:
     eval_deterministic: bool = False
     split: str = "train"
     stage: str | None = None
-    procedural_per_family: int = 0
+    procedural_per_family: int = 2
     procedural_dir: str | None = None
     tier_weights: dict[int, float] | None = None
     auto_curriculum: bool = True
@@ -187,12 +187,13 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
+    proc_dir = cfg.procedural_dir or str(Path(cfg.checkpoint_dir) / "proc_wads")
     map_specs = resolve_train_maps(
         list(cfg.maps) if cfg.maps else None,
         split=cfg.split,
         stage=cfg.stage,
         procedural_per_family=cfg.procedural_per_family,
-        procedural_dir=cfg.procedural_dir,
+        procedural_dir=proc_dir,
         procedural_seed=cfg.seed + 1000,
     )
     effective_reward_cfg = (
@@ -632,7 +633,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--map", dest="maps", action="append", default=[])
     p.add_argument("--split", default="train")
     p.add_argument("--stage", default=None)
-    p.add_argument("--procedural-per-family", type=int, default=0)
+    p.add_argument("--procedural-per-family", type=int, default=2)
     p.add_argument("--procedural-dir", default=None)
     p.add_argument("--tier-weights", default=None, help="Comma-separated tier:weight, e.g. 1:0.4,2:0.3,3:0.2,4:0.1")
     p.add_argument("--auto-curriculum", dest="auto_curriculum", action="store_true", default=True)
