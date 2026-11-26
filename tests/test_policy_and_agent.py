@@ -207,11 +207,9 @@ def test_evaluate_chunks_matches_step_by_step_with_resets(arch: str, with_resets
 
             obs_t = {k: v[t] for k, v in obs_seq.items()}
             logits_t, value_t, h = policy.act_step(obs_t, prev_a, h)
-            probs_t = torch.sigmoid(logits_t)
-            act_t = torch.bernoulli(probs_t, generator=gen)
-
-            lp_t = -F.binary_cross_entropy_with_logits(logits_t, act_t, reduction="none").sum(dim=-1)
-            ent_t = -(probs_t * F.logsigmoid(logits_t) + (1.0 - probs_t) * F.logsigmoid(-logits_t)).sum(dim=-1)
+            act_t, lp_t = policy.sample_action(logits_t, deterministic=False, generator=gen)
+            lp_check, ent_t = policy.logprob_and_entropy(logits_t, act_t)
+            torch.testing.assert_close(lp_t, lp_check, atol=1e-5, rtol=1e-5)
 
             actions.append(act_t)
             step_values.append(value_t)
@@ -228,6 +226,52 @@ def test_evaluate_chunks_matches_step_by_step_with_resets(arch: str, with_resets
     torch.testing.assert_close(seq_lp, torch.stack(step_log_probs, dim=0), atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(seq_ent, torch.stack(step_entropy, dim=0), atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(seq_val, torch.stack(step_values, dim=0), atol=1e-5, rtol=1e-5)
+
+
+def test_factorized_action_head_forbids_contradictory_buttons():
+    torch.manual_seed(5)
+    policy = build_policy(PolicyConfig(arch="telemetry_gru_v1", action_head="factorized"))
+    policy.eval()
+    logits = torch.randn(512, 12)
+    gen = torch.Generator().manual_seed(77)
+    act, lp = policy.sample_action(logits, deterministic=False, generator=gen)
+    assert act.shape == (512, NUM_ACTIONS)
+    assert torch.isfinite(lp).all()
+    # Mutually exclusive pairs must never both be 1
+    assert not bool(((act[:, 0] > 0.5) & (act[:, 1] > 0.5)).any())
+    assert not bool(((act[:, 2] > 0.5) & (act[:, 3] > 0.5)).any())
+    assert not bool(((act[:, 4] > 0.5) & (act[:, 5] > 0.5)).any())
+
+
+def test_sign_verified_entity_kinematics_and_ammo_empty_flag():
+    policy = build_policy(PolicyConfig(arch="telemetry_gru_v1"))
+    enc = policy.entity_encoder
+    # Entity at 90 deg LEFT (sin=1, cos=0), distance=0.25:
+    # Moving RIGHT (+vel_right = +1.0) means moving TOWARD player -> positive closing speed!
+    # Moving LEFT (-vel_right = -1.0) means moving AWAY -> negative closing speed!
+    ent_feat = torch.zeros(2, 1, 5)
+    ent_feat[0, 0] = torch.tensor([0.25, 1.0, 0.0, 0.0, 1.0])
+    ent_feat[1, 0] = torch.tensor([0.25, 1.0, 0.0, 0.0, -1.0])
+    ent_mask = torch.ones(2, 1)
+    norm = enc._normalize_features(ent_feat, ent_mask)
+    closing_toward = float(norm[0, 0, 6])
+    closing_away = float(norm[1, 0, 6])
+    inv_tti_toward = float(norm[0, 0, 8])
+    inv_tti_away = float(norm[1, 0, 8])
+    assert closing_toward > 0.5 and closing_away < -0.5
+    assert inv_tti_toward > 0.5 and inv_tti_away == pytest.approx(0.0)
+
+    # Empty ammo vs 2 shells (2/50 = 0.04) should strongly separate VitalsActionEncoder outputs
+    v0 = torch.zeros(1, NUM_VITALS)
+    v2 = torch.zeros(1, NUM_VITALS)
+    v0[0, 0] = 1.0
+    v2[0, 0] = 1.0
+    v2[0, 3] = 0.04  # 2 shells / 50
+    prev = torch.zeros(1, NUM_ACTIONS)
+    with torch.no_grad():
+        e0 = policy.vitals_encoder(v0, prev)
+        e2 = policy.vitals_encoder(v2, prev)
+    assert (e0 - e2).abs().max().item() > 0.05
 
 
 @pytest.mark.parametrize("arch", ["telemetry_gru_v1", "stub"])

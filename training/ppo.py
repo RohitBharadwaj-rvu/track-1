@@ -21,14 +21,14 @@ from training.rollout import RolloutBuffer
 @dataclass(frozen=True)
 class PPOConfig:
     lr: float = 3e-4
-    gamma: float = 0.99
+    gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
     vf_coef: float = 0.5
     ent_coef: float = 0.01
     max_grad_norm: float = 0.5
     update_epochs: int = 4
-    chunk_len: int = 32
+    chunk_len: int = 64
     num_minibatches: int = 4
     target_kl: float | None = 0.03
     normalize_advantages: bool = True

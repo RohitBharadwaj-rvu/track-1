@@ -23,23 +23,28 @@ from training.rollout import (
     SyncVecDoomEnv,
     collect_rollout,
     resolve_train_maps,
+    resolve_train_maps_and_weights,
 )
 
 
 @dataclass
 class TrainConfig:
     arch: str = "telemetry_gru_v1"
+    action_head: str = "factorized"  # "factorized" | "bernoulli"
     hidden_size: int = 256
     ray_channels: int = 32
     entity_dim: int = 64
     vitals_dim: int = 64
     num_memory_slots: int = 0
     split: str = "train"
+    curriculum_stage: str | None = None
+    procedural_count: int = 0
     maps: tuple[str, ...] = ()
     num_envs: int = 4
     vec_mode: str = "subproc"  # "subproc" | "sync"
-    rollout_steps: int = 128
-    chunk_len: int = 32
+    max_cached_envs: int = 32
+    rollout_steps: int = 256
+    chunk_len: int = 64
     num_minibatches: int = 4
     update_epochs: int = 4
     total_steps: int = 50_000
@@ -47,7 +52,7 @@ class TrainConfig:
     device: str = "auto"
     lr: float = 3e-4
     ent_coef: float = 0.01
-    gamma: float = 0.99
+    gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
     vf_coef: float = 0.5
@@ -77,7 +82,10 @@ def _make_vec_env(
     seed: int,
     render_buffers: bool = False,
     reward_config: RewardConfig | None = None,
+    map_weights: list[float] | None = None,
+    max_cached_envs: int = 32,
 ):
+    cache_size = max(max_cached_envs, len(map_specs))
     if vec_mode == "sync":
         return SyncVecDoomEnv(
             map_specs=map_specs,
@@ -85,6 +93,8 @@ def _make_vec_env(
             base_seed=seed,
             render_buffers=render_buffers,
             num_envs=num_envs,
+            max_cached_envs=cache_size,
+            map_weights=map_weights,
         )
     if vec_mode == "subproc":
         return SubprocVecDoomEnv(
@@ -93,6 +103,8 @@ def _make_vec_env(
             base_seed=seed,
             render_buffers=render_buffers,
             num_envs=num_envs,
+            max_cached_envs=cache_size,
+            map_weights=map_weights,
         )
     raise ValueError(f"Unsupported vec_mode: {vec_mode!r}")
 
@@ -134,7 +146,26 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    map_specs = resolve_train_maps(list(cfg.maps) if cfg.maps else None, split=cfg.split)
+    map_specs, map_weights = resolve_train_maps_and_weights(
+        list(cfg.maps) if cfg.maps else None,
+        split=cfg.split,
+        curriculum_stage=cfg.curriculum_stage,
+    )
+    ckpt_dir = Path(cfg.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.procedural_count > 0 and not cfg.maps:
+        from training.maps import generate_training_variations
+
+        proc_specs = generate_training_variations(
+            ckpt_dir / "procedural_maps",
+            count_per_family=cfg.procedural_count,
+            base_seed=cfg.seed + 1000,
+        )
+        if map_weights is not None:
+            mean_w = float(np.mean(map_weights))
+            map_weights = [*map_weights, *([mean_w] * len(proc_specs))]
+        map_specs = [*map_specs, *proc_specs]
+
     ppo_cfg = PPOConfig(
         lr=cfg.lr,
         gamma=cfg.gamma,
@@ -161,6 +192,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     else:
         policy_cfg = PolicyConfig(
             arch=cfg.arch,
+            action_head=cfg.action_head,
             hidden_size=cfg.hidden_size,
             ray_channels=cfg.ray_channels,
             entity_dim=cfg.entity_dim,
@@ -173,8 +205,6 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     steps_per_update = cfg.rollout_steps * cfg.num_envs
     target_updates = max(1, (cfg.total_steps + steps_per_update - 1) // steps_per_update)
 
-    ckpt_dir = Path(cfg.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = ckpt_dir / "metrics.jsonl"
     resume_path = ckpt_dir / "latest_train_state.pt"
 
@@ -189,6 +219,8 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
         seed=cfg.seed,
         render_buffers=cfg.render_buffers,
         reward_config=reward_config,
+        map_weights=map_weights,
+        max_cached_envs=cfg.max_cached_envs,
     ) as vec_env:
         obs = vec_env.reset()
         prev_action = np.zeros((cfg.num_envs, NUM_ACTIONS), dtype=np.float32)
@@ -460,6 +492,7 @@ def verify_checkpoint_two_maps(
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Role 2 Recurrent PPO Trainer & Throughput Sweeper")
     p.add_argument("--arch", default="telemetry_gru_v1")
+    p.add_argument("--action-head", choices=("factorized", "bernoulli"), default="factorized")
     p.add_argument("--hidden-size", type=int, default=256)
     p.add_argument("--ray-channels", type=int, default=32)
     p.add_argument("--entity-dim", type=int, default=64)
@@ -467,10 +500,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-memory-slots", type=int, default=0)
     p.add_argument("--map", dest="maps", action="append", default=[])
     p.add_argument("--split", default="train")
+    p.add_argument("--curriculum-stage", default=None, help="Role 3 stage: connect|mvp|progression|full|...")
+    p.add_argument("--procedural-count", type=int, default=0, help="Extra procedural WADs per family")
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--vec-mode", choices=("subproc", "sync"), default="subproc")
-    p.add_argument("--rollout-steps", type=int, default=128)
-    p.add_argument("--chunk-len", type=int, default=32)
+    p.add_argument("--max-cached-envs", type=int, default=32)
+    p.add_argument("--rollout-steps", type=int, default=256)
+    p.add_argument("--chunk-len", type=int, default=64)
     p.add_argument("--num-minibatches", type=int, default=4)
     p.add_argument("--update-epochs", type=int, default=4)
     p.add_argument("--total-steps", type=int, default=50_000)
@@ -478,7 +514,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="auto")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--ent-coef", type=float, default=0.01)
-    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gamma", type=float, default=0.995)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--no-anneal-lr", action="store_true")
     p.add_argument("--checkpoint-dir", default="training/runs/default")
@@ -512,15 +548,19 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg = TrainConfig(
         arch=args.arch,
+        action_head=args.action_head,
         hidden_size=args.hidden_size,
         ray_channels=args.ray_channels,
         entity_dim=args.entity_dim,
         vitals_dim=args.vitals_dim,
         num_memory_slots=args.num_memory_slots,
         split=args.split,
+        curriculum_stage=args.curriculum_stage,
+        procedural_count=args.procedural_count,
         maps=tuple(args.maps),
         num_envs=args.num_envs,
         vec_mode=args.vec_mode,
+        max_cached_envs=args.max_cached_envs,
         rollout_steps=args.rollout_steps,
         chunk_len=args.chunk_len,
         num_minibatches=args.num_minibatches,

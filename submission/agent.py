@@ -96,11 +96,11 @@ class DoomAgent:
         with torch.inference_mode():
             obs_t = _obs_to_batch_tensors(observation, self.device)
             logits, _, next_hidden = self.policy.act_step(obs_t, self._prev_action, self._hidden)
-            probs = torch.sigmoid(logits)
-            if self.deterministic:
-                action_t = (probs >= self.action_threshold).to(dtype=torch.float32)
-            else:
-                action_t = torch.bernoulli(probs)
+            action_t, _ = self.policy.sample_action(
+                logits,
+                deterministic=self.deterministic,
+                threshold=self.action_threshold,
+            )
             self._hidden = next_hidden
             self._prev_action = action_t
             return action_t[0].detach().cpu().numpy().astype(np.int8, copy=False)

@@ -110,24 +110,24 @@ def test_exploration_cap_combat_and_reward_hierarchy():
         )
         completed_return += r
 
-    # 2. Stalled max-exploration + moderate combat run (visits 60 cells > cap 40, 2 kills, times out)
+    # 2. Stalled max-exploration + moderate combat run (visits 170 cells > cap 150, 2 kills, times out)
     shaper.reset(_priv(tic=0, x=0.0))
     explore_sum = 0.0
     stalled_return = 0.0
-    for step_idx in range(1, 61):
+    for step_idx in range(1, 171):
         r, _, comp = shaper.step(
             _priv(
-                tic=step_idx * 16,
-                episode_ticks=1000,
+                tic=step_idx * 12,
+                episode_ticks=2100,
                 x=float(step_idx * 64),
                 kills=2 if step_idx >= 20 else 0,
-                timeout=(step_idx == 60),
+                timeout=(step_idx == 170),
             )
         )
         explore_sum += comp["explore"]
         stalled_return += r
 
-    assert shaper.unique_cells_visited == 61
+    assert shaper.unique_cells_visited == 171
     assert explore_sum == pytest.approx(cfg.max_exploration_cells * cfg.new_cell_reward)
 
     # 3. Early death run with damage
@@ -140,6 +140,66 @@ def test_exploration_cap_combat_and_reward_hierarchy():
     assert comp_death["death"] == pytest.approx(cfg.death_penalty)
 
     assert completed_return > stalled_return > death_r
+
+
+def test_post_key_reset_door_bounce_wasted_ammo_and_health_exit():
+    cfg = RewardConfig()
+    shaper = RewardShaper(cfg)
+
+    def _obs(ammo: float, has_enemy: bool):
+        mask = np.zeros(32, dtype=np.int8)
+        etypes = np.zeros(32, dtype=np.int64)
+        if has_enemy:
+            mask[0] = 1
+            etypes[0] = 2  # enemy_hitscan
+        vitals = np.zeros(17, dtype=np.float32)
+        vitals[3] = ammo
+        return {"vitals": vitals, "visible_entities": {"mask": mask, "entity_type": etypes}}
+
+    shaper.reset(_priv(tic=0, x=0.0), obs=_obs(10.0, False))
+    # Visit cell x=64 before key pickup
+    _, _, c1 = shaper.step(_priv(tic=4, x=64.0), obs=_obs(10.0, False))
+    assert c1["explore"] == pytest.approx(cfg.new_cell_reward)
+    assert c1["post_key_explore"] == pytest.approx(0.0)
+
+    # Pick up key at x=128
+    _, _, c2 = shaper.step(_priv(tic=8, x=128.0, keys=[1, 0, 0, 0, 0, 0]), obs=_obs(10.0, False))
+    assert c2["key"] == pytest.approx(cfg.key_pickup_reward)
+
+    # Backtrack to already-visited cell x=64 -> earns bounded post-key exploration!
+    _, _, c3 = shaper.step(_priv(tic=12, x=64.0, keys=[1, 0, 0, 0, 0, 0]), obs=_obs(9.0, False))
+    assert c3["explore"] == pytest.approx(0.0)
+    assert c3["post_key_explore"] == pytest.approx(cfg.post_key_cell_reward)
+    # Ammo dropped from 10->9 with no visible enemy -> wasted ammo penalty
+    assert c3["wasted_ammo"] == pytest.approx(cfg.wasted_ammo_penalty)
+
+    # Door starts rising, then USE pulses 0->1 and door ceiling drops -> exact door bounce penalty
+    use_act = np.array([0, 0, 0, 0, 0, 0, 0, 1, 0], dtype=np.int8)
+    noop_act = np.zeros(9, dtype=np.int8)
+    _, _, c4 = shaper.step(
+        _priv(tic=16, x=64.0, keys=[1, 0, 0, 0, 0, 0], sector_ceiling=[24.0, 0.0, 128.0]),
+        action=use_act,
+        prev_action=noop_act,
+        obs=_obs(8.0, True),  # enemy visible -> no wasted ammo penalty
+    )
+    assert c4["door_bounce"] == pytest.approx(0.0)
+    assert c4["wasted_ammo"] == pytest.approx(0.0)
+
+    _, _, c5 = shaper.step(
+        _priv(tic=20, x=64.0, keys=[1, 0, 0, 0, 0, 0], sector_ceiling=[16.0, 0.0, 128.0]),
+        action=use_act,
+        prev_action=noop_act,
+        obs=_obs(8.0, True),
+    )
+    assert c5["door_bounce"] == pytest.approx(cfg.door_bounce_penalty)
+
+    # Exit with full health -> both time efficiency and health_exit bonus fire
+    _, _, c6 = shaper.step(
+        _priv(tic=500, episode_ticks=1000, x=64.0, keys=[1, 0, 0, 0, 0, 0], exit_reached=True),
+        obs=_obs(8.0, False),
+    )
+    assert c6["health_exit"] == pytest.approx(cfg.health_exit_bonus)
+    assert c6["efficiency"] == pytest.approx(cfg.efficiency_bonus * 0.5)
 
 
 def test_reward_shaper_on_real_key_door_exit_doom_env():

@@ -67,23 +67,54 @@ def parse_map_arg(raw: str, split: str = "train") -> MapSpec:
 
 def resolve_train_maps(map_args: list[str] | None = None, split: str = "train") -> list[MapSpec]:
     """Resolve training maps from CLI `--map`, Role 3's `training.maps`, or fallback."""
+    specs, _ = resolve_train_maps_and_weights(map_args=map_args, split=split, curriculum_stage=None)
+    return specs
+
+
+def resolve_train_maps_and_weights(
+    map_args: list[str] | None = None,
+    split: str = "train",
+    curriculum_stage: str | None = None,
+) -> tuple[list[MapSpec], list[float] | None]:
+    """Resolve training maps and optional normalized curriculum sampling weights."""
     if map_args:
-        return [parse_map_arg(m, split=split) for m in map_args]
+        return [parse_map_arg(m, split=split) for m in map_args], None
     try:
         maps_mod = importlib.import_module("training.maps")
     except ModuleNotFoundError:
-        return list(DEFAULT_TRAIN_MAPS)
+        return list(DEFAULT_TRAIN_MAPS), None
+
+    if curriculum_stage is not None and hasattr(maps_mod, "get_curriculum_maps"):
+        specs = list(maps_mod.get_curriculum_maps(curriculum_stage))
+        weights = (
+            list(maps_mod.get_curriculum_weights(curriculum_stage))
+            if hasattr(maps_mod, "get_curriculum_weights")
+            else None
+        )
+        if specs:
+            return specs, weights
 
     if hasattr(maps_mod, "get_maps"):
         specs = list(maps_mod.get_maps(split=split))
         if specs:
-            return specs
+            return specs, None
     for attr in ("TRAIN_MAPS", "ALL_MAPS", "DEV_MAPS"):
         if hasattr(maps_mod, attr):
             specs = [s for s in getattr(maps_mod, attr) if split == "all" or s.split == split]
             if specs:
-                return specs
-    return list(DEFAULT_TRAIN_MAPS)
+                return specs, None
+    return list(DEFAULT_TRAIN_MAPS), None
+
+
+def _normalize_weights(weights: list[float] | None, n: int) -> np.ndarray | None:
+    if weights is None:
+        return None
+    if len(weights) != n:
+        raise ValueError(f"map_weights length ({len(weights)}) must match map_specs length ({n})")
+    arr = np.asarray(weights, dtype=np.float64)
+    if np.any(arr < 0.0) or float(arr.sum()) <= 0.0:
+        raise ValueError("map_weights must be non-negative with positive sum")
+    return arr / float(arr.sum())
 
 
 def _resolve_wad_path(wad: str) -> str:
@@ -104,12 +135,14 @@ class _DoomWorkerSlot:
         reward_config: RewardConfig | None = None,
         base_seed: int = 0,
         render_buffers: bool = False,
-        max_cached_envs: int = 8,
+        max_cached_envs: int = 32,
+        map_weights: list[float] | None = None,
     ):
         if not map_specs:
             raise ValueError("map_specs must not be empty")
         self.slot_id = slot_id
         self.map_specs = list(map_specs)
+        self._map_probs = _normalize_weights(map_weights, len(self.map_specs))
         self.shaper = RewardShaper(reward_config)
         self.render_buffers = render_buffers
         self.max_cached_envs = max(1, max_cached_envs)
@@ -120,6 +153,7 @@ class _DoomWorkerSlot:
         self._active_env: Any = None
         self._active_spec: MapSpec = self.map_specs[0]
         self._current_seed: int = 0
+        self._prev_action: np.ndarray = np.zeros(NUM_ACTIONS, dtype=np.int8)
         self._steps = 0
         self._total_reward = 0.0
         self._keys_picked_up = 0
@@ -149,7 +183,10 @@ class _DoomWorkerSlot:
         return env
 
     def reset(self) -> dict[str, np.ndarray]:
-        idx = int(self._rng.integers(0, len(self.map_specs)))
+        if self._map_probs is not None:
+            idx = int(self._rng.choice(len(self.map_specs), p=self._map_probs))
+        else:
+            idx = int(self._rng.integers(0, len(self.map_specs)))
         spec = self.map_specs[idx]
         env = self._get_or_create_env(spec)
         self._active_env = env
@@ -158,7 +195,8 @@ class _DoomWorkerSlot:
         self._current_seed = int(self.slot_id * 1_000_000 + self._episode_counter)
 
         raw_obs, _ = env.reset(seed=self._current_seed)
-        self.shaper.reset(env.privileged_state())
+        self.shaper.reset(env.privileged_state(), obs=raw_obs)
+        self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
         self._steps = 0
         self._total_reward = 0.0
         self._keys_picked_up = 0
@@ -173,7 +211,13 @@ class _DoomWorkerSlot:
             raise RuntimeError("Call reset() before step()")
         raw_obs, _, terminated, truncated, _ = self._active_env.step(action)
         priv = self._active_env.privileged_state()
-        reward, events, _ = self.shaper.step(priv)
+        reward, events, _ = self.shaper.step(
+            priv,
+            action=action,
+            prev_action=self._prev_action,
+            obs=raw_obs,
+        )
+        self._prev_action = np.asarray(action, dtype=np.int8).copy()
 
         self._steps += 1
         self._total_reward += reward
@@ -236,7 +280,8 @@ class SyncVecDoomEnv:
         base_seed: int = 0,
         render_buffers: bool = False,
         num_envs: int | None = None,
-        max_cached_envs: int = 8,
+        max_cached_envs: int = 32,
+        map_weights: list[float] | None = None,
     ):
         self.num_envs = num_envs if num_envs is not None else max(1, len(map_specs))
         self.slots = [
@@ -247,6 +292,7 @@ class SyncVecDoomEnv:
                 base_seed=base_seed,
                 render_buffers=render_buffers,
                 max_cached_envs=max_cached_envs,
+                map_weights=map_weights,
             )
             for i in range(self.num_envs)
         ]
@@ -293,6 +339,7 @@ def _worker_loop(
     base_seed: int,
     render_buffers: bool,
     max_cached_envs: int,
+    map_weights: list[float] | None = None,
 ) -> None:
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(var, "1")
@@ -303,6 +350,7 @@ def _worker_loop(
         base_seed=base_seed,
         render_buffers=render_buffers,
         max_cached_envs=max_cached_envs,
+        map_weights=map_weights,
     )
     try:
         while True:
@@ -334,7 +382,8 @@ class SubprocVecDoomEnv:
         base_seed: int = 0,
         render_buffers: bool = False,
         num_envs: int = 4,
-        max_cached_envs: int = 8,
+        max_cached_envs: int = 32,
+        map_weights: list[float] | None = None,
     ):
         self.num_envs = int(num_envs)
         ctx = mp.get_context("spawn")
@@ -345,7 +394,16 @@ class SubprocVecDoomEnv:
             parent_conn, child_conn = ctx.Pipe()
             proc = ctx.Process(
                 target=_worker_loop,
-                args=(child_conn, i, map_specs, reward_config, base_seed, render_buffers, max_cached_envs),
+                args=(
+                    child_conn,
+                    i,
+                    map_specs,
+                    reward_config,
+                    base_seed,
+                    render_buffers,
+                    max_cached_envs,
+                    map_weights,
+                ),
                 daemon=True,
             )
             proc.start()
@@ -601,14 +659,17 @@ def collect_rollout(
             prev_t = torch.as_tensor(prev_action, dtype=torch.float32, device=device)
 
             logits, value, next_hidden = policy.act_step(obs_t, prev_t, hidden)
-            if deterministic:
-                act_t = (logits > 0.0).float()
+            if hasattr(policy, "sample_action"):
+                act_t, log_prob_t = policy.sample_action(logits, deterministic=deterministic)
+                log_prob = log_prob_t.cpu().numpy()
             else:
-                probs = torch.sigmoid(logits)
-                act_t = torch.bernoulli(probs)
-
-            bce = F.binary_cross_entropy_with_logits(logits, act_t, reduction="none")
-            log_prob = (-bce.sum(dim=-1)).cpu().numpy()
+                if deterministic:
+                    act_t = (logits > 0.0).float()
+                else:
+                    probs = torch.sigmoid(logits)
+                    act_t = torch.bernoulli(probs)
+                bce = F.binary_cross_entropy_with_logits(logits, act_t, reduction="none")
+                log_prob = (-bce.sum(dim=-1)).cpu().numpy()
             action_np = act_t.cpu().numpy().astype(np.float32)
             value_np = value.cpu().numpy().astype(np.float32)
 

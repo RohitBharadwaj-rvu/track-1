@@ -142,3 +142,20 @@ def test_rollout_buffer_chunk_minibatches_preserve_order_and_hidden_alignment():
             np.testing.assert_allclose(mb["obs"]["ray_dist"][:, b, 0], np.arange(4) + (start_tag % 100))
 
     assert seen_starts == {0.0, 4.0, 100.0, 104.0}
+
+
+def test_weighted_curriculum_resolution_and_sampling():
+    from training.rollout import resolve_train_maps_and_weights
+
+    specs, weights = resolve_train_maps_and_weights(curriculum_stage="mvp")
+    assert len(specs) >= 5
+    assert weights is not None and len(weights) == len(specs)
+    assert sum(weights) == pytest.approx(1.0, abs=1e-6)
+
+    # Extreme weights [1.0, 0.0] must always select index 0 across resets
+    s0 = MapSpec(wad="maps/train/train_door_straight.wad", family="door_exit", tier=2, split="train", episode_ticks=40)
+    s1 = MapSpec(wad="maps/train/train_key_short_red.wad", family="key_return", tier=3, split="train", episode_ticks=40)
+    with SyncVecDoomEnv([s0, s1], base_seed=0, render_buffers=False, num_envs=1, map_weights=[1.0, 0.0]) as vec:
+        for _ in range(5):
+            vec.reset()
+            assert vec.slots[0]._active_spec.wad == s0.wad

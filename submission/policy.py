@@ -2,11 +2,13 @@
 
 Ownership (see REVISED_PLAN.md & training/README.md):
   - Role 1 (Policy & Exported Agent) implements `TelemetryPolicy` (`arch="telemetry_gru_v1"`):
-    circular-conv rays, masked-attention entities with learned empty-room output,
-    normalized vitals + prev_action GRU, and 9-button Bernoulli actor + scalar critic.
+    circular-conv rays, masked-attention entities with combat kinematics, category counts &
+    learned empty-room output, enriched vitals + prev_action GRU, and factorized
+    (3x 3-way categorical + 3x Bernoulli) or 9-Bernoulli actor + scalar critic.
   - Role 2 (PPO & Rollout Collection) calls ONLY the frozen contract below:
       * `policy.init_hidden(batch_size, device)`
       * `policy.act_step(obs_batch, prev_action, hidden)`
+      * `policy.sample_action(logits, deterministic=False, threshold=0.5, generator=None)`
       * `policy.evaluate_chunks(obs_seq, prev_action_seq, action_seq, init_hidden, episode_starts)`
       * `save_checkpoint` / `load_checkpoint`
 """
@@ -42,6 +44,7 @@ except ImportError:  # pragma: no cover - fallback when submission/ is imported 
 
 CHECKPOINT_FORMAT_VERSION = 1
 _LOG_FIVE = math.log(5.0)
+FACTORIZED_LOGIT_DIM = 12  # 3x3 categorical (fwd/back, strafe, turn) + 3 Bernoulli (attack, use, weapon)
 
 
 @dataclass(frozen=True)
@@ -67,8 +70,9 @@ class PolicyConfig:
     entity_out_dim: int = 128
     entity_type_embed_dim: int = 16
     entity_attn_heads: int = 4
-    entity_num_queries: int = 2
+    entity_num_queries: int = 4
     head_hidden_dim: int = 128
+    action_head: str = "factorized"  # "factorized" (3x3-cat + 3-bern) | "bernoulli" (9-bern)
     use_gru_residual: bool = True
     use_button_init_bias: float = -1.5
     weapon_switch_init_bias: float = -2.0
@@ -83,6 +87,8 @@ class PolicyConfig:
                 f"entity_dim ({self.entity_dim}) must be divisible by "
                 f"entity_attn_heads ({self.entity_attn_heads})"
             )
+        if self.action_head not in ("factorized", "bernoulli"):
+            raise ValueError(f"action_head must be 'factorized' or 'bernoulli', got {self.action_head!r}")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -90,7 +96,120 @@ class PolicyConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PolicyConfig:
         valid = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        # Backward compatibility for legacy checkpoints saved before `action_head` existed
+        if "action_head" not in valid:
+            valid["action_head"] = "bernoulli"
+        if "entity_num_queries" not in valid:
+            valid["entity_num_queries"] = 2
         return cls(**valid)
+
+
+def _pair_to_cat_index(pos_btn, neg_btn):
+    """Map mutually-exclusive binary pair (pos, neg) -> class index {0: none, 1: pos, 2: neg}."""
+    import torch
+
+    pos = pos_btn > 0.5
+    neg = neg_btn > 0.5
+    idx = torch.zeros_like(pos, dtype=torch.long)
+    idx = torch.where(pos & ~neg, torch.ones_like(idx), idx)
+    idx = torch.where(neg & ~pos, torch.full_like(idx, 2), idx)
+    return idx
+
+
+def sample_actions_from_logits(
+    logits,
+    *,
+    action_head: str = "factorized",
+    deterministic: bool = False,
+    threshold: float = 0.5,
+    generator: Any = None,
+):
+    """Sample (or argmax) a 9-button binary action tensor and its exact joint log-prob.
+
+    Supports both:
+      - `"factorized"`: 12 logits = 3x3-way categoricals (fwd/back, left/right, turnL/turnR)
+                        + 3 independent Bernoullis (attack, use, select_next_weapon).
+      - `"bernoulli"`:  9 independent Bernoulli logits.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if action_head == "bernoulli":
+        probs = torch.sigmoid(logits)
+        if deterministic:
+            act = (probs >= threshold).to(dtype=logits.dtype)
+        else:
+            act = torch.bernoulli(probs, generator=generator).to(dtype=logits.dtype)
+        bce = F.binary_cross_entropy_with_logits(logits, act, reduction="none")
+        log_prob = -bce.sum(dim=-1)
+        return act, log_prob
+
+    # Factorized: 3x3 categorical + 3 Bernoulli -> (..., 9) binary action
+    lead_shape = logits.shape[:-1]
+    cat_logits = logits[..., :9].reshape(*lead_shape, 3, 3)
+    bern_logits = logits[..., 9:12]
+
+    cat_log_probs = F.log_softmax(cat_logits, dim=-1)
+    if deterministic:
+        cat_idx = torch.argmax(cat_logits, dim=-1)
+    else:
+        cat_probs = torch.softmax(cat_logits, dim=-1).reshape(-1, 3)
+        cat_idx = torch.multinomial(cat_probs, num_samples=1, generator=generator).reshape(*lead_shape, 3)
+
+    cat_lp = cat_log_probs.gather(-1, cat_idx.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
+
+    bern_probs = torch.sigmoid(bern_logits)
+    if deterministic:
+        bern_act = (bern_probs >= threshold).to(dtype=logits.dtype)
+    else:
+        bern_act = torch.bernoulli(bern_probs, generator=generator).to(dtype=logits.dtype)
+    bern_lp = -F.binary_cross_entropy_with_logits(bern_logits, bern_act, reduction="none").sum(dim=-1)
+
+    act = torch.zeros(*lead_shape, NUM_ACTIONS, dtype=logits.dtype, device=logits.device)
+    for k in range(3):
+        act[..., 2 * k] = (cat_idx[..., k] == 1).to(dtype=logits.dtype)
+        act[..., 2 * k + 1] = (cat_idx[..., k] == 2).to(dtype=logits.dtype)
+    act[..., 6:9] = bern_act
+    return act, cat_lp + bern_lp
+
+
+def action_logprob_and_entropy(logits, action_9d, *, action_head: str = "factorized"):
+    """Compute exact joint `(log_prob, entropy)` of `action_9d` under `logits`."""
+    import torch
+    import torch.nn.functional as F
+
+    act = action_9d.to(dtype=logits.dtype)
+    if action_head == "bernoulli":
+        bce = F.binary_cross_entropy_with_logits(logits, act, reduction="none")
+        log_prob = -bce.sum(dim=-1)
+        probs = torch.sigmoid(logits)
+        entropy = -(probs * F.logsigmoid(logits) + (1.0 - probs) * F.logsigmoid(-logits)).sum(dim=-1)
+        return log_prob, entropy
+
+    lead_shape = logits.shape[:-1]
+    cat_logits = logits[..., :9].reshape(*lead_shape, 3, 3)
+    bern_logits = logits[..., 9:12]
+
+    cat_log_probs = F.log_softmax(cat_logits, dim=-1)
+    cat_probs = torch.softmax(cat_logits, dim=-1)
+    cat_targets = torch.stack(
+        [
+            _pair_to_cat_index(act[..., 0], act[..., 1]),
+            _pair_to_cat_index(act[..., 2], act[..., 3]),
+            _pair_to_cat_index(act[..., 4], act[..., 5]),
+        ],
+        dim=-1,
+    )
+    cat_lp = cat_log_probs.gather(-1, cat_targets.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
+    cat_ent = -(cat_probs * cat_log_probs).sum(dim=-1).sum(dim=-1)
+
+    bern_act = act[..., 6:9]
+    bern_lp = -F.binary_cross_entropy_with_logits(bern_logits, bern_act, reduction="none").sum(dim=-1)
+    bern_probs = torch.sigmoid(bern_logits)
+    bern_ent = -(
+        bern_probs * F.logsigmoid(bern_logits) + (1.0 - bern_probs) * F.logsigmoid(-bern_logits)
+    ).sum(dim=-1)
+    return cat_lp + bern_lp, cat_ent + bern_ent
 
 
 def build_policy(config: PolicyConfig):
@@ -111,13 +230,13 @@ def build_policy(config: PolicyConfig):
     class StubRecurrentPolicy(nn.Module):
         """Lightweight GRU policy implementing the exact Stage-1 contract.
 
-        Lets Role 2 develop and test rollout collection, GAE, and recurrent PPO
-        immediately alongside the full circular-conv + attention encoder.
+        Always uses 9-Bernoulli logits for fast smoke tests and contract checks.
         """
 
         def __init__(self, cfg: PolicyConfig):
             super().__init__()
             self.config = cfg
+            self.action_head = "bernoulli"
             in_dim = cfg.num_rays * 2 + cfg.num_vitals + cfg.num_actions
             self.encoder = nn.Sequential(
                 nn.Linear(in_dim, cfg.hidden_size),
@@ -151,6 +270,27 @@ def build_policy(config: PolicyConfig):
             value = self.critic(h).squeeze(-1)
             return logits, value, next_hidden
 
+        def sample_action(
+            self,
+            logits: torch.Tensor,
+            *,
+            deterministic: bool = False,
+            threshold: float = 0.5,
+            generator: Any = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return sample_actions_from_logits(
+                logits,
+                action_head=self.action_head,
+                deterministic=deterministic,
+                threshold=threshold,
+                generator=generator,
+            )
+
+        def logprob_and_entropy(
+            self, logits: torch.Tensor, action_9d: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return action_logprob_and_entropy(logits, action_9d, action_head=self.action_head)
+
         def evaluate_chunks(
             self,
             obs_seq: dict[str, torch.Tensor],
@@ -172,13 +312,7 @@ def build_policy(config: PolicyConfig):
             seq_h = torch.cat(outputs, dim=0)
             logits = self.actor(seq_h)
             value = self.critic(seq_h).squeeze(-1)
-
-            bce = F.binary_cross_entropy_with_logits(logits, action_seq.float(), reduction="none")
-            log_prob = -bce.sum(dim=-1)
-            probs = torch.sigmoid(logits)
-            entropy = -(
-                probs * F.logsigmoid(logits) + (1.0 - probs) * F.logsigmoid(-logits)
-            ).sum(dim=-1)
+            log_prob, entropy = self.logprob_and_entropy(logits, action_seq)
             return log_prob, entropy, value
 
     class CircularRayEncoder(nn.Module):
@@ -215,13 +349,14 @@ def build_policy(config: PolicyConfig):
             return self.proj(self.convs(torch.cat([dist_pair, hit_oh], dim=1)))
 
     class VitalsActionEncoder(nn.Module):
-        """Encodes preprocessed vitals (already scaled in submission/obs.py) + prev_action."""
+        """Encodes preprocessed vitals + explicit ammo/health/speed flags + prev_action."""
 
         def __init__(self, cfg: PolicyConfig) -> None:
             super().__init__()
             self.num_vitals = cfg.num_vitals
             self.num_weapon_slots = 8
-            vitals_encoded_dim = 24 if cfg.num_vitals == 17 else cfg.num_vitals
+            # 24 base dims + 4 explicit flags (selected_ammo_empty, has_other_ammo, low_health, horiz_speed)
+            vitals_encoded_dim = 28 if cfg.num_vitals == 17 else cfg.num_vitals
             in_dim = vitals_encoded_dim + cfg.num_actions
             self.net = nn.Sequential(
                 nn.Linear(in_dim, cfg.vitals_dim),
@@ -243,13 +378,44 @@ def build_policy(config: PolicyConfig):
                 ammo = torch.log1p(torch.clamp(v[..., 3:8], min=0.0))
                 keys = torch.clamp(v[..., 8:14], 0.0, 1.0)
                 vel = torch.tanh(v[..., 14:17])
-                norm_v = torch.cat([health, armor, weapon_oh, ammo, keys, vel], dim=-1)
+
+                # Explicit binary/scalar cues for empty ammo, low HP, and wall-snag detection
+                selected_ammo_empty = (v[..., 3:4] <= 1e-6).to(dtype=v.dtype)
+                has_other_ammo = (v[..., 4:8].sum(dim=-1, keepdim=True) > 1e-6).to(dtype=v.dtype)
+                low_health = (v[..., 0:1] < 0.35).to(dtype=v.dtype)
+                horiz_speed = torch.tanh(torch.hypot(v[..., 14:15], v[..., 15:16]))
+
+                norm_v = torch.cat(
+                    [
+                        health,
+                        armor,
+                        weapon_oh,
+                        ammo,
+                        keys,
+                        vel,
+                        selected_ammo_empty,
+                        has_other_ammo,
+                        low_health,
+                        horiz_speed,
+                    ],
+                    dim=-1,
+                )
             else:
                 norm_v = torch.tanh(v)
             return self.net(torch.cat([norm_v, prev_action.to(dtype=norm_v.dtype)], dim=-1))
 
     class MaskedEntityAttentionEncoder(nn.Module):
-        """Masked multi-head cross-attention over visible entities with empty-room fallback."""
+        """Masked multi-head cross-attention over visible entities with combat kinematics & counts.
+
+        Derives exact ego-frame kinematics consistent with `env/doom_env/sensors.py`:
+          - `rel_angle` is 0 straight ahead and positive to the player's LEFT.
+          - `rel_vel_right` is positive to the player's RIGHT.
+          - Therefore radial unit vector toward entity is `(+cos_a, -sin_a)`:
+              * closing_speed = -(rel_vel_fwd * cos_a - rel_vel_right * sin_a)
+              * lateral_speed = rel_vel_fwd * sin_a + rel_vel_right * cos_a
+        """
+
+        _COUNT_SUMMARY_DIM = 8  # 7 category log1p counts + nearest threat proximity
 
         def __init__(self, cfg: PolicyConfig) -> None:
             super().__init__()
@@ -260,7 +426,7 @@ def build_policy(config: PolicyConfig):
             self.head_dim = cfg.entity_dim // cfg.entity_attn_heads
 
             self.type_emb = nn.Embedding(cfg.num_entity_types, cfg.entity_type_embed_dim)
-            entity_feat_dim = 6 if cfg.num_entity_features == 5 else cfg.num_entity_features
+            entity_feat_dim = 10 if cfg.num_entity_features == 5 else cfg.num_entity_features
             self.num_entity_features = cfg.num_entity_features
             self.entity_mlp = nn.Sequential(
                 nn.Linear(cfg.entity_type_embed_dim + entity_feat_dim, cfg.entity_dim),
@@ -276,7 +442,7 @@ def build_policy(config: PolicyConfig):
             self.k_proj = nn.Linear(cfg.entity_dim, cfg.entity_dim)
             self.v_proj = nn.Linear(cfg.entity_dim, cfg.entity_dim)
             self.out_proj = nn.Sequential(
-                nn.Linear(cfg.entity_num_queries * cfg.entity_dim, cfg.entity_out_dim),
+                nn.Linear(cfg.entity_num_queries * cfg.entity_dim + self._COUNT_SUMMARY_DIM, cfg.entity_out_dim),
                 nn.LayerNorm(cfg.entity_out_dim),
                 nn.SiLU(),
             )
@@ -286,17 +452,67 @@ def build_policy(config: PolicyConfig):
             f = ent_feat.float()
             mask = ent_mask.to(dtype=f.dtype).unsqueeze(-1)
             if self.num_entity_features == 5:
-                # obs.py already divides [dist/1024, sin, cos, rel_vel_fwd, rel_vel_right] by [1, 1, 1, 20, 20]
+                # obs.py scales [dist/1024, sin, cos, rel_vel_fwd, rel_vel_right] by [1, 1, 1, 20, 20]
                 dist = torch.clamp(f[..., 0], min=0.0)
                 dist_log = torch.log1p(dist) / _LOG_FIVE
                 dist_near = 1.0 / (1.0 + dist)
                 sin_a = torch.clamp(f[..., 1], -1.0, 1.0)
                 cos_a = torch.clamp(f[..., 2], -1.0, 1.0)
-                rel_vel_fwd = torch.tanh(f[..., 3])
-                rel_vel_right = torch.tanh(f[..., 4])
-                out = torch.stack([dist_log, dist_near, sin_a, cos_a, rel_vel_fwd, rel_vel_right], dim=-1)
+                raw_fwd = f[..., 3]
+                raw_right = f[..., 4]
+                rel_vel_fwd = torch.tanh(raw_fwd)
+                rel_vel_right = torch.tanh(raw_right)
+
+                # Sign-verified ego kinematics (sensors.py: +sin_a = LEFT, +raw_right = RIGHT)
+                closing_raw = -(raw_fwd * cos_a - raw_right * sin_a)
+                lateral_raw = raw_fwd * sin_a + raw_right * cos_a
+                closing_speed = torch.tanh(closing_raw)
+                lateral_speed = torch.tanh(lateral_raw)
+                inv_tti = torch.tanh(torch.clamp(closing_raw, min=0.0) / (dist + 0.05))
+                crosshair_align = torch.exp(-torch.abs(sin_a) / 0.1) * (cos_a > 0.0).to(dtype=f.dtype)
+
+                out = torch.stack(
+                    [
+                        dist_log,
+                        dist_near,
+                        sin_a,
+                        cos_a,
+                        rel_vel_fwd,
+                        rel_vel_right,
+                        closing_speed,
+                        lateral_speed,
+                        inv_tti,
+                        crosshair_align,
+                    ],
+                    dim=-1,
+                )
                 return out * mask
             return torch.tanh(f) * mask
+
+        def _category_summary(
+            self, ent_feat: torch.Tensor, types: torch.Tensor, valid: torch.Tensor
+        ) -> torch.Tensor:
+            """Compute explicit per-category log1p counts and nearest-threat proximity."""
+            dtype = ent_feat.dtype
+            v = valid.to(dtype=dtype)
+            # Entity type IDs (env/doom_env/spaces.py):
+            # 1=melee, 2=hitscan, 3=proj_enemy, 4=projectile, 5=health, 6=armor, 7=ammo, 8=weapon, 9=key
+            c_melee = ((types == 1) & valid).to(dtype=dtype).sum(dim=-1)
+            c_hitscan = ((types == 2) & valid).to(dtype=dtype).sum(dim=-1)
+            c_proj_e = ((types == 3) & valid).to(dtype=dtype).sum(dim=-1)
+            c_missile = ((types == 4) & valid).to(dtype=dtype).sum(dim=-1)
+            c_heal = (((types == 5) | (types == 6)) & valid).to(dtype=dtype).sum(dim=-1)
+            c_ammo = (((types == 7) | (types == 8)) & valid).to(dtype=dtype).sum(dim=-1)
+            c_key = ((types == 9) & valid).to(dtype=dtype).sum(dim=-1)
+
+            counts = torch.log1p(
+                torch.stack([c_melee, c_hitscan, c_proj_e, c_missile, c_heal, c_ammo, c_key], dim=-1)
+            )
+            dist = torch.clamp(ent_feat[..., 0].float(), min=0.0)
+            is_threat = ((types >= 1) & (types <= 4) & valid).to(dtype=dtype)
+            threat_prox = (1.0 / (1.0 + dist)) * is_threat * v
+            nearest_threat = threat_prox.max(dim=-1, keepdim=True).values
+            return torch.cat([counts, nearest_threat], dim=-1)
 
         def forward(
             self,
@@ -336,7 +552,8 @@ def build_policy(config: PolicyConfig):
                 .contiguous()
                 .view(batch_size, self.num_queries * self.entity_dim)
             )
-            out = self.out_proj(pooled)
+            summary = self._category_summary(ent_feat, types, valid)
+            out = self.out_proj(torch.cat([pooled, summary], dim=-1))
             return torch.where(has_any.unsqueeze(-1), out, self.empty_embed.expand(batch_size, -1))
 
     class TelemetryPolicy(nn.Module):
@@ -345,6 +562,7 @@ def build_policy(config: PolicyConfig):
         def __init__(self, cfg: PolicyConfig) -> None:
             super().__init__()
             self.config = cfg
+            self.action_head = cfg.action_head
             self.ray_encoder = CircularRayEncoder(cfg)
             self.vitals_encoder = VitalsActionEncoder(cfg)
             self.entity_encoder = MaskedEntityAttentionEncoder(cfg)
@@ -357,10 +575,11 @@ def build_policy(config: PolicyConfig):
             )
             self.gru = nn.GRU(cfg.hidden_size, cfg.hidden_size, batch_first=False)
             self.post_gru_norm = nn.LayerNorm(cfg.hidden_size)
+            actor_out_dim = FACTORIZED_LOGIT_DIM if cfg.action_head == "factorized" else cfg.num_actions
             self.actor = nn.Sequential(
                 nn.Linear(cfg.hidden_size, cfg.head_hidden_dim),
                 nn.SiLU(),
-                nn.Linear(cfg.head_hidden_dim, cfg.num_actions),
+                nn.Linear(cfg.head_hidden_dim, actor_out_dim),
             )
             self.critic = nn.Sequential(
                 nn.Linear(cfg.hidden_size, cfg.head_hidden_dim),
@@ -383,10 +602,14 @@ def build_policy(config: PolicyConfig):
             nn.init.orthogonal_(actor_out.weight, gain=0.01)
             nn.init.zeros_(actor_out.bias)
             with torch.no_grad():
-                if self.config.num_actions > 7:
-                    actor_out.bias[7] = self.config.use_button_init_bias
-                if self.config.num_actions > 8:
-                    actor_out.bias[8] = self.config.weapon_switch_init_bias
+                if self.action_head == "factorized":
+                    actor_out.bias[10] = self.config.use_button_init_bias
+                    actor_out.bias[11] = self.config.weapon_switch_init_bias
+                else:
+                    if self.config.num_actions > 7:
+                        actor_out.bias[7] = self.config.use_button_init_bias
+                    if self.config.num_actions > 8:
+                        actor_out.bias[8] = self.config.weapon_switch_init_bias
 
             critic_out: nn.Linear = self.critic[-1]  # type: ignore[assignment]
             nn.init.orthogonal_(critic_out.weight, gain=1.0)
@@ -426,6 +649,27 @@ def build_policy(config: PolicyConfig):
             logits, value = self._heads(out.squeeze(0), fused)
             return logits, value, next_hidden
 
+        def sample_action(
+            self,
+            logits: torch.Tensor,
+            *,
+            deterministic: bool = False,
+            threshold: float = 0.5,
+            generator: Any = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return sample_actions_from_logits(
+                logits,
+                action_head=self.action_head,
+                deterministic=deterministic,
+                threshold=threshold,
+                generator=generator,
+            )
+
+        def logprob_and_entropy(
+            self, logits: torch.Tensor, action_9d: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return action_logprob_and_entropy(logits, action_9d, action_head=self.action_head)
+
         def evaluate_chunks(
             self,
             obs_seq: dict[str, torch.Tensor],
@@ -462,12 +706,7 @@ def build_policy(config: PolicyConfig):
                 gru_out = torch.cat(outs, dim=0)
 
             logits, value = self._heads(gru_out, fused_seq)
-            bce = F.binary_cross_entropy_with_logits(logits, action_seq.to(dtype=logits.dtype), reduction="none")
-            log_prob = -bce.sum(dim=-1)
-            probs = torch.sigmoid(logits)
-            entropy = -(
-                probs * F.logsigmoid(logits) + (1.0 - probs) * F.logsigmoid(-logits)
-            ).sum(dim=-1)
+            log_prob, entropy = self.logprob_and_entropy(logits, action_seq)
             return log_prob, entropy, value
 
     if config.arch == "stub":
