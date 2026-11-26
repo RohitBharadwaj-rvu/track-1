@@ -9,7 +9,7 @@
 ### 1. Problem & Telemetry Choice
 Our agent plays unseen `freedoom2.wad` (`skill 3`) levels zero-shot under strict inference limits (`2 GB VRAM`, `8 GB RAM`, `1 CPU thread`, `40 ms/step`). Rather than spending compute on raw pixel CNNs, we operate directly on `doom_env`'s ego-centric telemetry signals (`rays`, `visible_entities`, `vitals`) with `render_buffers=False` during training.
 
-### 2. Policy & Recurrent Memory (`submission/policy.py`)
+### 2. Policy & Recurrent Memory (`submission/policy.py`, `telemetry_gru_v1`, `687,098` params)
 - **Raycast Encoder:** Circular 1D convolutions over the 64 ego-centric rays (normalized distance + hit type) to preserve directional left/right bins across 360°.
 - **Entity Encoder:** Learned class embeddings + relative geometry/velocity features `(32, 5)` pooled with masked attention conditioned on `vitals` and ray context, with a deterministic empty-set fallback.
 - **Temporal & Button-Edge Memory:** A GRU fuses `[ray_emb, entity_emb, normalized_vitals, prev_action]` so the policy respects ViZDoom's button-down edge semantics for `USE` and `SELECT_NEXT_WEAPON` and tracks short-term navigation state.
@@ -35,6 +35,7 @@ Our agent plays unseen `freedoom2.wad` (`skill 3`) levels zero-shot under strict
 ### 2. Sandbox Compliance & Inference Runtime (`validate.py`)
 - **Hardware target:** RTX 3090 (2 GB VRAM cap), 8 GB RAM, 1 CPU thread (`OMP_NUM_THREADS=1`), offline read-only repo.
 - **Stage 0 Random Baseline (`validate.py` on Windows local):** `init 0.0s`, `first 2 ms`, `p50 0.9 ms`, `p99 1.6 ms`, `max 2 ms`, `0.5s / 21.0s` per-map compute budget.
+- **Stage 1 Connect `telemetry_gru_v1` (`validate.py` on Linux + CUDA, pinned to 1 CPU):** `init 2.4s`, `p50 4.0–4.8 ms`, `p99 6.9–10.8 ms`, `max 20 ms`, `2.2–2.5s / 21.0s` compute budget, `1,380 MB / 8,192 MB` RAM, `156 MB / 2,048 MB` VRAM. Solvable door/exit proof (`#P..D...E#`): `100%` exit rate (`24` steps on two consecutive maps with `agent.reset()`).
 - **Final Agent (`validate.py --docker`):** *TBD after weight freeze.*
 
 ### 3. Informative Failure Case

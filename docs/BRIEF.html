@@ -29,7 +29,7 @@
 <h2>Page 1: Architecture &amp; Memory Design</h2>
 <h3>1. Problem &amp; Telemetry Choice</h3>
 <p>Our agent plays unseen <code>freedoom2.wad</code> (<code>skill 3</code>) levels zero-shot under strict inference limits (<code>2 GB VRAM</code>, <code>8 GB RAM</code>, <code>1 CPU thread</code>, <code>40 ms/step</code>). Rather than spending compute on raw pixel CNNs, we operate directly on <code>doom_env</code>'s ego-centric telemetry signals (<code>rays</code>, <code>visible_entities</code>, <code>vitals</code>) with <code>render_buffers=False</code> during training.</p>
-<h3>2. Policy &amp; Recurrent Memory (<code>submission/policy.py</code>)</h3>
+<h3>2. Policy &amp; Recurrent Memory (<code>submission/policy.py</code>, <code>telemetry_gru_v1</code>, <code>687,098</code> params)</h3>
 <ul>
 <li><strong>Raycast Encoder:</strong> Circular 1D convolutions over the 64 ego-centric rays (normalized distance + hit type) to preserve directional left/right bins across 360°.</li>
 <li><strong>Entity Encoder:</strong> Learned class embeddings + relative geometry/velocity features <code>(32, 5)</code> pooled with masked attention conditioned on <code>vitals</code> and ray context, with a deterministic empty-set fallback.</li>
@@ -95,6 +95,7 @@
 <ul>
 <li><strong>Hardware target:</strong> RTX 3090 (2 GB VRAM cap), 8 GB RAM, 1 CPU thread (<code>OMP_NUM_THREADS=1</code>), offline read-only repo.</li>
 <li><strong>Stage 0 Random Baseline (<code>validate.py</code> on Windows local):</strong> <code>init 0.0s</code>, <code>first 2 ms</code>, <code>p50 0.9 ms</code>, <code>p99 1.6 ms</code>, <code>max 2 ms</code>, <code>0.5s / 21.0s</code> per-map compute budget.</li>
+<li><strong>Stage 1 Connect <code>telemetry_gru_v1</code> (<code>validate.py</code> on Linux + CUDA, pinned to 1 CPU):</strong> <code>init 2.4s</code>, <code>p50 4.0–4.8 ms</code>, <code>p99 6.9–10.8 ms</code>, <code>max 20 ms</code>, <code>2.2–2.5s / 21.0s</code> compute budget, <code>1,380 MB / 8,192 MB</code> RAM, <code>156 MB / 2,048 MB</code> VRAM. Solvable door/exit proof (<code>#P..D...E#</code>): <code>100%</code> exit rate (<code>24</code> steps on two consecutive maps with <code>agent.reset()</code>).</li>
 <li><strong>Final Agent (<code>validate.py --docker</code>):</strong> <em>TBD after weight freeze.</em></li>
 </ul>
 <h3>3. Informative Failure Case</h3>
