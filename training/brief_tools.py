@@ -235,18 +235,25 @@ def export_pdf(brief_path: Path, pdf_path: Path) -> bool:
 
     with tempfile.TemporaryDirectory(prefix="brief_html_") as td:
         tmp_html = Path(td) / "brief.html"
+        tmp_profile = Path(td) / "profile"
         tmp_html.write_text(html_text, encoding="utf-8")
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
             browser,
-            "--headless",
+            "--headless=new",
             "--disable-gpu",
+            "--no-first-run",
+            "--disable-extensions",
+            f"--user-data-dir={tmp_profile}",
             "--no-pdf-header-footer",
             f"--print-to-pdf={pdf_path.resolve()}",
             tmp_html.resolve().as_uri(),
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        return res.returncode == 0 and pdf_path.is_file()
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return res.returncode == 0 and pdf_path.is_file()
+        except (OSError, subprocess.TimeoutExpired):
+            return False
 
 
 def main(argv: list[str] | None = None) -> int:

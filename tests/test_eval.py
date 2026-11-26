@@ -12,10 +12,12 @@ from doom_env.sensors import RAY_DOOR, RAY_LOCKED
 from fixtures import fixture_wad
 from training.brief_tools import markdown_to_two_page_html, update_brief_outcomes_row
 from training.eval import (
+    check_mvp_gate,
     compare_reports,
     diagnose_report,
     evaluate_episode,
     evaluate_suite,
+    resolve_maps,
 )
 from training.interfaces import MapSpec
 
@@ -222,3 +224,55 @@ def test_brief_tools_html_and_row_update(tmp_path: Path):
     }
     updated = update_brief_outcomes_row(tmp_brief, "Stage 2 MVP Recurrent PPO", report)
     assert "| Stage 2 MVP Recurrent PPO | `maps/two_rooms.wad` (seeds `0, 1`) | 2 | 2 | 0 | 0 | 2 | 31.0 | 0 |" in updated
+
+
+def test_resolve_role3_suites_and_check_mvp_gate():
+    connect_specs = resolve_maps(suite="connect")
+    assert len(connect_specs) == 2
+    assert {s.family for s in connect_specs} == {"door_exit", "key_return"}
+
+    mvp_specs = resolve_maps(suite="mvp_gate")
+    assert len(mvp_specs) == 4
+    assert {s.family for s in mvp_specs} == {"door_exit", "combat"}
+
+    def _gate_report(*, door_exits=2, kills=2, early_deaths=0, errors=0):
+        simple_eps = []
+        for wad in ("maps/dev/dev_simple_dogleg_door.wad", "maps/dev/dev_simple_chamber_door.wad"):
+            for seed in range(3):
+                ok = seed < door_exits
+                simple_eps.append(
+                    {
+                        "wad": wad,
+                        "map_name": "MAP01",
+                        "family": "door_exit",
+                        "outcome": "exit" if ok else "timeout",
+                        "doors_opened": 1 if ok else 0,
+                        "ticks": 500,
+                    }
+                )
+        combat_eps = []
+        for wad in ("maps/dev/dev_combat_crossfire.wad", "maps/dev/dev_combat_ambush_ring.wad"):
+            for seed in range(3):
+                combat_eps.append(
+                    {
+                        "wad": wad,
+                        "map_name": "MAP01",
+                        "family": "combat",
+                        "outcome": "death" if (seed == 0 and early_deaths > 0) else "timeout",
+                        "kills": kills,
+                        "ticks": 200 if (seed == 0 and early_deaths > 0) else 2100,
+                    }
+                )
+        return {
+            "summary": {"overall": {"errors": errors, "all_within_budget": True}},
+            "episodes": simple_eps + combat_eps,
+        }
+
+    baseline = _gate_report(door_exits=0, kills=0, early_deaths=1)
+    passing = _gate_report(door_exits=2, kills=2, early_deaths=1)
+    failing_doors = _gate_report(door_exits=1, kills=2, early_deaths=0)
+    failing_combat = _gate_report(door_exits=2, kills=0, early_deaths=0)
+
+    assert check_mvp_gate(passing, baseline)["passed"] is True
+    assert check_mvp_gate(failing_doors, baseline)["checks"]["simple_door_exit_pass"] is False
+    assert check_mvp_gate(failing_combat, baseline)["checks"]["combat_pass"] is False

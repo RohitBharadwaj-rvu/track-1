@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib
 import json
+import math
 from pathlib import Path
 import statistics
 import subprocess
@@ -80,18 +81,34 @@ def parse_map_arg(raw: str, split: str = "dev") -> MapSpec:
     )
 
 
-def resolve_maps(split: str = "dev", map_args: list[str] | None = None) -> list[MapSpec]:
+def resolve_maps(
+    split: str = "dev",
+    map_args: list[str] | None = None,
+    suite: str | None = None,
+) -> list[MapSpec]:
     """Resolve maps from CLI --map flags, Role 3's `training.maps`, or Stage 1 fallback."""
     if map_args:
         return [parse_map_arg(m, split=split) for m in map_args]
 
+    target = suite or split
     try:
         maps_mod = importlib.import_module("training.maps")
     except ModuleNotFoundError:
         return list(DEFAULT_FALLBACK_MAPS)
 
+    if target == "connect" and hasattr(maps_mod, "CONNECT_MAPS"):
+        specs = list(maps_mod.CONNECT_MAPS)
+        if specs:
+            return specs
+
+    if target == "mvp_gate":
+        simple = list(getattr(maps_mod, "MVP_GATE_SIMPLE_MAPS", ()))
+        combat = list(getattr(maps_mod, "MVP_GATE_COMBAT_MAPS", ()))
+        if simple or combat:
+            return simple + combat
+
     if hasattr(maps_mod, "get_maps"):
-        specs = list(maps_mod.get_maps(split=split))
+        specs = list(maps_mod.get_maps(split=target))
         if specs:
             return specs
 
@@ -101,9 +118,9 @@ def resolve_maps(split: str = "dev", map_args: list[str] | None = None) -> list[
         "train": ("TRAIN_MAPS", "ALL_MAPS"),
         "all": ("ALL_MAPS", "DEV_MAPS"),
     }
-    for attr in attr_map.get(split, ("DEV_MAPS", "ALL_MAPS")):
+    for attr in attr_map.get(target, ("DEV_MAPS", "ALL_MAPS")):
         if hasattr(maps_mod, attr):
-            specs = [s for s in getattr(maps_mod, attr) if split == "all" or s.split == split]
+            specs = [s for s in getattr(maps_mod, attr) if target == "all" or s.split == target]
             if specs:
                 return specs
 
@@ -660,6 +677,101 @@ def compare_reports(baseline: dict[str, Any], challenger: dict[str, Any]) -> dic
     }
 
 
+def check_mvp_gate(
+    report: dict[str, Any],
+    baseline_report: dict[str, Any] | None = None,
+    *,
+    early_death_ticks: int = 700,
+) -> dict[str, Any]:
+    """Check the Stage 2 Functional MVP Gate (`REVISED_PLAN.md §2`)."""
+    overall = report["summary"]["overall"]
+    clean_run = (overall.get("errors", 0) == 0) and bool(overall.get("all_within_budget", True))
+
+    simple_wads: set[str] = set()
+    combat_wads: set[str] = set()
+    try:
+        maps_mod = importlib.import_module("training.maps")
+        simple_wads = {Path(s.wad).name for s in getattr(maps_mod, "MVP_GATE_SIMPLE_MAPS", ())}
+        combat_wads = {Path(s.wad).name for s in getattr(maps_mod, "MVP_GATE_COMBAT_MAPS", ())}
+    except ModuleNotFoundError:
+        pass
+
+    episodes = report.get("episodes", [])
+    simple_by_map: dict[str, list[dict[str, Any]]] = {}
+    combat_eps: list[dict[str, Any]] = []
+    for ep in episodes:
+        name = Path(ep["wad"]).name
+        if name in simple_wads or (not simple_wads and ep.get("family") == "door_exit"):
+            simple_by_map.setdefault(name, []).append(ep)
+        elif name in combat_wads or (not combat_wads and ep.get("family") == "combat"):
+            combat_eps.append(ep)
+
+    per_simple_map: dict[str, dict[str, Any]] = {}
+    for map_key, eps in sorted(simple_by_map.items()):
+        required = 2 if len(eps) >= 3 else max(1, math.ceil(2 * len(eps) / 3))
+        door_exits = sum(
+            1 for e in eps if e.get("doors_opened", 0) >= 1 and e.get("outcome") == "exit"
+        )
+        per_simple_map[map_key] = {
+            "episodes": len(eps),
+            "door_exits": door_exits,
+            "required": required,
+            "passed": door_exits >= required,
+        }
+    simple_door_exit_pass = bool(per_simple_map) and all(v["passed"] for v in per_simple_map.values())
+
+    mean_kills = (
+        round(sum(e.get("kills", 0) for e in combat_eps) / len(combat_eps), 4)
+        if combat_eps
+        else 0.0
+    )
+    early_deaths = sum(
+        1 for e in combat_eps if e.get("outcome") == "death" and e.get("ticks", 0) <= early_death_ticks
+    )
+
+    baseline_mean_kills = 0.0
+    baseline_early_deaths = 0
+    if baseline_report is not None:
+        base_combat_eps = [
+            e
+            for e in baseline_report.get("episodes", [])
+            if Path(e["wad"]).name in combat_wads or (not combat_wads and e.get("family") == "combat")
+        ]
+        if base_combat_eps:
+            baseline_mean_kills = round(
+                sum(e.get("kills", 0) for e in base_combat_eps) / len(base_combat_eps), 4
+            )
+            baseline_early_deaths = sum(
+                1
+                for e in base_combat_eps
+                if e.get("outcome") == "death" and e.get("ticks", 0) <= early_death_ticks
+            )
+
+    combat_pass = (
+        bool(combat_eps)
+        and (mean_kills > baseline_mean_kills)
+        and (early_deaths <= baseline_early_deaths)
+    )
+
+    checks = {
+        "clean_run": clean_run,
+        "simple_door_exit_pass": simple_door_exit_pass,
+        "combat_pass": combat_pass,
+    }
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+        "per_simple_map": per_simple_map,
+        "combat_stats": {
+            "episodes": len(combat_eps),
+            "mean_kills": mean_kills,
+            "baseline_mean_kills": baseline_mean_kills,
+            "early_deaths": early_deaths,
+            "baseline_early_deaths": baseline_early_deaths,
+        },
+    }
+
+
 def format_report_markdown(report: dict[str, Any]) -> str:
     """Format an evaluation report into a readable Markdown summary."""
     meta = report["metadata"]
@@ -705,12 +817,32 @@ def format_report_markdown(report: dict[str, Any]) -> str:
         for item in diagnosis:
             lines.append(f"- **[{item['code']}]** ({item['evidence']}): {item['recommendation']}")
 
+    mvp_gate = report.get("mvp_gate")
+    if mvp_gate is not None:
+        status = "PASSED" if mvp_gate["passed"] else "FAILED"
+        chk = mvp_gate["checks"]
+        cs = mvp_gate["combat_stats"]
+        lines.extend(
+            [
+                "",
+                f"### Functional MVP Gate: {status}",
+                f"- `clean_run={chk['clean_run']}` | `simple_door_exit_pass={chk['simple_door_exit_pass']}` | `combat_pass={chk['combat_pass']}`",
+                f"- Combat: `mean_kills={cs['mean_kills']}` (baseline `{cs['baseline_mean_kills']}`), `early_deaths={cs['early_deaths']}` (baseline `{cs['baseline_early_deaths']}`)",
+            ]
+        )
+
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Role 4 independent DoomAgent evaluator.")
     parser.add_argument("--split", default="dev", choices=("train", "dev", "final", "all"))
+    parser.add_argument(
+        "--suite",
+        default=None,
+        choices=("connect", "mvp_gate", "dev", "final", "train", "all"),
+        help="Named map suite (overrides --split)",
+    )
     parser.add_argument("--map", action="append", default=None, help="wad[:map[:family[:tier[:ticks]]]]")
     parser.add_argument("--seeds", nargs="+", type=int, default=None, help="Override seed list for all maps")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
@@ -721,6 +853,14 @@ def main(argv: list[str] | None = None) -> int:
         "--keep-key-replays",
         action="store_true",
         help="Prune non-selected .lmp replays in --record-dir after selecting best success & failure",
+    )
+    parser.add_argument(
+        "--check-mvp-gate",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="BASELINE_JSON",
+        help="Evaluate Functional MVP Gate (optionally against a saved baseline JSON)",
     )
     parser.add_argument("--out", type=Path, default=None, help="Write JSON report to this path")
     parser.add_argument("--compare", nargs=2, metavar=("BASELINE_JSON", "CHALLENGER_JSON"), default=None)
@@ -733,7 +873,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(cmp_result, indent=2))
         return 0
 
-    specs = resolve_maps(split=args.split, map_args=args.map)
+    specs = resolve_maps(split=args.split, map_args=args.map, suite=args.suite)
     seeds_override = tuple(args.seeds) if args.seeds is not None else None
     report = evaluate_suite(
         specs,
@@ -744,6 +884,13 @@ def main(argv: list[str] | None = None) -> int:
         record_dir=args.record_dir,
         keep_key_replays=args.keep_key_replays,
     )
+    if args.check_mvp_gate is not None:
+        base_rep = (
+            json.loads(Path(args.check_mvp_gate).read_text(encoding="utf-8"))
+            if args.check_mvp_gate
+            else None
+        )
+        report["mvp_gate"] = check_mvp_gate(report, base_rep)
     print(format_report_markdown(report))
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)

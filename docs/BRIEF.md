@@ -28,7 +28,7 @@ Our agent plays unseen `freedoom2.wad` (`skill 3`) levels zero-shot under strict
 
 | Candidate | Suite | Episodes | Exits | Keys Picked Up | Locked Doors Unlocked | Kills | Mean Cells Visited | Errors |
 |---|---|---|---|---|---|---|---|---|
-| Stage 0 Random (`submission/agent.py`) | `maps/two_rooms.wad` (seeds `0, 1`) | 2 | 0 | 0 | 0 | 0 | 27.5 | 0 |
+| Stage 0 Random (`submission/agent.py`) | 10 dev maps (30 eps) | 30 | 1 | 0 | 0 | 10 | 13.97 | 0 |
 | Stage 2 MVP Recurrent PPO | *TBD* | — | — | — | — | — | — | — |
 | Final Shipped Agent | *TBD* | — | — | — | — | — | — | — |
 
