@@ -1,18 +1,26 @@
 # Maps
 
-`two_rooms.wad` is a single small test map (one door, one monster, an exit). It's here so you can
-check your setup and run `validate.py`. It is **not** an evaluation map and won't teach an agent
-much.
+`two_rooms.wad` is the official starter smoke-test map (one door, one monster, an exit). It is **not** an evaluation map.
 
-Evaluation uses hidden, unseen maps across four tiers (see [docs/EVALUATION.md](../docs/EVALUATION.md)).
-Finding or building a varied set of training maps is part of the challenge. Any WAD that ViZDoom can
-load works with `doom_env`:
+Our Role 3 map library (`training/maps.py`, generated deterministically by `training/wad_gen/`) provides strictly separated **Train**, **Dev**, and **Final (Untouched)** suites across all four evaluation tiers (`docs/EVALUATION.md`):
 
-```python
-from doom_env import make_env
-env = make_env("path/to/your.wad", "MAP01", episode_ticks=2100)
+| Split | Directory | Count | Tiers Covered | Construction |
+|---|---|---:|---|---|
+| **Train** | `maps/train/` | 20 | T1 Combat (4), T2 Door-Exit & Multi-Room (6), T3 Key & Return (6), T4 Full Gauntlet (4) | Parameterized UDMF grid (+ on-the-fly procedural variations via `training.wad_gen.procedural`) |
+| **Dev** | `maps/dev/` | 10 | 2 held-out simple door-exit (MVP Gate), T1 Combat (2), T2 Multi-Room (2), T3 Key & Return incl. mirrored corridors (2), T4 Gauntlet 4,200 ticks (2) | Held-out distinct UDMF grid topologies |
+| **Final** | `maps/final/` | 8 | 4 unseen grid layouts (T1–T4) + **4 non-grid polygonal/diagonal-wall layouts (T1–T4)** | Unseen UDMF grid + independent polygonal/angled-wall UDMF builder |
+
+## Regenerate & Verify
+
+Every WAD is statically verified for reachability (no soft-locks, key reachable before lock, exit reachable) and engine-verified in `doom_env` (`freedoom2.wad`, skill 3, `< 2,048` sectors, exact `wad` geometry, verified `RAY_DOOR` / `RAY_LOCKED` linedef specials):
+
+```bash
+uv run python -m training.maps --generate --verify
+uv run python -m training.maps --list --split dev
 ```
 
-Evaluation runs with the `freedoom2.wad` IWAD (bundled with ViZDoom), skill 3 and the vanilla engine.
+To dry-run the submitted agent on any registered map:
 
-To dry-run your agent on your own maps: `python validate.py --map path/to/your.wad:MAP05`.
+```bash
+uv run python validate.py --map maps/dev/dev_simple_dogleg_door.wad:MAP01
+```
