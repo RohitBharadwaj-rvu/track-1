@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Track 1 Brief</title>
+<style>
+    @page { size: letter; margin: 0.45in; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           font-size: 10.2pt; line-height: 1.38; color: #1a1a1a; max-width: 7.6in; margin: 0 auto; }
+    h1 { font-size: 16pt; margin: 0 0 6pt 0; border-bottom: 1.5px solid #222; padding-bottom: 4pt; }
+    h2 { font-size: 12.5pt; margin: 10pt 0 4pt 0; color: #0f3d5e; }
+    h3 { font-size: 10.8pt; margin: 8pt 0 3pt 0; }
+    p { margin: 3pt 0 5pt 0; }
+    ul, ol { margin: 2pt 0 6pt 16pt; padding: 0; }
+    li { margin-bottom: 2.5pt; }
+    code { font-family: Consolas, "Courier New", monospace; font-size: 9pt;
+           background: #f3f5f7; padding: 0.5pt 3pt; border-radius: 2pt; }
+    table { border-collapse: collapse; width: 100%; margin: 6pt 0 8pt 0; font-size: 8.8pt; }
+    th, td { border: 1px solid #cbd5e1; padding: 3.5pt 5pt; text-align: left; }
+    th { background: #eef3f8; font-weight: 600; }
+    hr { border: none; border-top: 1px solid #d1d5db; margin: 8pt 0; }
+    .page-break { break-before: page; page-break-before: always; }
+    </style>
+</head>
+<body>
+<h1>Track 1 Brief: Telemetry-Driven Recurrent DOOM Agent</h1>
+<p><em>(Draft working brief — updated by Role 4 across Stage 1 -&gt; Stage 4 milestones)</em></p>
+<hr />
+<h2>Page 1: Architecture &amp; Memory Design</h2>
+<h3>1. Problem &amp; Telemetry Choice</h3>
+<p>Our agent plays unseen <code>freedoom2.wad</code> (<code>skill 3</code>) levels zero-shot under strict inference limits (<code>2 GB VRAM</code>, <code>8 GB RAM</code>, <code>1 CPU thread</code>, <code>40 ms/step</code>). Rather than spending compute on raw pixel CNNs, we operate directly on <code>doom_env</code>'s ego-centric telemetry signals (<code>rays</code>, <code>visible_entities</code>, <code>vitals</code>) with <code>render_buffers=False</code> during training.</p>
+<h3>2. Policy &amp; Recurrent Memory (<code>submission/policy.py</code>)</h3>
+<ul>
+<li><strong>Raycast Encoder:</strong> Circular 1D convolutions over the 64 ego-centric rays (normalized distance + hit type) to preserve directional left/right bins across 360°.</li>
+<li><strong>Entity Encoder:</strong> Learned class embeddings + relative geometry/velocity features <code>(32, 5)</code> pooled with masked attention conditioned on <code>vitals</code> and ray context, with a deterministic empty-set fallback.</li>
+<li><strong>Temporal &amp; Button-Edge Memory:</strong> A GRU fuses <code>[ray_emb, entity_emb, normalized_vitals, prev_action]</code> so the policy respects ViZDoom's button-down edge semantics for <code>USE</code> and <code>SELECT_NEXT_WEAPON</code> and tracks short-term navigation state.</li>
+<li><strong>Action &amp; Value Heads:</strong> 9 independent binary button logits (<code>MultiBinary(9)</code>) and a scalar value critic trained via Recurrent PPO with GAE and episode-boundary hidden-state masking.</li>
+</ul>
+<h3>3. Curriculum &amp; Failure-Driven Upgrades</h3>
+<ul>
+<li>Training curriculum covers Tier 1 combat, Tier 2 multi-room exploration, Tier 3 key-and-return progression, and Tier 4 gauntlets using separate train/dev/final map families.</li>
+<li>Architectural upgrades (e.g., learned landmark memory slots for long-horizon key/door backtracking) are promoted only when independent evaluation on identical held-out seeds confirms improvement on Tier 3–4 exits and unlocks.</li>
+</ul>
+<hr />
+<div class="page-break"></div>
+<h2>Page 2: Evaluation Outcomes, Runtime &amp; Failure Analysis</h2>
+<h3>1. Baseline vs. Final Outcomes (Local Dev Proxy Suite)</h3>
+<p><em>Note: Organizer evaluation weights and hidden maps are private; local metrics below are proxy measurements.</em></p>
+<table><thead><tr>
+<th>Candidate</th>
+<th>Suite</th>
+<th>Episodes</th>
+<th>Exits</th>
+<th>Keys Picked Up</th>
+<th>Locked Doors Unlocked</th>
+<th>Kills</th>
+<th>Mean Cells Visited</th>
+<th>Errors</th>
+</tr></thead><tbody>
+<tr>
+<td>Stage 0 Random (<code>submission/agent.py</code>)</td>
+<td>10 dev maps (30 eps)</td>
+<td>30</td>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+<td>10</td>
+<td>13.97</td>
+<td>0</td>
+</tr>
+<tr>
+<td>Stage 2 MVP Recurrent PPO</td>
+<td><em>TBD</em></td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Final Shipped Agent</td>
+<td><em>TBD</em></td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<h3>2. Sandbox Compliance &amp; Inference Runtime (<code>validate.py</code>)</h3>
+<ul>
+<li><strong>Hardware target:</strong> RTX 3090 (2 GB VRAM cap), 8 GB RAM, 1 CPU thread (<code>OMP_NUM_THREADS=1</code>), offline read-only repo.</li>
+<li><strong>Stage 0 Random Baseline (<code>validate.py</code> on Windows local):</strong> <code>init 0.0s</code>, <code>first 2 ms</code>, <code>p50 0.9 ms</code>, <code>p99 1.6 ms</code>, <code>max 2 ms</code>, <code>0.5s / 21.0s</code> per-map compute budget.</li>
+<li><strong>Final Agent (<code>validate.py --docker</code>):</strong> <em>TBD after weight freeze.</em></li>
+</ul>
+<h3>3. Informative Failure Case</h3>
+<ul>
+<li><em>TBD: Document one concrete dev-map failure replay from <code>training/eval.py --record-dir</code> (e.g., key pickup without return unlock, or <code>USE</code> door-bounce) and how curriculum/architecture addressed it.</em></li>
+</ul>
+</body>
+</html>

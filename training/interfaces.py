@@ -114,11 +114,17 @@ class PrivilegedEventTracker:
         if ceil is not None and self._initial_ceil is not None and len(ceil) == len(self._initial_ceil):
             raised = np.flatnonzero(np.asarray(ceil, dtype=np.float64) - self._initial_ceil >= self.open_threshold)
             for idx in raised.tolist():
-                is_locked = locks is not None and idx < len(locks) and int(locks[idx]) > 0
-                if is_locked:
-                    if idx not in self._unlocked_sectors:
-                        self._unlocked_sectors.add(idx)
-                        locked_doors_unlocked += 1
+                if locks is not None and idx < len(locks):
+                    lock_val = int(locks[idx])
+                    if lock_val > 0:
+                        if idx not in self._unlocked_sectors:
+                            self._unlocked_sectors.add(idx)
+                            locked_doors_unlocked += 1
+                    elif lock_val == 0:
+                        if idx not in self._opened_sectors:
+                            self._opened_sectors.add(idx)
+                            doors_opened += 1
+                    # lock_val < 0 indicates a non-door sector (e.g., lift/ceiling), ignored.
                 else:
                     if idx not in self._opened_sectors:
                         self._opened_sectors.add(idx)
