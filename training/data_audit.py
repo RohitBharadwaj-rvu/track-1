@@ -124,7 +124,7 @@ def extract_map_features(wad_path: str | Path, map_name: str = "MAP01") -> dict[
         arg0 = int(ld.get("arg0", 0) or 0)
         arg2 = int(ld.get("arg2", 0) or 0)
         arg3 = int(ld.get("arg3", 0) or 0)
-        if sp in (11, 52, 243, 244):
+        if sp in (243, 244):
             exit_pts.append(((v1[0] + v2[0]) * 0.5, (v1[1] + v2[1]) * 0.5))
             if ld.get("playeruse"):
                 has_exit_switch = True

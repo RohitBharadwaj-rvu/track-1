@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from training.game_theory import compute_episode_rubric_score
 from training.interfaces import PrivilegedEventTracker, StepEvents
 
 _MOVE_BACKWARD_IDX = 1
@@ -32,14 +33,16 @@ class RewardConfig:
     key_pickup_reward: float = 4.0
     locked_door_unlock_reward: float = 7.0
     door_open_reward: float = 2.0
+    max_door_open_bonus: float = 4.0
     new_cell_reward: float = 0.10
     max_exploration_cells: int = 250
-    explore_decay_cells: float = 60.0
+    explore_decay_cells: float = 40.0
     post_key_cell_reward: float = 0.02
     max_post_key_cells: int = 30
     kill_reward: float = 1.2
     damage_penalty: float = -0.050
     death_penalty: float = -7.0
+    post_key_death_penalty: float = 0.0
     door_bounce_penalty: float = -0.25
     use_waste_penalty: float = -0.004
     use_hold_penalty: float = -0.08
@@ -49,6 +52,10 @@ class RewardConfig:
     max_pickup_bonus: float = 3.5
     pbrs_scale: float = 3.0
     pbrs_gamma: float = 1.0
+    champion_beat_coef: float = 3.0
+    champion_beat_cap: float = 2.5
+    champion_regress_coef: float = 2.5
+    champion_regress_cap: float = 2.0
     spin_penalty: float = -0.015
     spin_threshold_steps: int = 6
     blind_backward_penalty: float = -0.012
@@ -99,8 +106,24 @@ class RewardShaper:
         self._prev_ammo: float | None = None
         self._owned_weapons: set[int] = set()
         self._pickup_bonus_earned: float = 0.0
+        self._door_bonus_earned: float = 0.0
+        self._has_picked_up_key: bool = False
+        self._ep_keys: int = 0
+        self._ep_doors: int = 0
+        self._ep_unlocks: int = 0
+        self._ep_kills: int = 0
+        self._ep_tier: int = 1
+        self._champion_baseline: dict[str, float] | None = None
+        self.last_regressed_vs_champion: bool = False
+        self.last_rubric_score: float = 0.0
         self._consec_turn_dir: int = 0
         self._consec_turn_steps: int = 0
+
+    def set_config(self, config: RewardConfig) -> None:
+        self.config = config
+        if self.pbrs is not None:
+            self.pbrs.scale = float(config.pbrs_scale)
+            self.pbrs.gamma = float(config.pbrs_gamma)
 
     @property
     def unique_cells_visited(self) -> int:
@@ -116,7 +139,15 @@ class RewardShaper:
             int(np.floor(float(priv_state["y"]) / self.config.cell_size)),
         )
 
-    def reset(self, priv_state: dict[str, Any], obs: dict[str, Any] | None = None, *, pbrs: Any = None) -> None:
+    def reset(
+        self,
+        priv_state: dict[str, Any],
+        obs: dict[str, Any] | None = None,
+        *,
+        pbrs: Any = None,
+        champion_baseline: dict[str, float] | None = None,
+        tier: int = 1,
+    ) -> None:
         if pbrs is not None:
             self.pbrs = pbrs
         self.tracker.reset(priv_state)
@@ -133,6 +164,16 @@ class RewardShaper:
         if obs is not None and "vitals" in obs:
             self._owned_weapons.add(int(round(float(obs["vitals"][2]))))
         self._pickup_bonus_earned = 0.0
+        self._door_bonus_earned = 0.0
+        self._has_picked_up_key = False
+        self._ep_keys = 0
+        self._ep_doors = 0
+        self._ep_unlocks = 0
+        self._ep_kills = 0
+        self._ep_tier = int(tier)
+        self._champion_baseline = champion_baseline
+        self.last_regressed_vs_champion = False
+        self.last_rubric_score = 0.0
         self._consec_turn_dir = 0
         self._consec_turn_steps = 0
         if self.pbrs is not None:
@@ -268,6 +309,46 @@ class RewardShaper:
         if action is not None and int(action[_MOVE_BACKWARD_IDX]) == 1 and not _has_visible_enemy(obs):
             backward_pen = cfg.blind_backward_penalty
 
+        self._ep_keys += events.keys_picked_up
+        self._ep_doors += events.doors_opened
+        self._ep_unlocks += events.locked_doors_unlocked
+        self._ep_kills += events.kills
+
+        raw_door = cfg.door_open_reward * events.doors_opened
+        door_rew = min(raw_door, max(0.0, cfg.max_door_open_bonus - self._door_bonus_earned))
+        self._door_bonus_earned += door_rew
+
+        if events.keys_picked_up > 0 or keys_held > 0.0:
+            self._has_picked_up_key = True
+        post_key_death = cfg.post_key_death_penalty if (events.dead and self._has_picked_up_key) else 0.0
+
+        champion_delta = 0.0
+        if events.exit_reached or events.dead or events.timeout:
+            outcome = "exit" if events.exit_reached else ("death" if events.dead else "timeout")
+            ep_ticks = max(1, int(priv_state.get("episode_ticks", 4200 if self._ep_tier >= 3 else 2100)))
+            rubric_ep = {
+                "tier": self._ep_tier,
+                "outcome": outcome,
+                "ticks": int(priv_state.get("tic", 0)),
+                "episode_ticks": ep_ticks,
+                "final_health": curr_health,
+                "keys_picked_up": self._ep_keys,
+                "doors_opened": self._ep_doors,
+                "locked_doors_unlocked": self._ep_unlocks,
+                "unique_cells_visited": self.tracker.unique_cells_visited,
+                "kills": self._ep_kills,
+            }
+            self.last_rubric_score = compute_episode_rubric_score(rubric_ep)
+            if self._champion_baseline is not None:
+                base_rubric = float(self._champion_baseline.get("rubric", 0.0))
+                base_exit = float(self._champion_baseline.get("exit_rate", 0.0))
+                delta = self.last_rubric_score - base_rubric
+                if delta > 0.0:
+                    champion_delta = min(cfg.champion_beat_cap, cfg.champion_beat_coef * delta)
+                elif delta < 0.0 and base_exit >= 0.5:
+                    champion_delta = -min(cfg.champion_regress_cap, cfg.champion_regress_coef * abs(delta))
+                    self.last_regressed_vs_champion = True
+
         self._prev_health = curr_health
         self._prev_armor = curr_armor
         if curr_ammo is not None:
@@ -278,12 +359,14 @@ class RewardShaper:
             "efficiency": efficiency,
             "key": cfg.key_pickup_reward * events.keys_picked_up,
             "unlock": cfg.locked_door_unlock_reward * events.locked_doors_unlocked,
-            "door": cfg.door_open_reward * events.doors_opened,
+            "door": door_rew,
             "explore": explore,
             "post_key_explore": post_key_explore,
             "kill": cfg.kill_reward * events.kills,
             "damage": cfg.damage_penalty * events.damage_taken,
             "death": cfg.death_penalty if events.dead else 0.0,
+            "post_key_death": post_key_death,
+            "champion_delta": champion_delta,
             "use_penalty": use_penalty,
             "ammo_waste": ammo_waste,
             "weapon_switch_penalty": weapon_switch_penalty,

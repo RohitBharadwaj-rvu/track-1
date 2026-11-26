@@ -973,20 +973,35 @@ def build_polygon_wad(
     return _write_textmap_wad(path, textmap, map_name=map_name)
 
 
-def _d4_transform_pt(pt: tuple[float, float], rot_k: int, flip_x: bool) -> tuple[float, float]:
+def _d4_transform_pt(
+    pt: tuple[float, float],
+    rot_k: int,
+    flip_x: bool,
+    angle_deg: float = 0.0,
+) -> tuple[float, float]:
+    import math
+
     x, y = float(pt[0]), float(pt[1])
     if flip_x:
         x = -x
     for _ in range(int(rot_k) % 4):
         x, y = -y, x
-    return _snap_pt((x, y))
+    ang = float(angle_deg) % 360.0
+    if abs(ang) > 1e-6:
+        rad = math.radians(ang)
+        ca, sa = math.cos(rad), math.sin(rad)
+        x, y = (x * ca - y * sa), (x * sa + y * ca)
+    return (round(float(x), 1), round(float(y), 1))
 
 
-def _d4_transform_angle(angle: int, rot_k: int, flip_x: bool) -> int:
+def _d4_transform_angle(angle: int, rot_k: int, flip_x: bool, angle_deg: float = 0.0) -> int:
     ang = int(angle) % 360
     if flip_x:
         ang = (180 - ang) % 360
-    return (ang + 90 * (int(rot_k) % 4)) % 360
+    ang = (ang + 90 * (int(rot_k) % 4)) % 360
+    if abs(float(angle_deg)) > 1e-6:
+        ang = int(round((ang + float(angle_deg)) % 360.0)) % 360
+    return ang
 
 
 def transform_polygon_map(
@@ -994,10 +1009,11 @@ def transform_polygon_map(
     things: Sequence[ThingSpec],
     rot_k: int = 0,
     flip_x: bool = False,
+    angle_deg: float = 0.0,
 ) -> tuple[tuple[PolygonSector, ...], tuple[ThingSpec, ...]]:
-    """Apply an exact D4 symmetry transform (horizontal flip + 90-deg CCW rotations) to a polygonal map."""
+    """Apply D4 symmetry + optional continuous rotation (degrees CCW) while preserving exact vertex stitching."""
     def tx(pt: tuple[float, float]) -> tuple[float, float]:
-        return _d4_transform_pt(pt, rot_k, flip_x)
+        return _d4_transform_pt(pt, rot_k, flip_x, angle_deg)
 
     out_sectors: list[PolygonSector] = []
     for ps in poly_sectors:
@@ -1042,7 +1058,7 @@ def transform_polygon_map(
             x=tx((t.x, t.y))[0],
             y=tx((t.x, t.y))[1],
             doomednum=t.doomednum,
-            angle=_d4_transform_angle(t.angle, rot_k, flip_x),
+            angle=_d4_transform_angle(t.angle, rot_k, flip_x, angle_deg),
         )
         for t in things
     )

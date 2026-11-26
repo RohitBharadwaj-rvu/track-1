@@ -30,16 +30,6 @@ from doom_env.mapinfo import (
 from doom_env.sensors import MAX_STEP_UP, PLAYER_HEIGHT
 from doom_env.wad import map_lumps, read_wad
 
-# ZDoom UDMF lock numbers + binary lock numbers -> canonical color index {0: blue, 1: yellow, 2: red}
-_LOCK_TO_COLOR: dict[int, int] = {
-    LOCK_BLUE: 0,
-    130: 0,
-    LOCK_YELLOW: 1,
-    131: 1,
-    LOCK_RED: 2,
-    129: 2,
-}
-
 # DoomEdNums for key items -> color index {0: blue, 1: yellow, 2: red}
 _KEY_THING_TO_COLOR: dict[int, int] = {
     5: 0,   # BlueCard
@@ -50,13 +40,27 @@ _KEY_THING_TO_COLOR: dict[int, int] = {
     38: 2,  # RedSkull
 }
 
-_EXIT_SPECIALS = {11, 51, 52, 124, 197, 198, 243, 244}
+_UDMF_EXIT_SPECIALS = {243, 244}
+_DOOM_EXIT_SPECIALS = {11, 51, 52, 124, 197, 198}
 _REMOTE_DOOR_LOCK = -99
 _UDMF_DAMAGING_SPECIALS = {69, 71, 75, 80, 105, 115, 196}
 _DOOM_DAMAGING_SPECIALS = {4, 5, 7, 11, 16}
 _DOOM_REMOTE_DOOR_SPECIALS = {2, 29, 61, 63, 86, 90, 103, 105, 106, 108, 109, 111, 112, 114, 115}
 _INF = 1e9
 _MAX_POTENTIAL_DIST = 6.0
+
+# ZDoom UDMF lock numbers + binary lock numbers -> canonical color index {0: blue, 1: yellow, 2: red}
+_LOCK_TO_COLOR: dict[int, int] = {
+    LOCK_BLUE: 0,
+    5: 0,    # BlueSkull
+    130: 0,
+    LOCK_YELLOW: 1,
+    6: 1,    # YellowSkull
+    131: 1,
+    LOCK_RED: 2,
+    4: 2,    # RedSkull
+    129: 2,
+}
 
 
 def _segments_intersect_batch(
@@ -114,18 +118,26 @@ class _WadNavigationGraph:
     # neighbor[cell_idx] -> list of (neighbor_idx, edge_cost, lock_requirements)
     # where lock_requirements is a tuple of (sector_id, lock_code) crossed on this edge
     adj: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]]
+    rev_adj: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]]
     exit_cells: tuple[int, ...]
     key_spawns: tuple[tuple[int, int], ...]  # (cell_idx, color_idx)
     locked_door_cells: dict[int, tuple[int, list[int]]]  # sector_id -> (lock_code, [cell_indices])
     switch_waypoints: dict[int, int] = field(default_factory=dict)  # remote door sid -> switch cell_idx
+    player_start: tuple[float, float] | None = None
 
 
-_NAV_CACHE: dict[tuple[str, str, float], _WadNavigationGraph | None] = {}
+_NAV_CACHE: dict[tuple[str, int, int, str, float], _WadNavigationGraph | None] = {}
 
 
 def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: float = 32.0) -> _WadNavigationGraph | None:
-    resolved = str(Path(wad_path).resolve())
-    cache_key = (resolved, map_name.upper(), float(cell_size))
+    path_obj = Path(wad_path).resolve()
+    resolved = str(path_obj)
+    try:
+        st = path_obj.stat()
+        mtime_ns, fsize = int(st.st_mtime_ns), int(st.st_size)
+    except OSError:
+        mtime_ns, fsize = 0, 0
+    cache_key = (resolved, mtime_ns, fsize, map_name.upper(), float(cell_size))
     if cache_key in _NAV_CACHE:
         return _NAV_CACHE[cache_key]
 
@@ -156,21 +168,12 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
     sec_tag = np.zeros(n_sec, dtype=np.int64)
     has_sec_geom = False
 
-    exit_pts: list[tuple[float, float]] = []
+    exit_raw: list[tuple[float, float, float, float, bool]] = []  # (x1, y1, x2, y2, has_back)
+    exit_centers: list[tuple[float, float]] = []
     key_pts: list[tuple[float, float, int]] = []
-    remote_switch_by_tag: dict[int, list[tuple[float, float]]] = {}
+    player_start: tuple[float, float] | None = None
+    remote_switch_raw_by_tag: dict[int, list[tuple[float, float, float, float, bool]]] = {}
     manual_door_secs: set[int] = set()
-    inward_nudge = min(16.0, float(cell_size) * 0.5)
-
-    def _nudged_midpoint(x1: float, y1: float, x2: float, y2: float, has_back: bool) -> tuple[float, float]:
-        mx, my = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-        if not has_back:
-            dx, dy = x2 - x1, y2 - y1
-            seg_len = math.hypot(dx, dy)
-            if seg_len > 1e-6:
-                mx += (dy / seg_len) * inward_nudge
-                my += (-dx / seg_len) * inward_nudge
-        return mx, my
 
     if "TEXTMAP" in lumps:
         text = lumps["TEXTMAP"].decode("utf-8", "replace")
@@ -211,10 +214,10 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
             x1, y1 = verts[v1]
             x2, y2 = verts[v2]
 
-            if spec in _EXIT_SPECIALS:
-                exit_pts.append(_nudged_midpoint(x1, y1, x2, y2, has_back))
+            if spec in _UDMF_EXIT_SPECIALS:
+                exit_raw.append((x1, y1, x2, y2, has_back))
             elif spec in (11, 12) and arg0 > 0:
-                remote_switch_by_tag.setdefault(arg0, []).append(_nudged_midpoint(x1, y1, x2, y2, has_back))
+                remote_switch_raw_by_tag.setdefault(arg0, []).append((x1, y1, x2, y2, has_back))
 
         exit_sec_ids = {
             i for i, sec in enumerate(sectors) if str(sec.get("texturefloor", "")).upper() == "GATE3"
@@ -235,11 +238,13 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
                 if pts:
                     cx = sum(pt[0] for pt in pts) / len(pts)
                     cy = sum(pt[1] for pt in pts) / len(pts)
-                    exit_pts.append((cx, cy))
+                    exit_centers.append((cx, cy))
 
         for th in blocks.get("thing", []):
             t_id = int(th.get("type", 0) or 0)
-            if t_id in _KEY_THING_TO_COLOR:
+            if t_id == 1:
+                player_start = (float(th.get("x", 0.0)), float(th.get("y", 0.0)))
+            elif t_id in _KEY_THING_TO_COLOR:
                 key_pts.append((float(th.get("x", 0.0)), float(th.get("y", 0.0)), _KEY_THING_TO_COLOR[t_id]))
     elif {"VERTEXES", "LINEDEFS", "SIDEDEFS", "SECTORS"}.issubset(lumps):
         # Standard Doom binary WAD lumps (e.g., freedoom2.wad MAP01..MAP32).
@@ -286,15 +291,17 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
                 continue
             x1, y1 = verts[v1]
             x2, y2 = verts[v2]
-            if spec in _EXIT_SPECIALS:
-                exit_pts.append(_nudged_midpoint(x1, y1, x2, y2, has_back))
+            if spec in _DOOM_EXIT_SPECIALS:
+                exit_raw.append((x1, y1, x2, y2, has_back))
             elif spec in _DOOM_REMOTE_DOOR_SPECIALS and tag > 0:
-                remote_switch_by_tag.setdefault(int(tag), []).append(_nudged_midpoint(x1, y1, x2, y2, has_back))
+                remote_switch_raw_by_tag.setdefault(int(tag), []).append((x1, y1, x2, y2, has_back))
 
         n_t = len(t_raw) // 10
         for i in range(n_t):
             tx, ty, _ang, t_id, _tflags = struct.unpack_from("<hhhhh", t_raw, i * 10)
-            if t_id in _KEY_THING_TO_COLOR:
+            if t_id == 1:
+                player_start = (float(tx), float(ty))
+            elif t_id in _KEY_THING_TO_COLOR:
                 key_pts.append((float(tx), float(ty), _KEY_THING_TO_COLOR[t_id]))
 
     # Track directed cliff segments (allow downhill drop-offs, block uphill > MAX_STEP_UP).
@@ -330,27 +337,7 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
     cliff_p1 = p1[cliff_indices] if cliff_indices else np.zeros((0, 2), dtype=np.float64)
     cliff_p2 = p2[cliff_indices] if cliff_indices else np.zeros((0, 2), dtype=np.float64)
 
-    # Identify remote doors (tag > 0 matching a switch linedef, no local manual door linedefs)
-    remote_doors: dict[int, tuple[float, float]] = {}
-    for sid, lock in info.door_sectors.items():
-        if lock == 0 and 0 <= sid < n_sec and sid not in manual_door_secs:
-            tag = int(sec_tag[sid])
-            if tag > 0 and tag in remote_switch_by_tag:
-                pts = remote_switch_by_tag[tag]
-                remote_doors[sid] = pts[0]
-
-    # Locked door + remote door boundary segments
-    locked_sectors: dict[int, int] = {sid: lock for sid, lock in info.door_sectors.items() if lock > 0}
-    for sid in remote_doors:
-        locked_sectors[sid] = _REMOTE_DOOR_LOCK
-
-    lock_line_idx: list[tuple[int, int, int]] = []  # (line_idx, sid, lock)
-    for sid, lock in locked_sectors.items():
-        m = ((front == sid) | (back == sid)) & (~solid_mask)
-        for li in np.flatnonzero(m).tolist():
-            lock_line_idx.append((li, sid, lock))
-
-    if not exit_pts:
+    if not exit_raw and not exit_centers:
         _NAV_CACHE[cache_key] = None
         return None
 
@@ -381,6 +368,43 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
     def cell_center(idx: int) -> tuple[float, float]:
         gy, gx = divmod(idx, nx)
         return min_x + (gx + 0.5) * eff_cell, min_y + (gy + 0.5) * eff_cell
+
+    def _safe_wall_cell(x1: float, y1: float, x2: float, y2: float, has_back: bool) -> int:
+        mx, my = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        if has_back:
+            return to_cell(mx, my)
+        dx, dy = x2 - x1, y2 - y1
+        seg_len = math.hypot(dx, dy)
+        if seg_len <= 1e-6:
+            return to_cell(mx, my)
+        nx_w, ny_w = dy / seg_len, -dx / seg_len
+        anchor_x, anchor_y = mx + nx_w * 2.0, my + ny_w * 2.0
+        for mult in (0.78, 0.55, 0.35, 1.05):
+            cand = to_cell(mx + nx_w * (eff_cell * mult), my + ny_w * (eff_cell * mult))
+            cx, cy = cell_center(cand)
+            if not np.any(_segments_intersect_batch(anchor_x, anchor_y, cx, cy, solid_p1, solid_p2)):
+                return cand
+        return to_cell(mx + nx_w * (eff_cell * 0.5), my + ny_w * (eff_cell * 0.5))
+
+    # Identify remote doors (tag > 0 matching a switch linedef, no local manual door linedefs)
+    remote_doors: dict[int, int] = {}
+    for sid, lock in info.door_sectors.items():
+        if lock == 0 and 0 <= sid < n_sec and sid not in manual_door_secs:
+            tag = int(sec_tag[sid])
+            if tag > 0 and tag in remote_switch_raw_by_tag:
+                sx1, sy1, sx2, sy2, shb = remote_switch_raw_by_tag[tag][0]
+                remote_doors[sid] = _safe_wall_cell(sx1, sy1, sx2, sy2, shb)
+
+    # Locked door + remote door boundary segments
+    locked_sectors: dict[int, int] = {sid: lock for sid, lock in info.door_sectors.items() if lock > 0}
+    for sid in remote_doors:
+        locked_sectors[sid] = _REMOTE_DOOR_LOCK
+
+    lock_line_idx: list[tuple[int, int, int]] = []  # (line_idx, sid, lock)
+    for sid, lock in locked_sectors.items():
+        m = ((front == sid) | (back == sid)) & (~solid_mask)
+        for li in np.flatnonzero(m).tolist():
+            lock_line_idx.append((li, sid, lock))
 
     n_cells = nx * ny
     cell_damaging = np.zeros(n_cells, dtype=bool)
@@ -487,9 +511,18 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
                     cost = diag_base * (3.0 if (cell_damaging[src] or cell_damaging[dst]) else 1.0)
                     adj[src].append((dst, cost, reqs))
 
-    exit_cells = tuple(sorted({to_cell(ex, ey) for ex, ey in exit_pts}))
+    exit_cells = tuple(
+        sorted(
+            {_safe_wall_cell(x1, y1, x2, y2, hb) for x1, y1, x2, y2, hb in exit_raw}
+            | {to_cell(ex, ey) for ex, ey in exit_centers}
+        )
+    )
     key_spawns = tuple((to_cell(kx, ky), col) for kx, ky, col in key_pts)
-    switch_waypoints = {sid: to_cell(sx, sy) for sid, (sx, sy) in remote_doors.items()}
+    switch_waypoints = dict(remote_doors)
+    rev_adj: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]] = [[] for _ in range(n_cells)]
+    for u, edges in enumerate(adj):
+        for v, cost, reqs in edges:
+            rev_adj[v].append((u, cost, reqs))
     graph = _WadNavigationGraph(
         min_x=min_x,
         min_y=min_y,
@@ -497,15 +530,121 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
         nx=nx,
         ny=ny,
         adj=adj,
+        rev_adj=rev_adj,
         exit_cells=exit_cells,
         key_spawns=key_spawns,
         locked_door_cells=locked_door_cells,
         switch_waypoints=switch_waypoints,
+        player_start=player_start,
     )
     _NAV_CACHE[cache_key] = graph
     if len(_NAV_CACHE) > 256:
         _NAV_CACHE.pop(next(iter(_NAV_CACHE)))
     return graph
+
+
+def compute_pbrs_geodesic_summary(
+    wad_path: str | Path,
+    map_name: str = "MAP01",
+    cell_size: float = 32.0,
+) -> dict[str, Any]:
+    """Simulate static greedy progression over `_build_nav_graph` and report PBRS validity + geodesic horizon."""
+    import heapq
+
+    graph = _build_nav_graph(wad_path, map_name=map_name, cell_size=cell_size)
+    if graph is None or not graph.exit_cells or graph.player_start is None:
+        return {
+            "pbrs_valid": False,
+            "geodesic_horizon_u": 0.0,
+            "has_oneway_dropoff": False,
+            "nav_cells": 0,
+        }
+
+    edge_pairs: set[tuple[int, int]] = set()
+    for u, edges in enumerate(graph.adj):
+        for v, _, _ in edges:
+            edge_pairs.add((u, v))
+    has_oneway = any((v, u) not in edge_pairs for (u, v) in edge_pairs)
+
+    gx = min(graph.nx - 1, max(0, int(math.floor((graph.player_start[0] - graph.min_x) / graph.cell_size))))
+    gy = min(graph.ny - 1, max(0, int(math.floor((graph.player_start[1] - graph.min_y) / graph.cell_size))))
+    cur_cell = gy * graph.nx + gx
+    held_colors: set[int] = set()
+    collected_keys: set[int] = set()
+    unlocked_secs: set[int] = set()
+    n_cells = graph.nx * graph.ny
+    total_horizon = 0.0
+
+    def _can_pass(sid: int, lock: int) -> bool:
+        if sid in unlocked_secs:
+            return True
+        if lock == _REMOTE_DOOR_LOCK:
+            return False
+        if lock in _LOCK_TO_COLOR:
+            return _LOCK_TO_COLOR[lock] in held_colors
+        if lock == LOCK_ANY:
+            return len(held_colors) > 0
+        if lock == LOCK_ALL:
+            return len(held_colors) >= 3
+        if lock > 0:
+            return False
+        return True
+
+    def _fwd_dist(start: int) -> np.ndarray:
+        dist = np.full(n_cells, _INF, dtype=np.float64)
+        dist[start] = 0.0
+        pq: list[tuple[float, int]] = [(0.0, start)]
+        adj = graph.adj
+        while pq:
+            d, u = heapq.heappop(pq)
+            if d > dist[u]:
+                continue
+            for v, cost, reqs in adj[u]:
+                if reqs and not all(_can_pass(sid, lk) for sid, lk in reqs):
+                    continue
+                nd = d + cost
+                if nd < dist[v]:
+                    dist[v] = nd
+                    heapq.heappush(pq, (nd, v))
+        return dist
+
+    for _ in range(len(graph.key_spawns) + len(graph.switch_waypoints) + 2):
+        dist = _fwd_dist(cur_cell)
+        exit_dists = [(float(dist[c]), c) for c in graph.exit_cells if dist[c] < _INF * 0.5]
+        if exit_dists:
+            d_ex, _ = min(exit_dists)
+            total_horizon += d_ex
+            return {
+                "pbrs_valid": True,
+                "geodesic_horizon_u": round(total_horizon, 1),
+                "has_oneway_dropoff": has_oneway,
+                "nav_cells": n_cells,
+            }
+
+        subgoals: list[tuple[float, str, int, int]] = []
+        for idx, (k_cell, col) in enumerate(graph.key_spawns):
+            if idx not in collected_keys and dist[k_cell] < _INF * 0.5:
+                subgoals.append((float(dist[k_cell]), "key", idx, k_cell))
+        for sid, sw_cell in graph.switch_waypoints.items():
+            if sid not in unlocked_secs and dist[sw_cell] < _INF * 0.5:
+                subgoals.append((float(dist[sw_cell]), "switch", sid, sw_cell))
+        if not subgoals:
+            break
+        d_sub, kind, item_id, target_cell = min(subgoals)
+        total_horizon += d_sub
+        cur_cell = target_cell
+        if kind == "key":
+            collected_keys.add(item_id)
+            held_colors.add(graph.key_spawns[item_id][1])
+        else:
+            unlocked_secs.add(item_id)
+
+    return {
+        "pbrs_valid": False,
+        "geodesic_horizon_u": round(total_horizon, 1),
+        "has_oneway_dropoff": has_oneway,
+        "nav_cells": n_cells,
+    }
 
 
 class GeodesicPBRS:
@@ -526,8 +665,11 @@ class GeodesicPBRS:
         self._init_ceil: np.ndarray | None = None
         self._unlocked_sectors: set[int] = set()
         self._collected_key_indices: set[int] = set()
+        self._activated_switches: set[int] = set()
+        self._exit_best_phi: float = 0.0
         self._prev_stage_key: tuple[Any, ...] | None = None
         self._prev_phi: float = 0.0
+        self._rev_dist_cache: dict[tuple[Any, ...], np.ndarray] = {}
 
     def _cell_of(self, x: float, y: float) -> int:
         assert self.graph is not None
@@ -560,6 +702,8 @@ class GeodesicPBRS:
             return len(held_colors) > 0
         if lock == LOCK_ALL:
             return len(held_colors) >= 3
+        if lock > 0:
+            return False
         return True
 
     def _dijkstra(self, start_cell: int, held_colors: set[int]) -> np.ndarray:
@@ -584,6 +728,43 @@ class GeodesicPBRS:
                     heapq.heappush(pq, (nd, v))
         return dist
 
+    def _rev_dijkstra(
+        self,
+        cache_key: tuple[Any, ...],
+        targets: tuple[int, ...] | list[int],
+        held_colors: set[int],
+    ) -> np.ndarray:
+        assert self.graph is not None
+        if cache_key in self._rev_dist_cache:
+            return self._rev_dist_cache[cache_key]
+        import heapq
+
+        n = self.graph.nx * self.graph.ny
+        dist = np.full(n, _INF, dtype=np.float64)
+        pq: list[tuple[float, int]] = []
+        for t in targets:
+            ti = int(t)
+            if 0 <= ti < n and dist[ti] > 0.0:
+                dist[ti] = 0.0
+                pq.append((0.0, ti))
+        heapq.heapify(pq)
+        rev_adj = self.graph.rev_adj
+        while pq:
+            d, v = heapq.heappop(pq)
+            if d > dist[v]:
+                continue
+            for u, cost, reqs in rev_adj[v]:
+                if reqs and not all(self._can_pass_lock(sid, lk, held_colors) for sid, lk in reqs):
+                    continue
+                nd = d + cost
+                if nd < dist[u]:
+                    dist[u] = nd
+                    heapq.heappush(pq, (nd, u))
+        if len(self._rev_dist_cache) >= 128:
+            self._rev_dist_cache.pop(next(iter(self._rev_dist_cache)))
+        self._rev_dist_cache[cache_key] = dist
+        return dist
+
     def _compute_stage_potential(self, priv_state: dict[str, Any]) -> tuple[tuple[Any, ...], float]:
         if self.graph is None or self.scale <= 0.0:
             return ("none",), 0.0
@@ -596,6 +777,8 @@ class GeodesicPBRS:
                 if 0 <= sid < len(diff):
                     if diff[sid] >= 8.0:
                         self._unlocked_sectors.add(sid)
+                        if lk == _REMOTE_DOOR_LOCK:
+                            self._activated_switches.add(sid)
                     elif lk == _REMOTE_DOOR_LOCK:
                         self._unlocked_sectors.discard(sid)
 
@@ -605,27 +788,38 @@ class GeodesicPBRS:
                 self._collected_key_indices.add(idx)
 
         cur_cell = self._cell_of(float(priv_state["x"]), float(priv_state["y"]))
-        dist = self._dijkstra(cur_cell, held_colors)
+        held_fs = frozenset(held_colors)
+        unlocked_fs = frozenset(self._unlocked_sectors)
 
-        # Priority 1: Exit reachable using currently open + held-key doors
-        exit_dists = [float(dist[c]) for c in self.graph.exit_cells if dist[c] < _INF * 0.5]
-        if exit_dists:
-            d_min = min(exit_dists)
-            return ("exit",), max(0.0, _MAX_POTENTIAL_DIST - d_min / 1024.0)
+        # Priority 1: Exit reachable using currently open + held-key doors (cached reverse-Dijkstra)
+        exit_dist_map = self._rev_dijkstra(("exit", held_fs, unlocked_fs), self.graph.exit_cells, held_colors)
+        d_exit = float(exit_dist_map[cur_cell])
+        if d_exit < _INF * 0.5:
+            return ("exit",), max(0.0, _MAX_POTENTIAL_DIST - d_exit / 1024.0)
 
         # Priority 2: Nearest reachable prerequisite (uncollected key or closed remote door switch)
-        key_cands = [
-            float(dist[k_cell])
+        key_targets = tuple(
+            k_cell
             for idx, (k_cell, _col) in enumerate(self.graph.key_spawns)
-            if idx not in self._collected_key_indices and dist[k_cell] < _INF * 0.5
-        ]
-        sw_cands = [
-            (float(dist[sw_cell]), sid)
-            for sid, sw_cell in self.graph.switch_waypoints.items()
-            if sid not in self._unlocked_sectors and dist[sw_cell] < _INF * 0.5
-        ]
-        best_key = min(key_cands) if key_cands else None
+            if idx not in self._collected_key_indices
+        )
+        best_key: float | None = None
+        if key_targets:
+            col_fs = frozenset(self._collected_key_indices)
+            key_dist_map = self._rev_dijkstra(("key", held_fs, unlocked_fs, col_fs), key_targets, held_colors)
+            dk = float(key_dist_map[cur_cell])
+            if dk < _INF * 0.5:
+                best_key = dk
+
+        sw_cands: list[tuple[float, int]] = []
+        for sid, sw_cell in self.graph.switch_waypoints.items():
+            if sid not in self._unlocked_sectors:
+                sw_dist_map = self._rev_dijkstra(("sw", sid, held_fs, unlocked_fs), (sw_cell,), held_colors)
+                ds = float(sw_dist_map[cur_cell])
+                if ds < _INF * 0.5:
+                    sw_cands.append((ds, sid))
         best_sw = min(sw_cands) if sw_cands else None
+
         if best_key is not None and (best_sw is None or best_key <= best_sw[0]):
             if self.graph.switch_waypoints:
                 return (
@@ -645,6 +839,8 @@ class GeodesicPBRS:
     def reset(self, priv_state: dict[str, Any]) -> None:
         self._unlocked_sectors.clear()
         self._collected_key_indices.clear()
+        self._activated_switches.clear()
+        self._exit_best_phi = 0.0
         ceil = priv_state.get("sector_ceiling")
         self._init_ceil = None if ceil is None else np.array(ceil, dtype=np.float64, copy=True)
         if self.graph is None or self.scale <= 0.0:
@@ -652,16 +848,20 @@ class GeodesicPBRS:
             self._prev_phi = 0.0
             return
         self._prev_stage_key, self._prev_phi = self._compute_stage_potential(priv_state)
+        if self._prev_stage_key == ("exit",):
+            self._exit_best_phi = self._prev_phi
 
     def step(self, priv_state: dict[str, Any]) -> float:
         if self.graph is None or self.scale <= 0.0:
             return 0.0
         if bool(priv_state.get("exit_reached")):
-            # Potential at exit (d=0) is _MAX_POTENTIAL_DIST
-            raw = self.scale * (self.gamma * _MAX_POTENTIAL_DIST - self._prev_phi)
+            # Potential at exit (d=0) is _MAX_POTENTIAL_DIST; never penalize stepping onto the exit pad.
+            raw = max(0.0, self.scale * (_MAX_POTENTIAL_DIST - self._prev_phi))
             self._prev_phi = _MAX_POTENTIAL_DIST
+            self._exit_best_phi = max(self._exit_best_phi, _MAX_POTENTIAL_DIST)
             return float(np.clip(raw, -0.5, 0.5))
         if bool(priv_state.get("dead")):
+            self._prev_phi = 0.0
             return 0.0
 
         stage_key, phi = self._compute_stage_potential(priv_state)
@@ -670,11 +870,23 @@ class GeodesicPBRS:
             self._prev_phi = 0.0
             return 0.0
 
-        # Reset potential cleanly when progression target switches (e.g. key -> exit)
+        # Reset potential cleanly when progression target switches; high-water-mark exit potential
+        # prevents re-farming if a timed remote door closes and reopens.
         if self._prev_stage_key != stage_key:
             self._prev_stage_key = stage_key
+            if stage_key == ("exit",):
+                self._prev_phi = max(phi, self._exit_best_phi)
+                self._exit_best_phi = self._prev_phi
+            else:
+                self._prev_phi = phi
+            return 0.0
+
+        if stage_key[0] == "switch" and stage_key[1] in self._activated_switches:
             self._prev_phi = phi
             return 0.0
+
+        if stage_key == ("exit",):
+            self._exit_best_phi = max(self._exit_best_phi, phi)
 
         raw = self.scale * (self.gamma * phi - self._prev_phi)
         self._prev_phi = phi

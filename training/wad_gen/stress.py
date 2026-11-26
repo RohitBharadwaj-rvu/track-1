@@ -4,7 +4,7 @@ from dataclasses import replace
 
 from training.interfaces import MapSpec
 from training.wad_gen.families import MapDefinition
-from training.wad_gen.udmf import PolygonSector, ThingSpec
+from training.wad_gen.udmf import PolygonHole, PolygonSector, ThingSpec
 
 
 def _rect(name, x0, y0, x1, y1, **kwargs):
@@ -370,6 +370,266 @@ def _three_lock_citadel():
     )
 
 
+def _aliased_loop_maze():
+    """Symmetric perceptual-aliasing ring maze with identical textures and decoy alcoves."""
+    sectors = (
+        _rect("sw_corner", 0, 0, 256, 256, wall_texture="STONE2", floor_texture="FLOOR4_8"),
+        PolygonSector(
+            "w_hall",
+            ((0, 256), (0, 320), (0, 448), (0, 512), (256, 512), (256, 256)),
+            wall_texture="STONE2",
+            floor_texture="FLOOR4_8",
+        ),
+        _rect("west_decoy", -128, 320, 0, 448, wall_texture="STONE2", floor_texture="FLOOR4_8"),
+        _rect("nw_corner", 0, 512, 256, 768, wall_texture="STONE2", floor_texture="FLOOR4_8"),
+        PolygonSector(
+            "n_hall",
+            ((256, 512), (256, 768), (320, 768), (448, 768), (512, 768), (512, 512)),
+            wall_texture="STONE2",
+            floor_texture="FLOOR4_8",
+        ),
+        _rect("north_decoy", 320, 768, 448, 896, wall_texture="STONE2", floor_texture="FLOOR4_8"),
+        _rect("ne_corner", 512, 512, 768, 768, wall_texture="STONE2", floor_texture="FLOOR4_8"),
+        PolygonSector(
+            "e_hall",
+            ((512, 256), (512, 512), (768, 512), (768, 448), (768, 320), (768, 256)),
+            wall_texture="STONE2",
+            floor_texture="FLOOR4_8",
+        ),
+        _rect("exit", 768, 320, 832, 448, kind="exit"),
+        _rect("se_corner", 512, 0, 768, 256, wall_texture="STONE2", floor_texture="FLOOR4_8"),
+        _rect("s_hall", 256, 0, 512, 256, wall_texture="STONE2", floor_texture="FLOOR4_8"),
+    )
+    things = (
+        ThingSpec(128, 384, 1, 180),     # Facing west decoy; exit lies across symmetric east wing
+        ThingSpec(64, 384, 2001, 0),     # Shotgun
+        ThingSpec(128, 640, 2012, 0),    # Medikit
+        ThingSpec(640, 640, 3001, 180),  # DoomImp
+        ThingSpec(640, 128, 9, 90),      # ShotgunGuy
+    )
+    return MapDefinition(
+        MapSpec("maps/stress/aliased_loop_maze.wad", family="multi_room", tier=2, split="stress", episode_ticks=2400),
+        "polygon",
+        "Perceptual-aliasing symmetric loop maze around central void with identical alcoves.",
+        poly_sectors=sectors,
+        poly_things=things,
+    )
+
+
+def _decoy_lock_order():
+    """Spawn faces decoy Blue door; must fetch RedCard (North), open Red vault (South) for BlueCard, then exit."""
+    sectors = (
+        PolygonSector(
+            "hub",
+            (
+                (0, 0),
+                (0, 256),
+                (64, 256),
+                (192, 256),
+                (256, 256),
+                (256, 192),
+                (256, 64),
+                (256, 0),
+                (192, 0),
+                (64, 0),
+            ),
+            wall_texture="STONE2",
+            floor_texture="FLOOR0_1",
+        ),
+        _rect("north_hall", 64, 256, 192, 448, wall_texture="STARTAN2"),
+        _rect("red_door", 64, -64, 192, 0, kind="door_red"),
+        _rect("south_vault", 64, -256, 192, -64, wall_texture="BRICK1"),
+        _rect("blue_door", 256, 64, 320, 192, kind="door_blue"),
+        _rect("vestibule", 320, 64, 448, 192, wall_texture="METAL1"),
+        _rect("exit", 448, 64, 512, 192, kind="exit"),
+    )
+    things = (
+        ThingSpec(128, 128, 1, 0),       # Facing decoy East BlueDoor
+        ThingSpec(64, 128, 2001, 0),     # Shotgun
+        ThingSpec(128, 64, 2012, 0),     # Medikit
+        ThingSpec(128, 384, 13, 0),      # RedCard in north wing
+        ThingSpec(128, 320, 9, 270),     # ShotgunGuy
+        ThingSpec(128, -192, 5, 0),      # BlueCard inside south RedDoor vault
+        ThingSpec(128, -128, 3001, 90),  # DoomImp
+    )
+    return MapDefinition(
+        MapSpec("maps/stress/decoy_lock_order.wad", family="key_return", tier=3, split="stress", episode_ticks=4200),
+        "polygon",
+        "Decoy East BlueDoor forces color-specific RedCard -> South RedDoor -> BlueCard -> East BlueDoor order.",
+        poly_sectors=sectors,
+        poly_things=things,
+        min_locked_doors=2,
+    )
+
+
+def _scarce_resource_fork():
+    """Pistol-only spawn forks into lethal direct heavy crossfire vs north flank armory -> Boss Arena -> Exit."""
+    sectors = (
+        PolygonSector(
+            "spawn",
+            ((0, 0), (0, 256), (64, 256), (192, 256), (256, 256), (256, 192), (256, 64), (256, 0)),
+            wall_texture="STARTAN2",
+        ),
+        _rect("risk_hall", 256, 64, 640, 192, wall_texture="BRICK1"),
+        PolygonSector(
+            "safe_w",
+            ((64, 256), (64, 512), (192, 512), (192, 384), (192, 256)),
+            wall_texture="STONE2",
+        ),
+        _rect("safe_mid", 192, 384, 640, 512, wall_texture="METAL1"),
+        PolygonSector(
+            "east_arena",
+            ((640, -64), (640, 64), (640, 192), (640, 384), (640, 512), (896, 512), (896, 256), (896, 128), (896, -64)),
+            wall_texture="BRICK1",
+            floor_texture="FLOOR7_1",
+        ),
+        _rect("exit", 896, 128, 960, 256, kind="exit"),
+    )
+    things = (
+        ThingSpec(96, 128, 1, 0),        # Pistol only, facing lethal risk_hall
+        ThingSpec(448, 128, 65, 180),    # ChaingunGuy on direct risky lane
+        ThingSpec(560, 128, 66, 180),    # Revenant on direct risky lane
+        ThingSpec(128, 384, 3001, 270),  # DoomImp on safe flank
+        ThingSpec(128, 448, 2001, 0),    # Shotgun in flank armory
+        ThingSpec(160, 448, 2049, 0),    # ShellBox
+        ThingSpec(416, 448, 2018, 0),    # GreenArmor
+        ThingSpec(480, 448, 2012, 0),    # Medikit
+        ThingSpec(768, 192, 69, 180),    # HellKnight guarding east arena
+        ThingSpec(768, 384, 2012, 0),    # Medikit
+    )
+    return MapDefinition(
+        MapSpec("maps/stress/scarce_resource_fork.wad", family="gauntlet", tier=4, split="stress", episode_ticks=4200),
+        "polygon",
+        "Scarce-resource fork between direct ChaingunGuy/Revenant crossfire and north flank armory.",
+        poly_sectors=sectors,
+        poly_things=things,
+    )
+
+
+def _cover_peek_crossfire():
+    """Cover pillars + ExplosiveBarrel amidst mixed hitscan and projectile monsters (Stackelberg peeking)."""
+    p1 = PolygonHole(((192, 160), (192, 288), (256, 288), (256, 160)), wall_texture="STONE2")
+    p2 = PolygonHole(((384, 256), (384, 384), (448, 384), (448, 256)), wall_texture="STONE2")
+    sectors = (
+        PolygonSector(
+            "arena",
+            ((0, 0), (0, 512), (768, 512), (768, 320), (768, 192), (768, 0)),
+            wall_texture="BRICK1",
+            floor_texture="FLOOR4_8",
+            height_ceiling=160,
+            holes=(p1, p2),
+        ),
+        _rect("exit", 768, 192, 832, 320, kind="exit", height_ceiling=160),
+    )
+    things = (
+        ThingSpec(80, 224, 1, 0),        # Spawn behind west cover pillar
+        ThingSpec(128, 288, 82, 0),      # SuperShotgun
+        ThingSpec(128, 160, 2049, 0),    # ShellBox
+        ThingSpec(96, 352, 2012, 0),     # Medikit
+        ThingSpec(544, 256, 2035, 0),    # ExplosiveBarrel in enemy cluster
+        ThingSpec(576, 192, 65, 180),    # ChaingunGuy
+        ThingSpec(544, 320, 3001, 180),  # DoomImp
+        ThingSpec(640, 384, 3005, 180),  # Cacodemon
+        ThingSpec(672, 256, 69, 180),    # HellKnight
+    )
+    return MapDefinition(
+        MapSpec("maps/stress/cover_peek_crossfire.wad", family="combat", tier=1, split="stress", episode_ticks=2100),
+        "polygon",
+        "Asymmetric pillar cover arena with ExplosiveBarrel and mixed hitscan/projectile crossfire.",
+        poly_sectors=sectors,
+        poly_things=things,
+    )
+
+
+def _nukage_key_return():
+    """Compound hazard: cross nukage basin with RadSuit, grab RedSkull, return to west RedDoor -> Exit."""
+    sectors = (
+        PolygonSector(
+            "west_bank",
+            ((0, 0), (0, 64), (0, 192), (0, 256), (192, 256), (192, 192), (192, 64), (192, 0)),
+            wall_texture="STARTAN2",
+            height_floor=8,
+        ),
+        _rect(
+            "nukage_pool",
+            192,
+            64,
+            448,
+            192,
+            wall_texture="BROWN1",
+            floor_texture="NUKAGE1",
+            height_floor=0,
+            sector_special=71,
+        ),
+        _rect("dry_north", 192, 192, 448, 256, wall_texture="METAL1", floor_texture="FLOOR5_1", height_floor=8),
+        PolygonSector(
+            "east_vault",
+            ((448, 0), (448, 64), (448, 192), (448, 256), (640, 256), (640, 0)),
+            wall_texture="STONE2",
+            height_floor=8,
+        ),
+        _rect("red_door", -64, 64, 0, 192, kind="door_red", height_floor=8),
+        _rect("vestibule", -192, 64, -64, 192, height_floor=8),
+        _rect("exit", -256, 64, -192, 192, kind="exit", height_floor=8),
+    )
+    things = (
+        ThingSpec(96, 128, 1, 0),        # Facing east over nukage basin
+        ThingSpec(144, 128, 2025, 0),    # RadSuit before nukage
+        ThingSpec(560, 128, 38, 0),      # RedSkull in east vault
+        ThingSpec(512, 64, 3001, 180),   # DoomImp
+        ThingSpec(560, 208, 2011, 0),    # Stimpack
+    )
+    return _probe(
+        "nukage_key_return",
+        "Cross nukage basin with RadSuit for RedSkull, then backtrack across hazard/catwalk to west RedDoor.",
+        sectors,
+        things,
+        locked=True,
+    )
+
+
+def _switch_dropoff_ambush():
+    """Climb 16u stairs to switch alcove under ambush, flip tag=1 switch, take 48u dropoff to exit gate."""
+    sectors = (
+        PolygonSector(
+            "courtyard",
+            ((0, 0), (0, 64), (0, 192), (0, 256), (256, 256), (256, 192), (256, 64), (256, 0)),
+            wall_texture="STONE2",
+            height_ceiling=192,
+        ),
+        _rect("rdoor", -64, 64, 0, 192, kind="remote_door", sector_id=1, height_ceiling=192),
+        _rect("vestibule", -192, 64, -64, 192, height_ceiling=192),
+        _rect("exit", -256, 64, -192, 192, kind="exit", height_ceiling=192),
+        _rect("step1", 256, 0, 320, 64, height_floor=16, height_ceiling=192, wall_texture="STEP1"),
+        _rect("step2", 320, 0, 384, 64, height_floor=32, height_ceiling=192, wall_texture="STEP1"),
+        _rect("step3", 384, 0, 448, 64, height_floor=48, height_ceiling=192, wall_texture="STEP1"),
+        PolygonSector(
+            "high_ledge",
+            ((256, 64), (256, 192), (448, 192), (448, 64), (384, 64), (320, 64)),
+            wall_texture="METAL1",
+            floor_texture="FLOOR5_1",
+            height_floor=48,
+            height_ceiling=192,
+            door_switch=((448, 64), (448, 192), 1),
+        ),
+    )
+    things = (
+        ThingSpec(128, 128, 1, 0),      # Facing east stairs & cliff
+        ThingSpec(128, 64, 2001, 0),    # Shotgun
+        ThingSpec(128, 192, 2012, 0),   # Medikit
+        ThingSpec(368, 128, 9, 180),    # ShotgunGuy on high ledge
+        ThingSpec(304, 144, 3002, 180), # Demon
+    )
+    return MapDefinition(
+        MapSpec("maps/stress/switch_dropoff_ambush.wad", family="gauntlet", tier=3, split="stress", episode_ticks=3200),
+        "polygon",
+        "Climb stairs under ambush to press elevated remote switch (tag 1), drop off 48u cliff to exit.",
+        poly_sectors=sectors,
+        poly_things=things,
+        min_unlocked_doors=1,
+    )
+
+
 STRESS_DEFINITIONS = (
     *_exit_probes(),
     _key_window(False),
@@ -382,4 +642,10 @@ STRESS_DEFINITIONS = (
     _dropoff_return(),
     _open_arena_horde(),
     _three_lock_citadel(),
+    _aliased_loop_maze(),
+    _decoy_lock_order(),
+    _scarce_resource_fork(),
+    _cover_peek_crossfire(),
+    _nukage_key_return(),
+    _switch_dropoff_ambush(),
 )

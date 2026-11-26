@@ -79,6 +79,7 @@ class PolicyConfig:
     use_button_init_bias: float = -1.5
     weapon_switch_init_bias: float = -2.0
     eval_deterministic: bool = False
+    eval_temperature: float = 1.0
     action_threshold: float = 0.5
     use_ego_map: bool = False
     ego_map_out_dim: int = 128
@@ -128,6 +129,7 @@ def sample_actions_from_logits(
     action_head: str = "factorized",
     deterministic: bool = False,
     threshold: float = 0.5,
+    temperature: float = 1.0,
     generator: Any = None,
 ):
     """Sample (or argmax) a 9-button binary action tensor and its exact joint log-prob.
@@ -140,8 +142,11 @@ def sample_actions_from_logits(
     import torch
     import torch.nn.functional as F
 
+    temp = max(1e-4, float(temperature))
+    sample_logits = logits if (deterministic or abs(temp - 1.0) <= 1e-6) else (logits / temp)
+
     if action_head == "bernoulli":
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(sample_logits)
         if deterministic:
             act = (probs >= threshold).to(dtype=logits.dtype)
         else:
@@ -154,19 +159,21 @@ def sample_actions_from_logits(
     lead_shape = logits.shape[:-1]
     cat_logits = logits[..., :9].reshape(*lead_shape, 3, 3)
     bern_logits = logits[..., 9:12]
+    sample_cat_logits = sample_logits[..., :9].reshape(*lead_shape, 3, 3)
+    sample_bern_logits = sample_logits[..., 9:12]
 
     cat_log_probs = F.log_softmax(cat_logits, dim=-1)
     if deterministic:
         cat_idx = torch.argmax(cat_logits, dim=-1)
     else:
-        cat_probs = torch.softmax(cat_logits, dim=-1).reshape(-1, 3)
+        cat_probs = torch.softmax(sample_cat_logits, dim=-1).reshape(-1, 3)
         cat_idx = torch.multinomial(cat_probs, num_samples=1, generator=generator).reshape(*lead_shape, 3)
 
     cat_lp = cat_log_probs.gather(-1, cat_idx.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
 
-    bern_probs = torch.sigmoid(bern_logits)
+    bern_probs = torch.sigmoid(sample_bern_logits)
     if deterministic:
-        bern_act = (bern_probs >= threshold).to(dtype=logits.dtype)
+        bern_act = (torch.sigmoid(bern_logits) >= threshold).to(dtype=logits.dtype)
     else:
         bern_act = torch.bernoulli(bern_probs, generator=generator).to(dtype=logits.dtype)
     bern_lp = -F.binary_cross_entropy_with_logits(bern_logits, bern_act, reduction="none").sum(dim=-1)
@@ -282,6 +289,7 @@ def build_policy(config: PolicyConfig):
             *,
             deterministic: bool = False,
             threshold: float = 0.5,
+            temperature: float = 1.0,
             generator: Any = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             return sample_actions_from_logits(
@@ -289,6 +297,7 @@ def build_policy(config: PolicyConfig):
                 action_head=self.action_head,
                 deterministic=deterministic,
                 threshold=threshold,
+                temperature=temperature,
                 generator=generator,
             )
 
@@ -300,6 +309,7 @@ def build_policy(config: PolicyConfig):
             *,
             deterministic: bool = False,
             threshold: float = 0.5,
+            temperature: float = 1.0,
             generator: Any = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             logits, value, next_hidden = self.act_step(obs_batch, prev_action, hidden)
@@ -307,6 +317,7 @@ def build_policy(config: PolicyConfig):
                 logits,
                 deterministic=deterministic,
                 threshold=threshold,
+                temperature=temperature,
                 generator=generator,
             )
             return act, log_prob, value, next_hidden
@@ -730,6 +741,7 @@ def build_policy(config: PolicyConfig):
             *,
             deterministic: bool = False,
             threshold: float = 0.5,
+            temperature: float = 1.0,
             generator: Any = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             return sample_actions_from_logits(
@@ -737,6 +749,7 @@ def build_policy(config: PolicyConfig):
                 action_head=self.action_head,
                 deterministic=deterministic,
                 threshold=threshold,
+                temperature=temperature,
                 generator=generator,
             )
 
@@ -748,6 +761,7 @@ def build_policy(config: PolicyConfig):
             *,
             deterministic: bool = False,
             threshold: float = 0.5,
+            temperature: float = 1.0,
             generator: Any = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             logits, value, next_hidden = self.act_step(obs_batch, prev_action, hidden)
@@ -755,6 +769,7 @@ def build_policy(config: PolicyConfig):
                 logits,
                 deterministic=deterministic,
                 threshold=threshold,
+                temperature=temperature,
                 generator=generator,
             )
             return act, log_prob, value, next_hidden

@@ -80,6 +80,30 @@ One NVIDIA **RTX 3090 (24 GB)** shared between evaluation workers. Each agent ge
 | [docs/EVALUATION.md](docs/EVALUATION.md) | Map tiers, scoring categories, timeouts, replays |
 | [track_1_strategy_telemetry_world_model.md](track_1_strategy_telemetry_world_model.md) | Our Track 1 strategy & implementation plan |
 
+## Long-horizon training maps
+
+Generate the mixed corpus from the repository root:
+
+```shell
+uv run python -m training.generate_corpus --count 5000 --out training/runs/corpus_5k_progression --workers 12 --engine-spotcheck 30
+```
+
+Use `manifest.jsonl` from that directory for mixed training or `progression.jsonl` to practice the
+three multi-step dependency patterns. Both work with the trainer's `--corpus-manifest` and
+`--corpus-pool-size` options outside the connect stage. The focused maps vary wing assignment,
+distances, bends, spawn heading, and key colours across seeds.
+
+- **Two-key join.** Collect keys from two separate wings in either order. Both are needed to
+  reach the switch that opens the exit wing.
+- **Remote relay.** One wing's switch exposes a key in another. The key opens a third wing
+  containing the switch for the final gate.
+- **Revisit a wing.** Collect the near key, use it to reach a remote switch, then return to
+  the first wing for the newly accessible second key. That key unlocks the final switch.
+
+The generator checks reachability with all objectives present and again with each required key
+or switch individually disabled. Scripted playthroughs test one generated example of each pattern
+in ViZDoom. Corpus difficulty bands use map features; policy success rates require separate evaluation.
+
 ## Navigation stress, OOD & Freedoom evaluation
 
 Run the submission checkpoint on the 14 held-out navigation/combat stress probes, the 8 untouched

@@ -245,9 +245,34 @@ def _point_in_polygon(pt: tuple[float, float], poly: Sequence[tuple[float, float
     return inside
 
 
+def _edges_collinear_overlap(
+    a1: tuple[float, float],
+    a2: tuple[float, float],
+    b1: tuple[float, float],
+    b2: tuple[float, float],
+) -> bool:
+    dx, dy = a2[0] - a1[0], a2[1] - a1[1]
+    alen = float(np.hypot(dx, dy))
+    if alen < 1e-6:
+        return False
+    ux, uy = dx / alen, dy / alen
+    # Perpendicular distance from b1, b2 to infinite line of a
+    d1 = abs((b1[0] - a1[0]) * uy - (b1[1] - a1[1]) * ux)
+    d2 = abs((b2[0] - a1[0]) * uy - (b2[1] - a1[1]) * ux)
+    if d1 > 0.5 or d2 > 0.5:
+        return False
+    tb1 = (b1[0] - a1[0]) * ux + (b1[1] - a1[1]) * uy
+    tb2 = (b2[0] - a1[0]) * ux + (b2[1] - a1[1]) * uy
+    lo = max(0.0, min(tb1, tb2))
+    hi = min(alen, max(tb1, tb2))
+    return (hi - lo) > 1.0
+
+
 def verify_polygon_solvability(
     poly_sectors: Sequence[PolygonSector],
     things: Sequence[ThingSpec],
+    *,
+    check_t_junctions: bool = False,
 ) -> tuple[bool, tuple[str, ...]]:
     """Verify polygonal map adjacency, thing containment, and key-before-lock exit reachability."""
     errors: list[str] = []
@@ -259,7 +284,20 @@ def verify_polygon_solvability(
             pts.reverse()
         for i in range(len(pts)):
             p1, p2 = pts[i], pts[(i + 1) % len(pts)]
+            if p1 == p2:
+                continue
             edge_map.setdefault((min(p1, p2), max(p1, p2)), []).append(sid)
+
+    if check_t_junctions:
+        ext_edges = [(uk[0], uk[1], owners[0]) for uk, owners in edge_map.items() if len(owners) == 1]
+        for idx_i in range(len(ext_edges)):
+            a1, a2, sa = ext_edges[idx_i]
+            for idx_j in range(idx_i + 1, len(ext_edges)):
+                b1, b2, sb = ext_edges[idx_j]
+                if sa != sb and _edges_collinear_overlap(a1, a2, b1, b2):
+                    errors.append(
+                        f"Unstitched T-junction overlap between sector {sa} {a1}->{a2} and sector {sb} {b1}->{b2}"
+                    )
 
     blocking_edge_keys: set[tuple[tuple[float, float], tuple[float, float]]] = set()
     for ps in poly_sectors:

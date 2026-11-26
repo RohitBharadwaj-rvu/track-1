@@ -525,7 +525,15 @@ def _gen_gauntlet_grid(rng: random.Random) -> tuple[str, int, int]:
     return _to_grid_str(buf), rng.choice([0, 90, 180, 270]), 80
 
 
-def _build_angled_door_exit(path: Path, rng: random.Random) -> None:
+def _sample_continuous_angle(rng: random.Random, enabled: bool) -> float:
+    if not enabled:
+        return 0.0
+    # Avoid multiples of 90 deg so continuous rotations produce genuine non-axis walls.
+    base_quad = rng.randrange(4) * 90.0
+    return round(base_quad + rng.uniform(12.0, 78.0), 1)
+
+
+def _build_angled_door_exit(path: Path, rng: random.Random, *, continuous_angle: bool = False) -> None:
     """Manual/remote door + angled passage with optional stairs/nukage to walk-over pad or wall switch."""
     width = rng.choice((96, 112, 128, 160, 192))
     run = rng.randrange(200, 480, 24)
@@ -533,6 +541,7 @@ def _build_angled_door_exit(path: Path, rng: random.Random) -> None:
     switch = rng.random() < 0.45
     rot_k = rng.randrange(4)
     flip_x = bool(rng.randrange(2))
+    angle_deg = _sample_continuous_angle(rng, continuous_angle)
     p_ang = rng.choice((0, 90, 180, 270))
 
     if rng.random() < 0.65:
@@ -604,14 +613,14 @@ def _build_angled_door_exit(path: Path, rng: random.Random) -> None:
             )
         things = [ThingSpec(-160, width // 2, 1, p_ang)]
 
-    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x)
+    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x, angle_deg=angle_deg)
     ok, errors = verify_polygon_solvability(sectors, things)
     if not ok:
         raise ValueError(f"Invalid procedural polygon door_exit map: {errors}")
     build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((0, 60, 100, 150, 200)))
 
 
-def _build_poly_combat(path: Path, rng: random.Random) -> None:
+def _build_poly_combat(path: Path, rng: random.Random, *, continuous_angle: bool = False) -> None:
     """Angled combat arena (including >1024u wide halls), pillars, stairs/grates, nukage, full roster."""
     mode = rng.choice(("stairs", "grate", "wide_arena"))
     switch = rng.random() < 0.40
@@ -620,6 +629,7 @@ def _build_poly_combat(path: Path, rng: random.Random) -> None:
     p_ang = rng.choice((0, 90, 180, 270))
     rot_k = rng.randrange(4)
     flip_x = bool(rng.randrange(2))
+    angle_deg = _sample_continuous_angle(rng, continuous_angle)
     use_nukage = rng.random() < 0.35
 
     if mode == "wide_arena":
@@ -767,14 +777,14 @@ def _build_poly_combat(path: Path, rng: random.Random) -> None:
         for ex, ey in enemy_spots[: rng.randint(3, 4)]:
             things.append(ThingSpec(ex, ey, rng.choice(_COMBAT_MONSTER_IDS), m_ang))
 
-    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x)
+    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x, angle_deg=angle_deg)
     ok, errors = verify_polygon_solvability(sectors, things)
     if not ok:
         raise ValueError(f"Invalid procedural polygon combat map: {errors}")
     build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((0, 100, 150, 200)))
 
 
-def _build_poly_multi_room(path: Path, rng: random.Random) -> None:
+def _build_poly_multi_room(path: Path, rng: random.Random, *, continuous_angle: bool = False) -> None:
     """Octagonal hub with diagonal branches, stairs, low-window lure, optional nukage + switch exit."""
     r_hub = rng.choice((176, 192, 224))
     a_hub = rng.choice((48, 64, 72))
@@ -786,6 +796,7 @@ def _build_poly_multi_room(path: Path, rng: random.Random) -> None:
     use_nukage = rng.random() < 0.45
     rot_k = rng.randrange(4)
     flip_x = bool(rng.randrange(2))
+    angle_deg = _sample_continuous_angle(rng, continuous_angle)
     p_ang = rng.choice((0, 90, 180, 270))
 
     nw_door = _extrude(hub[1], hub[2], -48, 48)
@@ -928,15 +939,21 @@ def _build_poly_multi_room(path: Path, rng: random.Random) -> None:
             ThingSpec(cx_lure, cy_lure, 2024, 0),
         ]
 
-    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x)
+    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x, angle_deg=angle_deg)
     ok, errors = verify_polygon_solvability(sectors, things)
     if not ok:
         raise ValueError(f"Invalid procedural polygon multi_room map: {errors}")
     build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((0, 60, 100, 150, 200)))
 
 
-def _build_poly_key_return(path: Path, rng: random.Random, *, with_combat: bool = False) -> None:
-    """Polygonal key-return: windows/grates, one-way drop-offs, octagonal stairs, D4 transformed."""
+def _build_poly_key_return(
+    path: Path,
+    rng: random.Random,
+    *,
+    with_combat: bool = False,
+    continuous_angle: bool = False,
+) -> None:
+    """Polygonal key-return: windows/grates, one-way drop-offs, octagonal stairs, D4 + angle transformed."""
     door_kind, card_id, skull_id = rng.choice(_KEY_SPECS)
     key_id = skull_id if rng.choice((True, False)) else card_id
     switch = rng.random() < 0.30
@@ -944,6 +961,7 @@ def _build_poly_key_return(path: Path, rng: random.Random, *, with_combat: bool 
     m_ang = rng.randrange(0, 360, 45)
     rot_k = rng.randrange(4)
     flip_x = bool(rng.randrange(2))
+    angle_deg = _sample_continuous_angle(rng, continuous_angle)
 
     mode = rng.choice(("window", "grate", "dropoff_cliff", "octagonal_stairs"))
     if mode in ("window", "grate"):
@@ -1018,7 +1036,7 @@ def _build_poly_key_return(path: Path, rng: random.Random, *, with_combat: bool 
             _rect("step3_top", w_court + 128, 0, w_court + 128 + w_top, 64, height_floor=48, height_ceiling=192, wall_texture="BRICK1"),
             PolygonSector(
                 "high_rampart",
-                ((w_court, 64), (w_court, h_c), (w_court + 128 + w_top, h_c), (w_court + 128 + w_top, 64), (w_court + 128, 64)),
+                ((w_court, 64), (w_court, h_c), (w_court + 128 + w_top, h_c), (w_court + 128 + w_top, 64), (w_court + 128, 64), (w_court + 64, 64)),
                 height_floor=48,
                 height_ceiling=192,
                 wall_texture="BRICK1",
@@ -1097,14 +1115,14 @@ def _build_poly_key_return(path: Path, rng: random.Random, *, with_combat: bool 
             ThingSpec(cx_t + 32, cy_t - 32, rng.choice((3004, 3001, 65)), m_ang),
         ]
 
-    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x)
-    ok, errors = verify_polygon_solvability(sectors, things)
+    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x, angle_deg=angle_deg)
+    ok, errors = verify_polygon_solvability(sectors, things, check_t_junctions=True)
     if not ok:
         raise ValueError(f"Invalid procedural polygon key_return map ({mode}): {errors}")
     build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((0, 100, 150, 200)))
 
 
-def _build_poly_gauntlet(path: Path, rng: random.Random) -> None:
+def _build_poly_gauntlet(path: Path, rng: random.Random, *, continuous_angle: bool = False) -> None:
     """Two-lock or three-lock octagonal citadel with stairs, optional nukage, and 7-10 heavy foes."""
     keys = list(_KEY_SPECS)
     rng.shuffle(keys)
@@ -1120,6 +1138,7 @@ def _build_poly_gauntlet(path: Path, rng: random.Random) -> None:
     p_ang = rng.choice((0, 90, 180, 270))
     rot_k = rng.randrange(4)
     flip_x = bool(rng.randrange(2))
+    angle_deg = _sample_continuous_angle(rng, continuous_angle)
 
     r_hub = float(rng.choice((224, 240, 256)))
     a_hub = float(rng.choice((64, 72)))
@@ -1201,15 +1220,15 @@ def _build_poly_gauntlet(path: Path, rng: random.Random) -> None:
     for ex, ey in enemy_spots[: rng.randint(7, 9)]:
         things.append(ThingSpec(ex, ey, rng.choice(_COMBAT_MONSTER_IDS), m_ang))
 
-    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x)
+    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x, angle_deg=angle_deg)
     ok, errors = verify_polygon_solvability(sectors, things)
     if not ok:
         raise ValueError(f"Invalid procedural polygon gauntlet map: {errors}")
     build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((0, 100, 150, 200)))
 
 
-def _build_key_window_detour(path: Path, rng: random.Random) -> None:
-    """Asymmetric key-window detour (D4 transformed, never matching static stress templates)."""
+def _build_key_window_detour(path: Path, rng: random.Random, *, continuous_angle: bool = False) -> None:
+    """Asymmetric key-window detour (D4 + angle transformed, never matching static stress templates)."""
     door_kind, key_card, key_skull = rng.choice(_KEY_SPECS)
     key_num = key_skull if rng.random() < 0.5 else key_card
     bypass_north = rng.choice((True, False))
@@ -1222,6 +1241,7 @@ def _build_key_window_detour(path: Path, rng: random.Random) -> None:
     gap_w = float(rng.choice((48, 64, 80)))
     rot_k = rng.randrange(4)
     flip_x = bool(rng.randrange(2))
+    angle_deg = _sample_continuous_angle(rng, continuous_angle)
     p_ang = rng.choice((0, 90, 180, 270))
 
     by0, by1 = (room_h, room_h + bypass_h) if bypass_north else (-bypass_h, 0.0)
@@ -1248,7 +1268,7 @@ def _build_key_window_detour(path: Path, rng: random.Random) -> None:
     ]
     if rng.random() < 0.6:
         things.append(ThingSpec(x2 + span_e * 0.5, (by0 + by1) * 0.5, rng.choice(_COMBAT_MONSTER_IDS), 180))
-    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x)
+    sectors, things = transform_polygon_map(sectors, things, rot_k=rot_k, flip_x=flip_x, angle_deg=angle_deg)
     ok, errors = verify_polygon_solvability(sectors, things)
     if not ok:
         raise ValueError(f"Invalid procedural key-window map: {errors}")
@@ -1263,6 +1283,9 @@ def generate_procedural_wad(
     split: str = "train",
     return_distance: int | None = None,
     with_combat: bool = False,
+    out_path: str | Path | None = None,
+    continuous_angle: bool = False,
+    poly_only: bool = False,
 ) -> MapSpec:
     """Synthesize, statically verify, and write one procedural WAD for training variation.
 
@@ -1271,10 +1294,10 @@ def generate_procedural_wad(
     """
     rng = random.Random(int(seed))
     theme = rng.choice(THEME_NAMES)
-    out_path = Path(out_dir) / f"proc_{family}_s{seed}.wad"
+    out_path = Path(out_path) if out_path is not None else (Path(out_dir) / f"proc_{family}_s{seed}.wad")
 
     if return_distance is None:
-        roll_mode = rng.random()
+        roll_mode = 0.65 if poly_only else rng.random()
         if roll_mode < 0.48:
             return generate_dungeon_wad(
                 family,
@@ -1286,22 +1309,22 @@ def generate_procedural_wad(
             )
         if roll_mode < 0.88:
             if family == "door_exit":
-                _build_angled_door_exit(out_path, rng)
+                _build_angled_door_exit(out_path, rng, continuous_angle=continuous_angle)
                 return MapSpec(str(out_path), family=family, tier=2, split=split, episode_ticks=2100)
             if family == "combat":
-                _build_poly_combat(out_path, rng)
+                _build_poly_combat(out_path, rng, continuous_angle=continuous_angle)
                 return MapSpec(str(out_path), family=family, tier=1, split=split, episode_ticks=2100)
             if family == "multi_room":
-                _build_poly_multi_room(out_path, rng)
+                _build_poly_multi_room(out_path, rng, continuous_angle=continuous_angle)
                 return MapSpec(str(out_path), family=family, tier=2, split=split, episode_ticks=2400)
             if family == "key_return":
                 if rng.random() < 0.35:
-                    _build_key_window_detour(out_path, rng)
+                    _build_key_window_detour(out_path, rng, continuous_angle=continuous_angle)
                 else:
-                    _build_poly_key_return(out_path, rng, with_combat=with_combat)
+                    _build_poly_key_return(out_path, rng, with_combat=with_combat, continuous_angle=continuous_angle)
                 return MapSpec(str(out_path), family=family, tier=3, split=split, episode_ticks=3150)
             if family == "gauntlet":
-                _build_poly_gauntlet(out_path, rng)
+                _build_poly_gauntlet(out_path, rng, continuous_angle=continuous_angle)
                 return MapSpec(str(out_path), family=family, tier=4, split=split, episode_ticks=4200)
 
     if family == "door_exit":

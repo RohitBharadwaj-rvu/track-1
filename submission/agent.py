@@ -74,6 +74,7 @@ class DoomAgent:
         self.policy, self.config, self.checkpoint_meta = load_checkpoint(weights_path, device=self.device)
         self.policy.eval()
         self.deterministic = bool(self.config.eval_deterministic)
+        self.temperature = float(getattr(self.config, "eval_temperature", 1.0))
         self.action_threshold = float(self.config.action_threshold)
         self._ego_map = EgocentricSpatialMap() if bool(getattr(self.config, "use_ego_map", False)) else None
         self._hidden = self.policy.init_hidden(1, self.device)
@@ -116,6 +117,7 @@ class DoomAgent:
                 self._hidden,
                 deterministic=self.deterministic,
                 threshold=self.action_threshold,
+                temperature=self.temperature,
             )
             self._hidden = next_hidden
             self._prev_action = action_t

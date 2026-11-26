@@ -128,6 +128,10 @@ def resolve_train_maps(
 
 
 def _resolve_wad_path(wad: str) -> str:
+    if wad == "vizdoom/freedoom2.wad":
+        from doom_env.wrapper import IWAD
+
+        return IWAD
     p = Path(wad)
     if p.is_absolute() or p.exists():
         return str(p)
@@ -164,6 +168,7 @@ class _DoomWorkerSlot:
         map_weights: Sequence[float] | None = None,
         use_ego_map: bool = False,
         mirror_prob: float = 0.0,
+        champion_baselines: dict[str, dict[str, float]] | None = None,
     ):
         if not map_specs:
             raise ValueError("map_specs must not be empty")
@@ -175,6 +180,7 @@ class _DoomWorkerSlot:
         self.max_cached_envs = max(1, max_cached_envs)
         self.use_ego_map = bool(use_ego_map)
         self.mirror_prob = float(np.clip(mirror_prob, 0.0, 1.0))
+        self.champion_baselines = champion_baselines
         self._ego_map = EgocentricSpatialMap() if self.use_ego_map else None
         self._pbrs_cache: dict[tuple[str, str], GeodesicPBRS | None] = {}
         self._rng = np.random.default_rng(base_seed + slot_id * 10007)
@@ -192,10 +198,14 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked = 0
         self._kills = 0
         self._damage_taken = 0.0
+        self._use_waste_steps = 0
         self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
         self._locked_doors_xy: list[tuple[float, float]] = []
         self._last_priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
         self._last_aux_targets = np.zeros(AUX_TARGET_DIM, dtype=np.float32)
+
+    def set_reward_config(self, reward_config: RewardConfig) -> None:
+        self.shaper.set_config(reward_config)
 
     def _get_pbrs(self, spec: MapSpec) -> GeodesicPBRS | None:
         cfg = self.shaper.config
@@ -344,7 +354,17 @@ class _DoomWorkerSlot:
 
         raw_obs, _ = env.reset(seed=self._current_seed)
         priv = env.privileged_state()
-        self.shaper.reset(priv, obs=raw_obs, pbrs=self._get_pbrs(spec))
+        baseline = None
+        if self.champion_baselines is not None:
+            map_key = f"{Path(spec.wad).name}:{spec.map_name.upper()}"
+            baseline = self.champion_baselines.get(map_key) or self.champion_baselines.get(Path(spec.wad).name)
+        self.shaper.reset(
+            priv,
+            obs=raw_obs,
+            pbrs=self._get_pbrs(spec),
+            champion_baseline=baseline,
+            tier=spec.tier,
+        )
         self._steps = 0
         self._total_reward = 0.0
         self._keys_picked_up = 0
@@ -352,6 +372,7 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked = 0
         self._kills = 0
         self._damage_taken = 0.0
+        self._use_waste_steps = 0
         self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
         if self._ego_map is not None:
             self._ego_map.reset()
@@ -374,7 +395,7 @@ class _DoomWorkerSlot:
 
         raw_obs, _, terminated, truncated, _ = self._active_env.step(act_env)
         priv = self._active_env.privileged_state()
-        reward, events, _ = self.shaper.step(
+        reward, events, comp = self.shaper.step(
             priv, action=act_env, prev_action=self._prev_action, obs=raw_obs
         )
         self._prev_action = act_env.copy()
@@ -386,6 +407,8 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked += events.locked_doors_unlocked
         self._kills += events.kills
         self._damage_taken += events.damage_taken
+        if comp.get("use_penalty", 0.0) < 0.0:
+            self._use_waste_steps += 1
 
         priv_f, aux_t = self._update_door_sighting_and_features(
             raw_obs, priv, unlocked_this_step=events.locked_doors_unlocked
@@ -396,7 +419,7 @@ class _DoomWorkerSlot:
             aux_t = mirror_aux_targets(aux_t)
         obs_proc = self._preprocess_with_ego(obs_for_policy, act_policy)
 
-        info: dict[str, Any] = {"mirrored": was_mirrored}
+        info: dict[str, Any] = {"mirrored": was_mirrored, "wad": self._active_spec.wad}
         if terminated or truncated:
             if priv.get("exit_reached"):
                 outcome = "exit"
@@ -404,6 +427,15 @@ class _DoomWorkerSlot:
                 outcome = "death"
             else:
                 outcome = "timeout"
+            tics = int(priv.get("tic", 0))
+            ep_extra = {
+                "rubric_score": round(float(self.shaper.last_rubric_score), 4),
+                "regressed_vs_champion": bool(self.shaper.last_regressed_vs_champion),
+                "early_death": bool(outcome == "death" and tics <= 700),
+                "died_after_pickup": bool(outcome == "death" and self._keys_picked_up > 0),
+                "use_waste_rate": round(float(self._use_waste_steps) / float(max(1, self._steps)), 4),
+                "episode_ticks": int(self._active_spec.episode_ticks),
+            }
             info["final_obs"] = obs_proc
             info["final_priv_features"] = priv_f
             info["final_aux_targets"] = aux_t
@@ -414,7 +446,7 @@ class _DoomWorkerSlot:
                 tier=self._active_spec.tier,
                 seed=self._current_seed,
                 steps=self._steps,
-                ticks=int(priv.get("tic", 0)),
+                ticks=tics,
                 outcome=outcome,
                 keys_picked_up=self._keys_picked_up,
                 doors_opened=self._doors_opened,
@@ -424,6 +456,7 @@ class _DoomWorkerSlot:
                 final_health=float(priv.get("health", 0.0)),
                 unique_cells_visited=self.shaper.unique_cells_visited,
                 total_reward=float(self._total_reward),
+                extra=ep_extra,
             )
             next_obs = self.reset()
             info["priv_features"] = self._last_priv_features
@@ -460,6 +493,7 @@ class SyncVecDoomEnv:
         map_weights: Sequence[float] | None = None,
         use_ego_map: bool = False,
         mirror_prob: float = 0.0,
+        champion_baselines: dict[str, dict[str, float]] | None = None,
     ):
         self.num_envs = num_envs if num_envs is not None else max(1, len(map_specs))
         self.slots = [
@@ -473,11 +507,16 @@ class SyncVecDoomEnv:
                 map_weights=map_weights,
                 use_ego_map=use_ego_map,
                 mirror_prob=mirror_prob,
+                champion_baselines=champion_baselines,
             )
             for i in range(self.num_envs)
         ]
         self._last_priv_batch = np.zeros((self.num_envs, PRIV_FEATURE_DIM), dtype=np.float32)
         self._last_aux_batch = np.zeros((self.num_envs, AUX_TARGET_DIM), dtype=np.float32)
+
+    def set_reward_config(self, reward_config: RewardConfig) -> None:
+        for slot in self.slots:
+            slot.set_reward_config(reward_config)
 
     def set_map_weights(self, weights: Sequence[float]) -> None:
         for slot in self.slots:
@@ -544,6 +583,7 @@ def _worker_loop(
     map_weights: Sequence[float] | None,
     use_ego_map: bool = False,
     mirror_prob: float = 0.0,
+    champion_baselines: dict[str, dict[str, float]] | None = None,
 ) -> None:
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(var, "1")
@@ -557,6 +597,7 @@ def _worker_loop(
         map_weights=map_weights,
         use_ego_map=use_ego_map,
         mirror_prob=mirror_prob,
+        champion_baselines=champion_baselines,
     )
     try:
         while True:
@@ -568,6 +609,8 @@ def _worker_loop(
                 conn.send(slot.step(data))
             elif cmd == "set_weights":
                 slot.set_map_weights(data)
+            elif cmd == "set_reward_config":
+                slot.set_reward_config(data)
             elif cmd == "set_map_specs":
                 new_specs, new_weights = data
                 slot.set_map_specs(new_specs, new_weights)
@@ -598,6 +641,7 @@ class SubprocVecDoomEnv:
         map_weights: Sequence[float] | None = None,
         use_ego_map: bool = False,
         mirror_prob: float = 0.0,
+        champion_baselines: dict[str, dict[str, float]] | None = None,
     ):
         self.num_envs = int(num_envs)
         ctx = mp.get_context("spawn")
@@ -621,6 +665,7 @@ class SubprocVecDoomEnv:
                     map_weights,
                     use_ego_map,
                     mirror_prob,
+                    champion_baselines,
                 ),
                 daemon=True,
             )
@@ -628,6 +673,10 @@ class SubprocVecDoomEnv:
             child_conn.close()
             self._parent_conns.append(parent_conn)
             self._procs.append(proc)
+
+    def set_reward_config(self, reward_config: RewardConfig) -> None:
+        for conn in self._parent_conns:
+            conn.send(("set_reward_config", reward_config))
 
     def set_map_weights(self, weights: Sequence[float]) -> None:
         w = list(weights)
@@ -781,6 +830,22 @@ class RolloutBuffer:
 
         self.advantages = np.zeros((T, N), dtype=np.float32)
         self.returns = np.zeros((T, N), dtype=np.float32)
+        self.step_wads: list[list[str]] = [[""] * N for _ in range(T)]
+
+    def compute_per_wad_pvl(self) -> dict[str, float]:
+        """Compute mean positive GAE magnitude grouped by WAD for UED regret prioritization."""
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        pos_adv = np.maximum(self.advantages, 0.0)
+        for t in range(self.num_steps):
+            wads_t = self.step_wads[t]
+            for e in range(self.num_envs):
+                wad = wads_t[e]
+                if not wad:
+                    continue
+                sums[wad] = sums.get(wad, 0.0) + float(pos_adv[t, e])
+                counts[wad] = counts.get(wad, 0) + 1
+        return {wad: sums[wad] / float(counts[wad]) for wad in sums if counts[wad] > 0}
 
     def add(
         self,
@@ -1004,6 +1069,7 @@ def collect_rollout(
             for info in infos:
                 if "episode" in info:
                     completed_episodes.append(info["episode"])
+            buffer.step_wads[step] = [str(info.get("wad", "")) for info in infos]
 
             buffer.add(
                 step=step,

@@ -27,6 +27,12 @@ import numpy as np
 from doom_env import make_env
 from doom_env.limits import agent_budget_s
 from doom_env.spaces import BUTTONS, FRAME_SKIP
+from training.game_theory import (
+    compare_reports_nash,
+    compute_cvar,
+    compute_episode_rubric_score,
+    compute_polytope_scores,
+)
 from training.interfaces import EpisodeMetrics, MapSpec, PrivilegedEventTracker
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -330,6 +336,7 @@ def evaluate_episode(
         "wasted_attack_steps": wasted_attack_steps,
         "had_key_pickup": had_key_pickup,
         "died_after_pickup": died_after_pickup,
+        "episode_ticks": int(spec.episode_ticks),
     }
     if replay_path is not None:
         extra["replay_path"] = str(replay_path)
@@ -459,6 +466,20 @@ def summarize_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
     else:
         proxy = float(overall["exit_rate"])
     overall["proxy_leaderboard_score"] = round(proxy, 4)
+
+    polytope = compute_polytope_scores(episodes)
+    per_map_rubric: dict[str, list[float]] = {}
+    per_map_exit: dict[str, list[float]] = {}
+    for e in episodes:
+        mk = f"{Path(e.wad).name}:{e.map_name}"
+        per_map_rubric.setdefault(mk, []).append(compute_episode_rubric_score(e))
+        per_map_exit.setdefault(mk, []).append(1.0 if e.outcome == "exit" else 0.0)
+    mean_map_rubric = {k: sum(v) / float(len(v)) for k, v in per_map_rubric.items() if v}
+    mean_map_exit = {k: sum(v) / float(len(v)) for k, v in per_map_exit.items() if v}
+    overall["verifiable_rubric_score"] = polytope["nominal"]
+    overall["rubric_polytope"] = polytope
+    overall["cvar_25_rubric"] = compute_cvar(mean_map_rubric, 0.25)
+    overall["cvar_25_exit"] = compute_cvar(mean_map_exit, 0.25)
     return {"overall": overall, "by_tier": by_tier, "by_family": by_family}
 
 
@@ -587,16 +608,20 @@ def _select_and_prune_replays(
     return {"best_success": best_path, "representative_failure": fail_path}
 
 
-def _apply_eval_mode(agent: Any, eval_mode: str) -> bool:
-    """Apply `'deterministic'` or `'stochastic'` eval mode to an agent if it exposes a flag."""
-    if eval_mode == "default":
-        return False
-    det_flag = eval_mode == "deterministic"
-    for attr in ("deterministic", "eval_deterministic", "_deterministic"):
-        if hasattr(agent, attr):
-            setattr(agent, attr, det_flag)
-            return True
-    return False
+def _apply_eval_mode(agent: Any, eval_mode: str, eval_temperature: float | None = None) -> bool:
+    """Apply `'deterministic'` / `'stochastic'` eval mode and optional temperature to an agent."""
+    applied = False
+    if eval_mode != "default":
+        det_flag = eval_mode == "deterministic"
+        for attr in ("deterministic", "eval_deterministic", "_deterministic"):
+            if hasattr(agent, attr):
+                setattr(agent, attr, det_flag)
+                applied = True
+                break
+    if eval_temperature is not None and hasattr(agent, "temperature"):
+        setattr(agent, "temperature", float(eval_temperature))
+        applied = True
+    return applied
 
 
 def evaluate_suite(
@@ -610,6 +635,7 @@ def evaluate_suite(
     record_dir: Path | None = None,
     keep_key_replays: bool = False,
     eval_mode: str = "default",
+    eval_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Instantiate an agent once and evaluate all `(spec, seed)` episodes."""
     if not specs:
@@ -633,7 +659,7 @@ def evaluate_suite(
     wall_start = time.perf_counter()
     init_start = time.perf_counter()
     agent = factory(obs_space, act_space, device)
-    eval_mode_applied = _apply_eval_mode(agent, eval_mode)
+    eval_mode_applied = _apply_eval_mode(agent, eval_mode, eval_temperature=eval_temperature)
     init_time_s = round(time.perf_counter() - init_start, 4)
 
     episodes: list[EpisodeMetrics] = []
@@ -665,6 +691,7 @@ def evaluate_suite(
             "agent_spec": agent_spec,
             "device": device,
             "eval_mode": eval_mode,
+            "eval_temperature": float(eval_temperature) if eval_temperature is not None else getattr(agent, "temperature", 1.0),
             "eval_mode_applied": eval_mode_applied,
             "render_buffers": render_buffers,
             "init_time_s": init_time_s,
@@ -756,6 +783,32 @@ def compare_reports(baseline: dict[str, Any], challenger: dict[str, Any]) -> dic
                 reason = f"Challenger regressed {key} ({diff})."
                 break
 
+    b_poly = b.get("rubric_polytope") or compute_polytope_scores(baseline.get("episodes", []))
+    c_poly = c.get("rubric_polytope") or compute_polytope_scores(challenger.get("episodes", []))
+    b_corners = b_poly.get("corners", {})
+    c_corners = c_poly.get("corners", {})
+    common_corners = set(b_corners) & set(c_corners)
+    poly_dom = bool(common_corners) and all(c_corners[k] >= b_corners[k] for k in common_corners) and any(
+        c_corners[k] > b_corners[k] for k in common_corners
+    )
+
+    def _cvar_from(rep: dict[str, Any], ov: dict[str, Any]) -> float:
+        if "cvar_25_rubric" in ov:
+            return float(ov["cvar_25_rubric"])
+        per_m: dict[str, list[float]] = {}
+        for ep in rep.get("episodes", []):
+            mk = f"{Path(str(ep.get('wad', ''))).name}:{ep.get('map_name', 'MAP01')}"
+            per_m.setdefault(mk, []).append(compute_episode_rubric_score(ep))
+        return compute_cvar({k: sum(v) / float(len(v)) for k, v in per_m.items() if v}, 0.25)
+
+    cvar_delta = round(_cvar_from(challenger, c) - _cvar_from(baseline, b), 4)
+    game_theory = {
+        "nominal_rubric_delta": round(float(c_poly.get("nominal", 0.0)) - float(b_poly.get("nominal", 0.0)), 4),
+        "min_corner_delta": round(float(c_poly.get("min_corner", 0.0)) - float(b_poly.get("min_corner", 0.0)), 4),
+        "polytope_dominates": poly_dom,
+        "cvar_25_rubric_delta": cvar_delta,
+    }
+
     return {
         "verdict": verdict,
         "reason": reason,
@@ -763,6 +816,7 @@ def compare_reports(baseline: dict[str, Any], challenger: dict[str, Any]) -> dic
         "per_map_deltas": per_map_deltas,
         "regressed_maps": regressed_maps,
         "single_map_gain_warning": single_map_gain_warning,
+        "game_theory": game_theory,
     }
 
 
@@ -872,8 +926,8 @@ def format_report_markdown(report: dict[str, Any]) -> str:
 
     lines = [
         f"## Evaluation Summary ({meta.get('git_commit') or 'uncommitted'})",
-        f"- Agent: `{meta['agent_spec']}` | Device: `{meta['device']}` | Eval mode: `{meta.get('eval_mode', 'default')}` | Init: `{meta['init_time_s']}s` | Wall: `{meta['wall_time_s']}s`",
-        f"- Episodes: `{overall['episodes']}` | Exits: `{overall['exits']}` (`{overall['exit_rate']:.1%}` +- `{overall.get('exit_rate_se', 0.0):.1%}`) | Proxy score: `{overall.get('proxy_leaderboard_score', overall['exit_rate']):.4f}` | Deaths: `{overall['deaths']}` | Timeouts: `{overall['timeouts']}` | Errors: `{overall['errors']}`",
+        f"- Agent: `{meta['agent_spec']}` | Device: `{meta['device']}` | Eval mode: `{meta.get('eval_mode', 'default')}` (T={meta.get('eval_temperature', 1.0)}) | Init: `{meta['init_time_s']}s` | Wall: `{meta['wall_time_s']}s`",
+        f"- Episodes: `{overall['episodes']}` | Exits: `{overall['exits']}` (`{overall['exit_rate']:.1%}` +- `{overall.get('exit_rate_se', 0.0):.1%}`) | Proxy score: `{overall.get('proxy_leaderboard_score', overall['exit_rate']):.4f}` | Rubric: `{overall.get('verifiable_rubric_score', 0.0):.4f}` (min `{overall.get('rubric_polytope', {}).get('min_corner', 0.0):.4f}`, CVaR25 `{overall.get('cvar_25_rubric', 0.0):.4f}`) | Deaths: `{overall['deaths']}` | Timeouts: `{overall['timeouts']}` | Errors: `{overall['errors']}`",
         f"- Progression: Keys `{overall['keys_picked_up']}` | Doors `{overall['doors_opened']}` | Unlocks `{overall['locked_doors_unlocked']}` | Kills `{overall['kills']}` | Mean cells `{overall['mean_unique_cells']}`",
         f"- Funnel & Actions: `unlock|pickup={unlock_str}` | `exit|unlock={exit_u_str}` | Deaths after pickup `{overall.get('deaths_after_pickup', 0)}` | Opposing steps `{overall.get('opposing_button_steps', 0)}/{overall.get('total_steps', 0)}` | Consecutive USE `{overall.get('consecutive_use_presses', 0)}` | Wasted attacks `{overall.get('wasted_attack_steps', 0)}/{overall.get('attack_steps', 0)}`",
         f"- Compute: Total agent `{overall['total_agent_time_s']}s` | Max step `{overall['max_step_ms']} ms` | Within budget: `{overall['all_within_budget']}`",
@@ -942,6 +996,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Override agent determinism flag during evaluation",
     )
     parser.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=None,
+        help="Override agent stochastic action sampling temperature during evaluation",
+    )
+    parser.add_argument(
         "--compare-determinism",
         action="store_true",
         help="Benchmark stochastic vs deterministic eval modes on the selected specs",
@@ -964,7 +1024,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, default=None, help="Write JSON report to this path")
     parser.add_argument("--compare", nargs=2, metavar=("BASELINE_JSON", "CHALLENGER_JSON"), default=None)
+    parser.add_argument(
+        "--compare-nash",
+        nargs="+",
+        metavar="REPORT_JSON",
+        default=None,
+        help="Game-theoretic Nash averaging & minimax-regret comparison across 2+ JSON reports",
+    )
     args = parser.parse_args(argv)
+
+    if args.compare_nash:
+        if len(args.compare_nash) < 2:
+            parser.error("--compare-nash requires at least 2 report JSON files")
+        named = [
+            (Path(p).stem, json.loads(Path(p).read_text(encoding="utf-8")))
+            for p in args.compare_nash
+        ]
+        nash_res = compare_reports_nash(named)
+        print("## Nash Averaging Comparison")
+        print("| Candidate | Nash Value | Minimax Regret | Mean Rubric | CVaR-25 | Polytope Min | Nash Weight |")
+        print("|---|---|---|---|---|---|---|")
+        for row in nash_res["agents"]:
+            print(
+                f"| {row['name']} | {row['nash_value']:.4f} | {row['minimax_regret']:.4f} "
+                f"| {row['mean_rubric']:.4f} | {row['cvar_25']:.4f} | {row['polytope_min']:.4f} | {row['nash_weight']:.3f} |"
+            )
+        print("\nTop Frontier Maps:")
+        for fm in nash_res["frontier_maps"][:5]:
+            print(f"- `{fm['map']}` (q*={fm['nash_weight']:.3f}): {fm['scores']}")
+        print("\n" + json.dumps(nash_res, indent=2))
+        return 0
 
     if args.compare:
         baseline = json.loads(Path(args.compare[0]).read_text(encoding="utf-8"))
@@ -983,6 +1072,7 @@ def main(argv: list[str] | None = None) -> int:
             seeds_override=seeds_override,
             render_buffers=args.render_buffers,
             eval_mode="stochastic",
+            eval_temperature=args.eval_temperature,
         )
         det = evaluate_suite(
             specs,
@@ -1009,6 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
         record_dir=args.record_dir,
         keep_key_replays=args.keep_key_replays,
         eval_mode=args.eval_mode,
+        eval_temperature=args.eval_temperature,
     )
     if args.check_mvp_gate is not None:
         base_rep = (

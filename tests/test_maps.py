@@ -185,7 +185,7 @@ def test_registry_splits_and_zero_overlap():
     assert split_hashes["dev"].isdisjoint(split_hashes["final"])
 
     stress_hashes = {get_definition(s.wad).blueprint_hash() for s in get_maps("stress")}
-    assert len(stress_hashes) == len(get_maps("stress")) == 14
+    assert len(stress_hashes) == len(get_maps("stress")) == 20
     assert all(stress_hashes.isdisjoint(group) for group in split_hashes.values())
 
     ood_hashes = {get_definition(s.wad).blueprint_hash() for s in FINAL_OOD_MAPS}
@@ -573,3 +573,46 @@ def test_final_ood_suite_engine_verified():
     for spec in FINAL_OOD_MAPS:
         res = verify_wad_in_engine(ROOT / spec.wad, map_name=spec.map_name, episode_ticks=spec.episode_ticks, step_count=2)
         assert res.ok, f"OOD map {spec.wad} failed engine check: {res.errors}"
+
+@pytest.mark.parametrize(("archetype", "route"), [
+    ("two_key_join", ("key_b", "key_a", "switch_1", "exit")),
+    ("remote_key_relay", ("switch_1", "key_a", "switch_2", "exit")),
+    ("revisit_wing", ("key_a", "switch_1", "key_b", "switch_2", "exit")),
+])
+def test_progression_wings_complete_in_engine(tmp_path, archetype, route):
+    import random
+    from training.wad_gen.progression import build_progression
+    from training.wad_gen.udmf import build_polygon_wad
+
+    sectors, things, delay = build_progression(archetype, random.Random(2026), 2026)
+    wad = build_polygon_wad(tmp_path / "route.wad", sectors, things, door_close_delay=delay)
+    env = make_env(str(wad), "MAP01", episode_ticks=4200, render_buffers=False)
+    try:
+        env.reset(seed=0)
+        tracker = PrivilegedEventTracker()
+        tracker.reset(env.privileged_state())
+        for goal in route:
+            target = next(s for s in sectors if s.name.rsplit("_", 1)[0] == goal)
+            arm = target.name.split("_")[-1]
+            path = []
+            for s in sectors[1:]:
+                if s.name.startswith(f"approach_{arm}_") or (
+                    not s.name.startswith("approach_") and s.name.endswith(f"_{arm}")
+                ):
+                    path.append(np.mean(s.vertices, axis=0))
+                if s == target:
+                    break
+            for pos in path:
+                _walk_toward(env, tracker, *pos)
+            if goal == "exit":
+                break
+            if target.door_switch:
+                wall = np.mean(target.door_switch[:2], axis=0)
+                _walk_toward(env, tracker, *wall)
+                env.step(NOOP)
+                env.step(USE)
+            for pos in [*reversed(path[:-1]), (0, 0)]:
+                _walk_toward(env, tracker, *pos)
+        assert env.privileged_state()["exit_reached"]
+    finally:
+        env.close()

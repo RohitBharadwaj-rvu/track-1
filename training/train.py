@@ -15,6 +15,8 @@ import numpy as np
 from submission.obs import NUM_ACTIONS
 from submission.policy import PolicyConfig, build_policy, save_checkpoint
 from training.curriculum import CurriculumConfig, CurriculumScheduler
+from training.game_theory import AccelLevelArchive, PrimalDualController, load_champion_baselines
+from training.generate_corpus import CorpusPoolSampler
 from training.interfaces import EpisodeMetrics, MapSpec
 from training.ppo import PPOConfig, RecurrentPPOTrainer, load_training_state, save_training_state
 from training.rewards import RewardConfig, RewardShaper
@@ -25,6 +27,13 @@ from training.rollout import (
     collect_rollout,
     resolve_train_maps,
 )
+from training.wad_gen.dungeon import (
+    DungeonGenome,
+    generate_dungeon_from_genome,
+    mutate_dungeon_genome,
+)
+from training.wad_gen.extreme import EXTREME_ARCHETYPES, generate_extreme_wad
+from training.wad_gen.procedural import generate_procedural_wad
 
 
 @dataclass
@@ -47,6 +56,14 @@ class TrainConfig:
     tier_weights: dict[int, float] | None = None
     auto_curriculum: bool = True
     adaptive_weights: bool = True
+    adaptive_mode: str = "sfl_pvl"
+    use_accel: bool = True
+    use_primal_dual: bool = True
+    champion_report: str | None = None
+    corpus_manifest: str | None = None
+    corpus_pool_size: int = 60
+    corpus_high_diff_frac: float = 0.45
+    corpus_include_freedoom: bool = True
     tier12_promote_threshold: float = 0.65
     tier3_promote_threshold: float = 0.50
     min_promote_episodes: int = 32
@@ -122,6 +139,7 @@ def _make_vec_env(
     max_cached_envs: int = 32,
     use_ego_map: bool = False,
     mirror_prob: float = 0.0,
+    champion_baselines: dict[str, dict[str, float]] | None = None,
 ):
     cache_size = max(1, min(int(max_cached_envs), len(map_specs)))
     if vec_mode == "sync":
@@ -135,6 +153,7 @@ def _make_vec_env(
             map_weights=map_weights,
             use_ego_map=use_ego_map,
             mirror_prob=mirror_prob,
+            champion_baselines=champion_baselines,
         )
     if vec_mode == "subproc":
         return SubprocVecDoomEnv(
@@ -147,6 +166,7 @@ def _make_vec_env(
             map_weights=map_weights,
             use_ego_map=use_ego_map,
             mirror_prob=mirror_prob,
+            champion_baselines=champion_baselines,
         )
     raise ValueError(f"Unsupported vec_mode: {vec_mode!r}")
 
@@ -162,10 +182,12 @@ def _summarize_episodes(episodes: list[EpisodeMetrics]) -> dict[str, float]:
             "unlock_rate": 0.0,
             "key_rate": 0.0,
             "mean_reward": 0.0,
+            "mean_rubric_score": 0.0,
             "mean_cells": 0.0,
             "mean_kills": 0.0,
         }
     n = float(len(episodes))
+    rubric_vals = [float((e.extra or {}).get("rubric_score", 0.0)) for e in episodes]
     return {
         "episodes": n,
         "exit_rate": sum(e.outcome == "exit" for e in episodes) / n,
@@ -175,9 +197,73 @@ def _summarize_episodes(episodes: list[EpisodeMetrics]) -> dict[str, float]:
         "unlock_rate": sum(e.locked_doors_unlocked > 0 for e in episodes) / n,
         "key_rate": sum(e.keys_picked_up > 0 for e in episodes) / n,
         "mean_reward": float(np.mean([e.total_reward for e in episodes])),
+        "mean_rubric_score": float(np.mean(rubric_vals)),
         "mean_cells": float(np.mean([e.unique_cells_visited for e in episodes])),
         "mean_kills": float(np.mean([e.kills for e in episodes])),
     }
+
+
+def _generate_hybrid_poly_pool(
+    count_per_family: int,
+    families: tuple[str, ...],
+    proc_dir: Path,
+    base_seed: int,
+) -> list[MapSpec]:
+    specs: list[MapSpec] = []
+    if count_per_family <= 0:
+        return specs
+    seed = int(base_seed)
+    for fam in families:
+        for _ in range(int(count_per_family)):
+            seed += 1
+            if fam == "gauntlet":
+                arch = EXTREME_ARCHETYPES[seed % len(EXTREME_ARCHETYPES)]
+                out_wad = proc_dir / f"proc_poly_{fam}_s{seed}.wad"
+                spec = generate_extreme_wad(arch, seed=seed, out_dir=proc_dir, split="train", out_path=out_wad)
+            else:
+                out_wad = proc_dir / f"proc_poly_{fam}_s{seed}.wad"
+                spec = generate_procedural_wad(
+                    fam,
+                    seed=seed,
+                    out_dir=proc_dir,
+                    split="train",
+                    with_combat=(fam == "key_return"),
+                    out_path=out_wad,
+                    continuous_angle=True,
+                    poly_only=True,
+                )
+            specs.append(spec)
+    return specs
+
+
+def _init_accel_pool(
+    cfg: TrainConfig,
+    proc_dir: str,
+) -> tuple[list[MapSpec], list[MapSpec], list[MapSpec], AccelLevelArchive]:
+    base_specs = resolve_train_maps(
+        None,
+        split=cfg.split,
+        stage=cfg.stage,
+        procedural_per_family=0,
+    )
+    families = ("door_exit", "combat", "multi_room", "key_return", "gauntlet")
+    proc_path = Path(proc_dir)
+    proc_path.mkdir(parents=True, exist_ok=True)
+    seed = cfg.seed + 1000
+    pairs: list[tuple[MapSpec, DungeonGenome]] = []
+    k_total = int(cfg.procedural_per_family)
+    k_accel = max(1, k_total // 2) if k_total >= 2 else k_total
+    k_poly = max(0, k_total - k_accel)
+    for fam in families:
+        for _ in range(k_accel):
+            genome = DungeonGenome(family=fam, seed=seed)
+            spec = generate_dungeon_from_genome(genome, proc_path)
+            pairs.append((spec, genome))
+            seed += 1
+    poly_specs = _generate_hybrid_poly_pool(k_poly, families, proc_path, base_seed=seed + 50_000)
+    archive = AccelLevelArchive()
+    archive.seed_pool(pairs)
+    return base_specs, [s for s, _ in pairs], poly_specs, archive
 
 
 def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) -> dict[str, Any]:
@@ -189,19 +275,61 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     rng = np.random.default_rng(cfg.seed)
 
     proc_dir = cfg.procedural_dir or str(Path(cfg.checkpoint_dir) / "proc_wads")
-    map_specs = resolve_train_maps(
-        list(cfg.maps) if cfg.maps else None,
-        split=cfg.split,
-        stage=cfg.stage,
-        procedural_per_family=cfg.procedural_per_family,
-        procedural_dir=proc_dir,
-        procedural_seed=cfg.seed + 1000,
+    families = ("door_exit", "combat", "multi_room", "key_return", "gauntlet")
+    corpus_sampler: CorpusPoolSampler | None = None
+    archive: AccelLevelArchive | None = None
+    base_map_specs: list[MapSpec] = []
+    hybrid_poly_specs: list[MapSpec] = []
+
+    if cfg.corpus_manifest and not cfg.maps and cfg.stage != "connect":
+        base_map_specs = resolve_train_maps(
+            None,
+            split=cfg.split,
+            stage=cfg.stage,
+            procedural_per_family=0,
+        )
+        corpus_sampler = CorpusPoolSampler(
+            cfg.corpus_manifest,
+            include_freedoom=cfg.corpus_include_freedoom,
+        )
+        sampled = corpus_sampler.sample_pool(
+            pool_size=cfg.corpus_pool_size,
+            high_diff_frac=cfg.corpus_high_diff_frac,
+            rng=rng,
+        )
+        map_specs = [*base_map_specs, *sampled]
+    else:
+        use_accel_pool = (
+            bool(cfg.use_accel)
+            and int(cfg.procedural_per_family) > 0
+            and not cfg.maps
+            and cfg.stage != "connect"
+        )
+        if use_accel_pool:
+            base_map_specs, accel_specs, hybrid_poly_specs, archive = _init_accel_pool(cfg, proc_dir)
+            map_specs = [*base_map_specs, *accel_specs, *hybrid_poly_specs]
+        else:
+            map_specs = resolve_train_maps(
+                list(cfg.maps) if cfg.maps else None,
+                split=cfg.split,
+                stage=cfg.stage,
+                procedural_per_family=cfg.procedural_per_family,
+                procedural_dir=proc_dir,
+                procedural_seed=cfg.seed + 1000,
+            )
+
+    champion_baselines = (
+        load_champion_baselines(cfg.champion_report) if cfg.champion_report else None
     )
-    effective_reward_cfg = (
+    base_reward_cfg = (
         reward_config
         if reward_config is not None
         else RewardConfig(pbrs_scale=cfg.pbrs_scale, pbrs_gamma=1.0)
     )
+    effective_reward_cfg = base_reward_cfg
+    cmdp = PrimalDualController() if cfg.use_primal_dual else None
+    cmdp_metrics: dict[str, float] = cmdp.current_metrics() if cmdp is not None else {}
+
     scheduler = CurriculumScheduler(
         CurriculumConfig(
             auto_curriculum=cfg.auto_curriculum,
@@ -212,6 +340,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
             tier3_progress_promote_threshold=cfg.tier3_promote_threshold,
             tier3_require_exit=cfg.tier3_require_exit,
             adaptive_weights=cfg.adaptive_weights,
+            adaptive_mode=cfg.adaptive_mode,
         )
     )
 
@@ -298,6 +427,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
             max_cached_envs=cfg.max_cached_envs,
             use_ego_map=use_ego_map,
             mirror_prob=cfg.mirror_prob,
+            champion_baselines=champion_baselines,
         ) as vec_env:
             obs = vec_env.reset()
             prev_action = np.zeros((cfg.num_envs, NUM_ACTIONS), dtype=np.float32)
@@ -343,8 +473,14 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                 ppo_metrics = trainer.update(buffer, rng=rng)
                 iter_s = max(1e-6, time.perf_counter() - t_iter)
 
+                scheduler.observe_pvl(buffer.compute_per_wad_pvl())
                 if ep_list:
                     promoted = scheduler.observe_episodes(ep_list)
+                    if cmdp is not None:
+                        effective_reward_cfg, cmdp_metrics = cmdp.observe_episodes(ep_list, base_reward_cfg)
+                        vec_env.set_reward_config(effective_reward_cfg)
+                    if archive is not None:
+                        archive.update_scores(scheduler.get_map_scores(map_specs))
                     if promoted or cfg.adaptive_weights:
                         new_weights = scheduler.compute_map_weights(map_specs)
                         vec_env.set_map_weights(new_weights)
@@ -353,23 +489,61 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
 
                 if (
                     cfg.procedural_refresh_updates > 0
-                    and cfg.procedural_per_family > 0
+                    and (corpus_sampler is not None or cfg.procedural_per_family > 0)
                     and not cfg.maps
                     and cfg.stage != "connect"
                     and (local_idx + 1) < target_updates
                     and update_idx % cfg.procedural_refresh_updates == 0
                 ):
                     refresh_seed = cfg.seed + 1000 + update_idx * 97
-                    map_specs = resolve_train_maps(
-                        None,
-                        split=cfg.split,
-                        stage=cfg.stage,
-                        procedural_per_family=cfg.procedural_per_family,
-                        procedural_dir=proc_dir,
-                        procedural_seed=refresh_seed,
-                    )
+                    retired_poly_paths: list[Path] = []
+                    if corpus_sampler is not None:
+                        sampled = corpus_sampler.sample_pool(
+                            pool_size=cfg.corpus_pool_size,
+                            high_diff_frac=cfg.corpus_high_diff_frac,
+                            rng=rng,
+                            scores_by_wad=scheduler.get_map_scores(map_specs),
+                        )
+                        map_specs = [*base_map_specs, *sampled]
+                    elif archive is not None:
+                        k_total = int(cfg.procedural_per_family)
+                        k_accel = max(1, k_total // 2) if k_total >= 2 else k_total
+                        k_poly = max(0, k_total - k_accel)
+                        accel_specs = archive.evolve_pool(
+                            count_per_family=k_accel,
+                            families=families,
+                            out_dir=proc_dir,
+                            rng=rng,
+                            generation_seed=refresh_seed,
+                            genome_cls=DungeonGenome,
+                            generator_fn=generate_dungeon_from_genome,
+                            mutate_fn=mutate_dungeon_genome,
+                            defer_unlink=True,
+                        )
+                        retired_poly_paths = [Path(s.wad) for s in hybrid_poly_specs]
+                        hybrid_poly_specs = _generate_hybrid_poly_pool(
+                            k_poly, families, Path(proc_dir), base_seed=refresh_seed + 50_000
+                        )
+                        map_specs = [*base_map_specs, *accel_specs, *hybrid_poly_specs]
+                    else:
+                        map_specs = resolve_train_maps(
+                            None,
+                            split=cfg.split,
+                            stage=cfg.stage,
+                            procedural_per_family=cfg.procedural_per_family,
+                            procedural_dir=proc_dir,
+                            procedural_seed=refresh_seed,
+                        )
                     refreshed_weights = scheduler.compute_map_weights(map_specs)
                     vec_env.set_map_specs(map_specs, refreshed_weights)
+                    if archive is not None:
+                        archive.cleanup_retired()
+                    for rp in retired_poly_paths:
+                        if rp.exists() and rp.name.startswith("proc_poly_"):
+                            try:
+                                rp.unlink()
+                            except OSError:
+                                pass
 
                 total_decisions += steps_per_update
                 episodes_completed += len(ep_list)
@@ -386,6 +560,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                     "curriculum_phase": scheduler.phase,
                     **ppo_metrics,
                     **ep_summary,
+                    **cmdp_metrics,
                 }
                 last_summary = record
                 with metrics_path.open("a", encoding="utf-8") as fh:
@@ -662,6 +837,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-auto-curriculum", dest="auto_curriculum", action="store_false")
     p.add_argument("--adaptive-weights", dest="adaptive_weights", action="store_true", default=True)
     p.add_argument("--no-adaptive-weights", dest="adaptive_weights", action="store_false")
+    p.add_argument("--adaptive-mode", choices=("legacy", "sfl_pvl"), default="sfl_pvl")
+    p.add_argument("--accel", dest="use_accel", action="store_true", default=True)
+    p.add_argument("--no-accel", dest="use_accel", action="store_false")
+    p.add_argument("--primal-dual", dest="use_primal_dual", action="store_true", default=True)
+    p.add_argument("--no-primal-dual", dest="use_primal_dual", action="store_false")
+    p.add_argument("--champion-report", default=None, help="Optional eval JSON path for champion-anchored hill-climb rewards")
+    p.add_argument("--corpus-manifest", default=None, help="Path to pre-generated corpus manifest.jsonl for rotating map streaming")
+    p.add_argument("--corpus-pool-size", type=int, default=60)
+    p.add_argument("--corpus-high-diff-frac", type=float, default=0.45)
+    p.add_argument("--corpus-include-freedoom", dest="corpus_include_freedoom", action="store_true", default=True)
+    p.add_argument("--no-corpus-include-freedoom", dest="corpus_include_freedoom", action="store_false")
     p.add_argument("--tier12-promote-threshold", type=float, default=0.65)
     p.add_argument("--tier3-promote-threshold", type=float, default=0.50)
     p.add_argument("--min-promote-episodes", type=int, default=32)
@@ -749,6 +935,14 @@ def main(argv: list[str] | None = None) -> None:
         tier_weights=_parse_tier_weights(args.tier_weights),
         auto_curriculum=args.auto_curriculum,
         adaptive_weights=args.adaptive_weights,
+        adaptive_mode=args.adaptive_mode,
+        use_accel=args.use_accel,
+        use_primal_dual=args.use_primal_dual,
+        champion_report=args.champion_report,
+        corpus_manifest=args.corpus_manifest,
+        corpus_pool_size=args.corpus_pool_size,
+        corpus_high_diff_frac=args.corpus_high_diff_frac,
+        corpus_include_freedoom=args.corpus_include_freedoom,
         tier12_promote_threshold=args.tier12_promote_threshold,
         tier3_promote_threshold=args.tier3_promote_threshold,
         min_promote_episodes=args.min_promote_episodes,

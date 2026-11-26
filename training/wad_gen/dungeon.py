@@ -11,11 +11,13 @@ D4 symmetry + balanced initial spawn bearings, and full monster/weapon/pickup va
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
 import random
 
 from training.interfaces import MapSpec
+from training.pbrs import _build_nav_graph
 from training.wad_gen.udmf import THEME_NAMES, build_grid_wad
 from training.wad_gen.verify import verify_grid_solvability
 
@@ -34,6 +36,63 @@ _FAMILY_TICKS = {
     "key_return": 3200,
     "gauntlet": 4200,
 }
+
+
+@dataclass(frozen=True)
+class DungeonGenome:
+    """Evolvable parameter vector for ACCEL procedural dungeon mutations."""
+
+    family: str
+    seed: int
+    extra_rooms: int = 0
+    extra_locks: int = 0
+    force_window: bool = False
+    force_vertical: bool = False
+    force_nukage: bool = False
+    force_low_ammo: bool = False
+    monster_delta: int = 0
+    door_delay: int | None = None
+    generation: int = 0
+
+
+def mutate_dungeon_genome(genome: DungeonGenome, rng: Any) -> DungeonGenome:
+    """Apply 1-2 atomic ACCEL edits to produce a frontier child dungeon genome."""
+    ops = [
+        "extra_rooms",
+        "force_window",
+        "force_vertical",
+        "force_nukage",
+        "force_low_ammo",
+        "monster_delta",
+        "door_delay",
+    ]
+    if genome.family not in ("combat", "door_exit"):
+        ops.insert(1, "extra_locks")
+    n_edits = 2 if rng.random() < 0.35 else 1
+    chosen = rng.choice(ops, size=n_edits, replace=False) if hasattr(rng, "choice") and hasattr(rng, "integers") else random.Random(genome.seed + genome.generation + 17).sample(ops, k=n_edits)
+    g = genome
+    py_rng = random.Random(int(rng.integers(0, 2**31 - 1)) if hasattr(rng, "integers") else rng.randint(0, 2**31 - 1))
+    for op in list(chosen):
+        if op == "extra_rooms":
+            step = py_rng.choice((-1, 1)) if g.extra_rooms > 0 else 1
+            g = replace(g, extra_rooms=max(0, min(2, g.extra_rooms + step)))
+        elif op == "extra_locks":
+            step = py_rng.choice((-1, 1)) if g.extra_locks > 0 else 1
+            g = replace(g, extra_locks=max(0, min(2, g.extra_locks + step)))
+        elif op == "force_window":
+            g = replace(g, force_window=not g.force_window)
+        elif op == "force_vertical":
+            g = replace(g, force_vertical=not g.force_vertical)
+        elif op == "force_nukage":
+            g = replace(g, force_nukage=not g.force_nukage)
+        elif op == "force_low_ammo":
+            g = replace(g, force_low_ammo=not g.force_low_ammo)
+        elif op == "monster_delta":
+            step = py_rng.choice((-1, 1, 2))
+            g = replace(g, monster_delta=max(-2, min(4, g.monster_delta + step)))
+        elif op == "door_delay":
+            g = replace(g, door_delay=py_rng.choice((0, 60, 100, 150, 200)))
+    return replace(g, generation=g.generation + 1)
 
 
 def _det_seed(family: str, seed: int, attempt: int = 0) -> int:
@@ -119,6 +178,7 @@ def _attempt_build_dungeon(
     attempt: int,
     *,
     with_combat: bool,
+    genome: DungeonGenome | None = None,
 ) -> tuple[
     str,
     dict[tuple[int, int], int],
@@ -141,6 +201,14 @@ def _attempt_build_dungeon(
         mr, mc = rng.choice([(2, 3), (3, 2), (3, 3)])
     else:
         mr, mc = rng.choice([(3, 3), (3, 4), (4, 3)])
+
+    if genome is not None and genome.extra_rooms > 0:
+        if mr <= mc:
+            mr = min(4, mr + 1)
+        else:
+            mc = min(4, mc + 1)
+        if genome.extra_rooms >= 2:
+            mc = min(4, mc + 1)
 
     is_wide_arena = rng.random() < (0.42 if family in ("combat", "gauntlet", "multi_room") else 0.25)
     if is_wide_arena:
@@ -259,6 +327,9 @@ def _attempt_build_dungeon(
         else:
             desired_locks = 1
 
+    if genome is not None and genome.extra_locks > 0:
+        desired_locks = min(3, desired_locks + genome.extra_locks)
+
     # Cap locks by path edge count
     n_path_edges = max(0, len(path_to_exit) - 1)
     actual_locks = min(desired_locks, n_path_edges)
@@ -329,7 +400,7 @@ def _attempt_build_dungeon(
     # threshold connectors (`20`) bridge 40u gaps with <=24u step-up (zero interior border clobbering!).
     room_hf: dict[int, int] = {u: 0 for u in range(n_nodes)}
     room_hc: dict[int, int] = {u: rng.choice((128, 144, 160)) for u in range(n_nodes)}
-    use_verticality = rng.random() < 0.65
+    use_verticality = (rng.random() < 0.65) or (genome is not None and genome.force_vertical)
     if use_verticality:
         comp_id = list(range(n_nodes))
 
@@ -422,7 +493,8 @@ def _attempt_build_dungeon(
         else:
             _carve_connector(u, v, "open")
 
-    # Add windows (~40% on non-connected adjacent walls)
+    # Add windows (~40% on non-connected adjacent walls, forced if requested by genome)
+    win_prob = 0.85 if (genome is not None and genome.force_window) else 0.40
     for rr in range(mr):
         for cc in range(mc):
             u = nid(rr, cc)
@@ -431,7 +503,7 @@ def _attempt_build_dungeon(
                 if 0 <= nr < mr and 0 <= nc < mc:
                     v = nid(nr, nc)
                     ek = (min(u, v), max(u, v))
-                    if ek not in edge_set and rng.random() < 0.40:
+                    if ek not in edge_set and rng.random() < win_prob:
                         _carve_connector(u, v, "window")
 
     # Optional pillars inside spacious rooms (>= 5x5)
@@ -485,7 +557,7 @@ def _attempt_build_dungeon(
         u for u in range(n_nodes)
         if u not in (spawn_node, exit_node) and (room_rects[u][1] - room_rects[u][0]) >= 4 and (room_rects[u][3] - room_rects[u][2]) >= 4
     ]
-    if nukage_nodes and rng.random() < rad_prob:
+    if nukage_nodes and ((genome is not None and genome.force_nukage) or rng.random() < rad_prob):
         nuk_u = rng.choice(nukage_nodes)
         r0, r1, c0, c1 = room_rects[nuk_u]
         # Inner patch leaving dry perimeter ring & no occupied key/spawn/exit cells
@@ -531,11 +603,14 @@ def _attempt_build_dungeon(
         n_monsters = rng.randint(7, 12)
         m_pool = ["z", "s", "c", "i", "m", "S", "l", "k", "n", "N", "Q", "V", "K"]
         w_pool = rng.sample(["W", "L", "F", "G", "C"], k=rng.randint(2, 3))
-        low_ammo = rng.random() < 0.35
+        low_ammo = (rng.random() < 0.35) or (genome is not None and genome.force_low_ammo)
         if low_ammo:
             p_pool = rng.sample(["h", "H", "A", "U", "x"], k=rng.randint(2, 3))
         else:
             p_pool = rng.sample(["h", "H", "A", "M", "U", "O", "e", "o", "u", "J", "x"], k=rng.randint(3, 5))
+
+    if genome is not None and genome.monster_delta != 0:
+        n_monsters = max(0, n_monsters + genome.monster_delta)
 
     # Place spawn-room or early weapon + pickups
     early_nodes = [spawn_node] + [v for v in tree_adj[spawn_node] if v != exit_node]
@@ -605,8 +680,82 @@ def _attempt_build_dungeon(
     grid_str = "\n".join("".join(row) for row in t_grid)
     theme = rng.choice(THEME_NAMES)
     skull_keys = (actual_locks > 0) and (rng.random() < 0.45)
-    door_delay = rng.choice((0, 60, 100, 150, 200))
+    door_delay = genome.door_delay if (genome is not None and genome.door_delay is not None) else rng.choice((0, 60, 100, 150, 200))
     return grid_str, t_fh, t_ch, t_sp, cell_size, player_angle, theme, skull_keys, door_delay
+
+
+def generate_dungeon_from_genome(
+    genome: DungeonGenome,
+    out_dir: str | Path,
+    *,
+    split: str = "train",
+    with_combat: bool = False,
+    out_path: str | Path | None = None,
+) -> MapSpec:
+    """Synthesize a WAD from a `DungeonGenome`, verifying solvability AND valid PBRS nav graph."""
+    if genome.family not in _FAMILY_TIERS:
+        raise ValueError(f"Unknown family {genome.family!r}; expected one of {tuple(_FAMILY_TIERS)}")
+
+    target_path = (
+        Path(out_path)
+        if out_path is not None
+        else (Path(out_dir) / f"proc_accel_{genome.family}_g{genome.generation}_s{genome.seed}.wad")
+    )
+    last_err: tuple[str, ...] = ()
+    for attempt in range(12):
+        (
+            grid_str,
+            fh,
+            ch,
+            sp,
+            cell_size,
+            player_angle,
+            theme,
+            skull_keys,
+            door_delay,
+        ) = _attempt_build_dungeon(
+            genome.family,
+            genome.seed,
+            attempt,
+            with_combat=with_combat,
+            genome=genome,
+        )
+        res = verify_grid_solvability(
+            grid_str,
+            floor_heights=fh or None,
+            ceiling_heights=ch or None,
+        )
+        if res.ok:
+            build_grid_wad(
+                target_path,
+                grid_str,
+                cell_size=cell_size,
+                player_angle=player_angle,
+                theme=theme,
+                skull_keys=skull_keys,
+                door_close_delay=door_delay,
+                floor_heights=fh or None,
+                ceiling_heights=ch or None,
+                sector_specials=sp or None,
+            )
+            graph = _build_nav_graph(target_path, "MAP01")
+            if graph is not None and len(graph.exit_cells) > 0:
+                return MapSpec(
+                    wad=str(target_path),
+                    map_name="MAP01",
+                    family=genome.family,
+                    tier=_FAMILY_TIERS[genome.family],
+                    split=split,
+                    episode_ticks=_FAMILY_TICKS[genome.family],
+                    seeds=(0, 1, 2),
+                )
+            last_err = ("pbrs_nav_graph_invalid",)
+        else:
+            last_err = res.errors
+
+    raise RuntimeError(
+        f"Failed to generate PBRS-valid dungeon for genome={genome}: {last_err}"
+    )
 
 
 def generate_dungeon_wad(
