@@ -34,3 +34,14 @@ Merge Roles 1–4 when:
 2. Role 1 reloads that checkpoint in `submission/agent.py` (`DoomAgent`), plays **two consecutive maps with memory reset**, and passes `uv run python validate.py`.
 3. Role 3 provides one verified door/exit map and one verified key/lock map.
 4. Role 4 runs the evaluator on both maps and distinguishes **pickup, unlock, exit, death, and timeout**.
+
+## Role 1 Architecture & Google Colab A100 Setup
+
+- `submission/policy.py` implements `TelemetryPolicy` under `PolicyConfig(arch="telemetry_gru_v1")` (circular 1D-conv ray encoder preserving 16 angular bins, vitals + `prev_action` MLP, masked multi-head entity cross-attention with learned empty-room embedding, 256-dim GRU with residual post-norm, and 9-button Bernoulli actor + scalar critic), while preserving `arch="stub"` for fast smoke tests.
+- Open `training/colab_a100.ipynb` on an **A100 GPU** runtime and run `bash training/colab_setup.sh` to install `uv`, `git-lfs`, Python 3.13, `vizdoom==1.3.3`, CUDA PyTorch, and editable `doom_env`.
+- Verify CUDA + Stage 1 export/reload with:
+  ```bash
+  .venv/bin/python training/export_smoke_weights.py --device cuda
+  .venv/bin/pytest -q
+  .venv/bin/python validate.py --device cuda --map maps/two_rooms.wad --map maps/two_rooms.wad
+  ```
