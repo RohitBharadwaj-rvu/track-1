@@ -119,3 +119,26 @@ def test_map_spec_and_episode_metrics_defaults():
     metrics = EpisodeMetrics(wad=spec.wad, map_name=spec.map_name, family=spec.family, tier=spec.tier, seed=0)
     assert spec.episode_ticks == 2100
     assert metrics.outcome == "timeout"
+
+
+def test_privileged_event_tracker_ignores_non_door_sectors():
+    tracker = PrivilegedEventTracker()
+    base = {
+        "x": 0.0,
+        "y": 0.0,
+        "kills": 0,
+        "damage_taken": 0.0,
+        "keys": np.zeros(6, dtype=np.int32),
+        "exit_reached": False,
+        "dead": False,
+        "timeout": False,
+        "sector_ceiling": np.array([0.0, 0.0, 64.0]),
+        "door_lock": np.array([0, 1, -1]),
+    }
+    tracker.reset(base)
+
+    # Non-door sector 2 (door_lock == -1) raises ceiling by 64.0 (e.g. ceiling crusher/lift).
+    s1 = {**base, "sector_ceiling": np.array([0.0, 0.0, 128.0])}
+    ev, _ = tracker.update(s1)
+    assert ev.doors_opened == 0
+    assert ev.locked_doors_unlocked == 0
