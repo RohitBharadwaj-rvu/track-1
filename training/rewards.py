@@ -51,7 +51,7 @@ class RewardConfig:
     pbrs_gamma: float = 1.0
     spin_penalty: float = -0.015
     spin_threshold_steps: int = 6
-    blind_backward_penalty: float = -0.012
+    blind_backward_penalty: float = -0.030
     step_penalty: float = -0.008
     cell_size: float = 64.0
     open_threshold: float = 8.0
