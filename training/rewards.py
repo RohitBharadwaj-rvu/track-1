@@ -29,13 +29,13 @@ class RewardConfig:
     efficiency_bonus: float = 2.5
     health_efficiency_bonus: float = 1.5
     key_pickup_reward: float = 4.0
-    locked_door_unlock_reward: float = 5.0
+    locked_door_unlock_reward: float = 7.0
     door_open_reward: float = 2.0
     new_cell_reward: float = 0.10
     max_exploration_cells: int = 250
     explore_decay_cells: float = 60.0
-    post_key_cell_reward: float = 0.08
-    max_post_key_cells: int = 80
+    post_key_cell_reward: float = 0.02
+    max_post_key_cells: int = 30
     kill_reward: float = 0.8
     damage_penalty: float = -0.032
     death_penalty: float = -3.0
@@ -48,8 +48,8 @@ class RewardConfig:
     max_pickup_bonus: float = 2.5
     pbrs_scale: float = 3.0
     pbrs_gamma: float = 1.0
-    spin_penalty: float = -0.010
-    spin_threshold_steps: int = 8
+    spin_penalty: float = -0.015
+    spin_threshold_steps: int = 6
     step_penalty: float = -0.005
     cell_size: float = 64.0
     open_threshold: float = 8.0
