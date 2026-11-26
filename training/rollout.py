@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import importlib
+import math
 import multiprocessing as mp
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -29,6 +30,11 @@ from training.interfaces import EpisodeMetrics, MapSpec
 from training.rewards import RewardConfig, RewardShaper
 
 ROOT = Path(__file__).resolve().parent.parent
+PRIV_FEATURE_DIM = 16
+AUX_TARGET_DIM = 4
+_RAY_RANGE = 1024.0
+_RAY_LOCKED = 3
+
 DEFAULT_TRAIN_MAPS = [
     MapSpec(
         wad="maps/two_rooms.wad",
@@ -45,7 +51,6 @@ DEFAULT_TRAIN_MAPS = [
 def parse_map_arg(raw: str, split: str = "train") -> MapSpec:
     """Parse `wad[:map_name[:family[:tier[:episode_ticks]]]]` into a `MapSpec`."""
     parts = raw.split(":")
-    # Handle Windows drive letter prefix like C:\path\map.wad:...
     if len(parts) >= 2 and len(parts[0]) == 1 and parts[0].isalpha() and parts[1].startswith(("\\", "/")):
         parts = [f"{parts[0]}:{parts[1]}", *parts[2:]]
     if len(parts) > 5:
@@ -65,25 +70,52 @@ def parse_map_arg(raw: str, split: str = "train") -> MapSpec:
     )
 
 
-def resolve_train_maps(map_args: list[str] | None = None, split: str = "train") -> list[MapSpec]:
-    """Resolve training maps from CLI `--map`, Role 3's `training.maps`, or fallback."""
+def resolve_train_maps(
+    map_args: list[str] | None = None,
+    split: str = "train",
+    *,
+    stage: str | None = None,
+    procedural_per_family: int = 0,
+    procedural_dir: str | Path | None = None,
+    procedural_seed: int = 1000,
+) -> list[MapSpec]:
+    """Resolve training maps from CLI `--map`, Role 3's `training.maps` (+ procedural), or fallback."""
     if map_args:
-        return [parse_map_arg(m, split=split) for m in map_args]
-    try:
-        maps_mod = importlib.import_module("training.maps")
-    except ModuleNotFoundError:
-        return list(DEFAULT_TRAIN_MAPS)
+        specs = [parse_map_arg(m, split=split) for m in map_args]
+    else:
+        specs = []
+        try:
+            maps_mod = importlib.import_module("training.maps")
+        except ModuleNotFoundError:
+            maps_mod = None
 
-    if hasattr(maps_mod, "get_maps"):
-        specs = list(maps_mod.get_maps(split=split))
-        if specs:
-            return specs
-    for attr in ("TRAIN_MAPS", "ALL_MAPS", "DEV_MAPS"):
-        if hasattr(maps_mod, attr):
-            specs = [s for s in getattr(maps_mod, attr) if split == "all" or s.split == split]
-            if specs:
-                return specs
-    return list(DEFAULT_TRAIN_MAPS)
+        if maps_mod is not None:
+            if hasattr(maps_mod, "get_maps"):
+                specs = list(maps_mod.get_maps(split=split, stage=stage if split == "train" else None))
+            if not specs:
+                for attr in ("TRAIN_MAPS", "ALL_MAPS", "DEV_MAPS"):
+                    if hasattr(maps_mod, attr):
+                        specs = [s for s in getattr(maps_mod, attr) if split == "all" or s.split == split]
+                        if specs:
+                            break
+        if not specs:
+            specs = list(DEFAULT_TRAIN_MAPS)
+
+    if procedural_per_family > 0:
+        try:
+            maps_mod = importlib.import_module("training.maps")
+            if hasattr(maps_mod, "generate_training_variations"):
+                out_dir = Path(procedural_dir) if procedural_dir is not None else (ROOT / "training" / "runs" / "proc_wads")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                proc_specs = maps_mod.generate_training_variations(
+                    out_dir,
+                    count_per_family=int(procedural_per_family),
+                    base_seed=int(procedural_seed),
+                )
+                specs = [*specs, *proc_specs]
+        except ModuleNotFoundError:
+            pass
+    return specs
 
 
 def _resolve_wad_path(wad: str) -> str:
@@ -94,8 +126,23 @@ def _resolve_wad_path(wad: str) -> str:
     return str(candidate if candidate.exists() else p)
 
 
+def _normalize_weights(weights: Sequence[float] | None, n: int) -> np.ndarray:
+    if n <= 0:
+        raise ValueError("num maps must be positive")
+    if weights is None:
+        return np.full(n, 1.0 / n, dtype=np.float64)
+    arr = np.asarray(weights, dtype=np.float64)
+    if arr.shape != (n,):
+        raise ValueError(f"Expected {n} map weights, got shape {arr.shape}")
+    arr = np.maximum(arr, 0.0)
+    total = float(arr.sum())
+    if total <= 0.0:
+        return np.full(n, 1.0 / n, dtype=np.float64)
+    return arr / total
+
+
 class _DoomWorkerSlot:
-    """Single environment stream caching `DoomEnv` per (wad, map_name, ticks) with RewardShaper."""
+    """Single env stream caching `DoomEnv`, running `RewardShaper`, and building privileged/aux targets."""
 
     def __init__(
         self,
@@ -105,11 +152,13 @@ class _DoomWorkerSlot:
         base_seed: int = 0,
         render_buffers: bool = False,
         max_cached_envs: int = 8,
+        map_weights: Sequence[float] | None = None,
     ):
         if not map_specs:
             raise ValueError("map_specs must not be empty")
         self.slot_id = slot_id
         self.map_specs = list(map_specs)
+        self.map_probs = _normalize_weights(map_weights, len(self.map_specs))
         self.shaper = RewardShaper(reward_config)
         self.render_buffers = render_buffers
         self.max_cached_envs = max(1, max_cached_envs)
@@ -127,6 +176,13 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked = 0
         self._kills = 0
         self._damage_taken = 0.0
+        self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
+        self._locked_door_xy: tuple[float, float] | None = None
+        self._last_priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
+        self._last_aux_targets = np.zeros(AUX_TARGET_DIM, dtype=np.float32)
+
+    def set_map_weights(self, weights: Sequence[float]) -> None:
+        self.map_probs = _normalize_weights(weights, len(self.map_specs))
 
     def _get_or_create_env(self, spec: MapSpec):
         wad_path = _resolve_wad_path(spec.wad)
@@ -148,8 +204,61 @@ class _DoomWorkerSlot:
         self._envs[key] = env
         return env
 
+    def _update_door_sighting_and_features(
+        self,
+        raw_obs: dict[str, Any],
+        priv: dict[str, Any],
+        unlocked_this_step: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        px = float(priv["x"])
+        py = float(priv["y"])
+        heading = math.radians(float(priv["angle"]))
+
+        if unlocked_this_step > 0:
+            self._locked_door_xy = None
+
+        rays = raw_obs["rays"]
+        hit_type = np.asarray(rays["hit_type"], dtype=np.int64)
+        locked_indices = np.flatnonzero(hit_type == _RAY_LOCKED)
+        if len(locked_indices) > 0:
+            dists = np.asarray(rays["distance"], dtype=np.float32)[locked_indices]
+            best_ray = int(locked_indices[int(np.argmin(dists))])
+            d = float(rays["distance"][best_ray]) * _RAY_RANGE
+            ray_angle = heading + best_ray * (2.0 * math.pi / float(NUM_RAYS))
+            self._locked_door_xy = (px + d * math.cos(ray_angle), py + d * math.sin(ray_angle))
+
+        seen_locked = 0.0
+        door_sin = 0.0
+        door_cos = 0.0
+        door_dist_norm = 0.0
+        if self._locked_door_xy is not None:
+            dx = self._locked_door_xy[0] - px
+            dy = self._locked_door_xy[1] - py
+            dist = math.hypot(dx, dy)
+            rel_angle = math.atan2(dy, dx) - heading
+            seen_locked = 1.0
+            door_sin = math.sin(rel_angle)
+            door_cos = math.cos(rel_angle)
+            door_dist_norm = min(dist / _RAY_RANGE, 2.0)
+
+        aux_targets = np.array([seen_locked, door_sin, door_cos, door_dist_norm], dtype=np.float32)
+
+        ep_ticks = max(1, int(priv.get("episode_ticks", 1)))
+        rem_frac = max(0.0, 1.0 - float(priv.get("tic", 0)) / float(ep_ticks))
+        keys_arr = np.asarray(priv["keys"], dtype=np.float32)
+        priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
+        priv_features[0] = min(float(self.shaper.unique_cells_visited) / 200.0, 2.0)
+        priv_features[1] = min(float(self.shaper.post_key_cells_visited) / 60.0, 2.0)
+        priv_features[2:8] = keys_arr[:6]
+        priv_features[8] = min(float(self._doors_opened) / 5.0, 2.0)
+        priv_features[9] = min(float(self._locked_doors_unlocked) / 3.0, 2.0)
+        priv_features[10] = float(rem_frac)
+        priv_features[11] = min(max(float(priv.get("health", 100.0)) / 100.0, 0.0), 2.0)
+        priv_features[12:16] = aux_targets
+        return priv_features, aux_targets
+
     def reset(self) -> dict[str, np.ndarray]:
-        idx = int(self._rng.integers(0, len(self.map_specs)))
+        idx = int(self._rng.choice(len(self.map_specs), p=self.map_probs))
         spec = self.map_specs[idx]
         env = self._get_or_create_env(spec)
         self._active_env = env
@@ -158,7 +267,8 @@ class _DoomWorkerSlot:
         self._current_seed = int(self.slot_id * 1_000_000 + self._episode_counter)
 
         raw_obs, _ = env.reset(seed=self._current_seed)
-        self.shaper.reset(env.privileged_state())
+        priv = env.privileged_state()
+        self.shaper.reset(priv, obs=raw_obs)
         self._steps = 0
         self._total_reward = 0.0
         self._keys_picked_up = 0
@@ -166,14 +276,21 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked = 0
         self._kills = 0
         self._damage_taken = 0.0
+        self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
+        self._locked_door_xy = None
+        self._last_priv_features, self._last_aux_targets = self._update_door_sighting_and_features(raw_obs, priv)
         return preprocess_obs(raw_obs)
 
     def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         if self._active_env is None:
             raise RuntimeError("Call reset() before step()")
-        raw_obs, _, terminated, truncated, _ = self._active_env.step(action)
+        act = np.asarray(action, dtype=np.int8)
+        raw_obs, _, terminated, truncated, _ = self._active_env.step(act)
         priv = self._active_env.privileged_state()
-        reward, events, _ = self.shaper.step(priv)
+        reward, events, _ = self.shaper.step(
+            priv, action=act, prev_action=self._prev_action, obs=raw_obs
+        )
+        self._prev_action = act.copy()
 
         self._steps += 1
         self._total_reward += reward
@@ -182,6 +299,10 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked += events.locked_doors_unlocked
         self._kills += events.kills
         self._damage_taken += events.damage_taken
+
+        priv_f, aux_t = self._update_door_sighting_and_features(
+            raw_obs, priv, unlocked_this_step=events.locked_doors_unlocked
+        )
 
         info: dict[str, Any] = {}
         if terminated or truncated:
@@ -193,6 +314,8 @@ class _DoomWorkerSlot:
             else:
                 outcome = "timeout"
             info["final_obs"] = final_obs
+            info["final_priv_features"] = priv_f
+            info["final_aux_targets"] = aux_t
             info["episode"] = EpisodeMetrics(
                 wad=self._active_spec.wad,
                 map_name=self._active_spec.map_name,
@@ -212,7 +335,13 @@ class _DoomWorkerSlot:
                 total_reward=float(self._total_reward),
             )
             next_obs = self.reset()
+            info["priv_features"] = self._last_priv_features
+            info["aux_targets"] = self._last_aux_targets
         else:
+            self._last_priv_features = priv_f
+            self._last_aux_targets = aux_t
+            info["priv_features"] = priv_f
+            info["aux_targets"] = aux_t
             next_obs = preprocess_obs(raw_obs)
         return next_obs, float(reward), bool(terminated), bool(truncated), info
 
@@ -237,6 +366,7 @@ class SyncVecDoomEnv:
         render_buffers: bool = False,
         num_envs: int | None = None,
         max_cached_envs: int = 8,
+        map_weights: Sequence[float] | None = None,
     ):
         self.num_envs = num_envs if num_envs is not None else max(1, len(map_specs))
         self.slots = [
@@ -247,12 +377,25 @@ class SyncVecDoomEnv:
                 base_seed=base_seed,
                 render_buffers=render_buffers,
                 max_cached_envs=max_cached_envs,
+                map_weights=map_weights,
             )
             for i in range(self.num_envs)
         ]
+        self._last_priv_batch = np.zeros((self.num_envs, PRIV_FEATURE_DIM), dtype=np.float32)
+        self._last_aux_batch = np.zeros((self.num_envs, AUX_TARGET_DIM), dtype=np.float32)
+
+    def set_map_weights(self, weights: Sequence[float]) -> None:
+        for slot in self.slots:
+            slot.set_map_weights(weights)
+
+    def get_privileged_batch(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._last_priv_batch.copy(), self._last_aux_batch.copy()
 
     def reset(self) -> dict[str, np.ndarray]:
-        return batch_preprocessed_obs([slot.reset() for slot in self.slots])
+        obs_list = [slot.reset() for slot in self.slots]
+        self._last_priv_batch = np.stack([s._last_priv_features for s in self.slots], axis=0)
+        self._last_aux_batch = np.stack([s._last_aux_targets for s in self.slots], axis=0)
+        return batch_preprocessed_obs(obs_list)
 
     def step(
         self, actions: np.ndarray
@@ -266,6 +409,8 @@ class SyncVecDoomEnv:
             terms.append(te)
             truncs.append(tr)
             infos.append(info)
+            self._last_priv_batch[i] = info["priv_features"]
+            self._last_aux_batch[i] = info["aux_targets"]
         return (
             batch_preprocessed_obs(obs_list),
             np.asarray(rewards, dtype=np.float32),
@@ -293,6 +438,7 @@ def _worker_loop(
     base_seed: int,
     render_buffers: bool,
     max_cached_envs: int,
+    map_weights: Sequence[float] | None,
 ) -> None:
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(var, "1")
@@ -303,14 +449,18 @@ def _worker_loop(
         base_seed=base_seed,
         render_buffers=render_buffers,
         max_cached_envs=max_cached_envs,
+        map_weights=map_weights,
     )
     try:
         while True:
             cmd, data = conn.recv()
             if cmd == "reset":
-                conn.send(slot.reset())
+                obs = slot.reset()
+                conn.send((obs, slot._last_priv_features, slot._last_aux_targets))
             elif cmd == "step":
                 conn.send(slot.step(data))
+            elif cmd == "set_weights":
+                slot.set_map_weights(data)
             elif cmd == "close":
                 slot.close()
                 conn.send(None)
@@ -335,17 +485,29 @@ class SubprocVecDoomEnv:
         render_buffers: bool = False,
         num_envs: int = 4,
         max_cached_envs: int = 8,
+        map_weights: Sequence[float] | None = None,
     ):
         self.num_envs = int(num_envs)
         ctx = mp.get_context("spawn")
         self._parent_conns = []
         self._procs = []
         self._closed = False
+        self._last_priv_batch = np.zeros((self.num_envs, PRIV_FEATURE_DIM), dtype=np.float32)
+        self._last_aux_batch = np.zeros((self.num_envs, AUX_TARGET_DIM), dtype=np.float32)
         for i in range(self.num_envs):
             parent_conn, child_conn = ctx.Pipe()
             proc = ctx.Process(
                 target=_worker_loop,
-                args=(child_conn, i, map_specs, reward_config, base_seed, render_buffers, max_cached_envs),
+                args=(
+                    child_conn,
+                    i,
+                    map_specs,
+                    reward_config,
+                    base_seed,
+                    render_buffers,
+                    max_cached_envs,
+                    map_weights,
+                ),
                 daemon=True,
             )
             proc.start()
@@ -353,10 +515,24 @@ class SubprocVecDoomEnv:
             self._parent_conns.append(parent_conn)
             self._procs.append(proc)
 
+    def set_map_weights(self, weights: Sequence[float]) -> None:
+        w = list(weights)
+        for conn in self._parent_conns:
+            conn.send(("set_weights", w))
+
+    def get_privileged_batch(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._last_priv_batch.copy(), self._last_aux_batch.copy()
+
     def reset(self) -> dict[str, np.ndarray]:
         for conn in self._parent_conns:
             conn.send(("reset", None))
-        return batch_preprocessed_obs([conn.recv() for conn in self._parent_conns])
+        obs_list = []
+        for i, conn in enumerate(self._parent_conns):
+            obs, priv_f, aux_t = conn.recv()
+            obs_list.append(obs)
+            self._last_priv_batch[i] = priv_f
+            self._last_aux_batch[i] = aux_t
+        return batch_preprocessed_obs(obs_list)
 
     def step(
         self, actions: np.ndarray
@@ -365,13 +541,15 @@ class SubprocVecDoomEnv:
         for i, conn in enumerate(self._parent_conns):
             conn.send(("step", act[i]))
         obs_list, rewards, terms, truncs, infos = [], [], [], [], []
-        for conn in self._parent_conns:
+        for i, conn in enumerate(self._parent_conns):
             o, r, te, tr, info = conn.recv()
             obs_list.append(o)
             rewards.append(r)
             terms.append(te)
             truncs.append(tr)
             infos.append(info)
+            self._last_priv_batch[i] = info["priv_features"]
+            self._last_aux_batch[i] = info["aux_targets"]
         return (
             batch_preprocessed_obs(obs_list),
             np.asarray(rewards, dtype=np.float32),
@@ -415,16 +593,10 @@ def compute_gae(
     truncated: np.ndarray,
     bootstrap_values: np.ndarray,
     last_values: np.ndarray,
-    gamma: float = 0.99,
+    gamma: float = 0.995,
     gae_lambda: float = 0.95,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute Generalized Advantage Estimation distinguishing death/exit from time truncation.
-
-    All time-indexed inputs have shape `(T, N)`; `last_values` has shape `(N,)`.
-    - When `terminated[t, i]` is True: `next_val = 0.0` (no bootstrap), GAE resets.
-    - When `truncated[t, i]` is True (and not terminated): `next_val = bootstrap_values[t, i]`,
-      and GAE still resets so rewards from the auto-reset next episode never bleed across.
-    """
+    """Compute Generalized Advantage Estimation distinguishing death/exit from time truncation."""
     T, N = rewards.shape
     advantages = np.zeros((T, N), dtype=np.float32)
     gae = np.zeros(N, dtype=np.float32)
@@ -444,7 +616,7 @@ def compute_gae(
 
 
 class RolloutBuffer:
-    """Stores contiguous `(T, N, ...)` rollouts and yields shuffled `(chunk_len, B, ...)` batches."""
+    """Stores contiguous `(T, N, ...)` rollouts (incl. optional privileged/aux targets)."""
 
     def __init__(self, num_steps: int, num_envs: int, hidden_shape: tuple[int, ...]):
         self.num_steps = int(num_steps)
@@ -469,8 +641,9 @@ class RolloutBuffer:
         self.truncated = np.zeros((T, N), dtype=bool)
         self.bootstrap_values = np.zeros((T, N), dtype=np.float32)
         self.episode_starts = np.zeros((T, N), dtype=bool)
-        # Hidden state BEFORE step t; shape (T, num_layers, N, hidden_size) or matching hidden_shape
         self.hiddens = np.zeros((T, *self.hidden_shape), dtype=np.float32)
+        self.priv_features = np.zeros((T, N, PRIV_FEATURE_DIM), dtype=np.float32)
+        self.aux_targets = np.zeros((T, N, AUX_TARGET_DIM), dtype=np.float32)
 
         self.advantages = np.zeros((T, N), dtype=np.float32)
         self.returns = np.zeros((T, N), dtype=np.float32)
@@ -489,6 +662,8 @@ class RolloutBuffer:
         bootstrap_value: np.ndarray,
         episode_start: np.ndarray,
         hidden: np.ndarray,
+        priv_features: np.ndarray | None = None,
+        aux_targets: np.ndarray | None = None,
     ) -> None:
         for k, arr in self.obs.items():
             arr[step] = obs_batch[k]
@@ -502,11 +677,15 @@ class RolloutBuffer:
         self.bootstrap_values[step] = bootstrap_value
         self.episode_starts[step] = episode_start
         self.hiddens[step] = hidden
+        if priv_features is not None:
+            self.priv_features[step] = priv_features
+        if aux_targets is not None:
+            self.aux_targets[step] = aux_targets
 
     def compute_returns_and_advantages(
         self,
         last_values: np.ndarray,
-        gamma: float = 0.99,
+        gamma: float = 0.995,
         gae_lambda: float = 0.95,
     ) -> None:
         self.advantages, self.returns = compute_gae(
@@ -535,7 +714,6 @@ class RolloutBuffer:
             raise ValueError("No chunks available in buffer")
         mb_count = max(1, min(num_minibatches, total_chunks))
 
-        # Enumerate all (chunk_idx, env_idx) pairs and shuffle across chunks, keeping time contiguous.
         pairs = [(c, e) for e in range(self.num_envs) for c in range(num_chunks_per_env)]
         order = np.arange(total_chunks)
         if rng is not None:
@@ -555,7 +733,7 @@ class RolloutBuffer:
             init_hidden = np.stack(
                 [self.hiddens[c * chunk_len, :, e] for c, e in chosen],
                 axis=1,
-            )  # (num_layers, B, H)
+            )
 
             yield {
                 "obs": {k: _slice_seq(v) for k, v in self.obs.items()},
@@ -566,8 +744,43 @@ class RolloutBuffer:
                 "advantages": _slice_seq(self.advantages),
                 "returns": _slice_seq(self.returns),
                 "episode_starts": _slice_seq(self.episode_starts),
+                "priv_features": _slice_seq(self.priv_features),
+                "aux_targets": _slice_seq(self.aux_targets),
                 "init_hidden": init_hidden,
             }
+
+
+def _policy_step(
+    policy: Any,
+    obs_t: dict[str, Any],
+    prev_t: Any,
+    hidden: Any,
+    deterministic: bool,
+    asymmetric_critic: Any = None,
+    feature_hook: Any = None,
+    priv_t: Any = None,
+):
+    import torch
+    import torch.nn.functional as F
+
+    if hasattr(policy, "sample_action"):
+        act_t, log_prob_t, blind_val, next_hidden = policy.sample_action(
+            obs_t, prev_t, hidden, deterministic=deterministic
+        )
+    else:
+        logits, blind_val, next_hidden = policy.act_step(obs_t, prev_t, hidden)
+        if deterministic:
+            act_t = (logits > 0.0).float()
+        else:
+            act_t = torch.bernoulli(torch.sigmoid(logits))
+        bce = F.binary_cross_entropy_with_logits(logits, act_t, reduction="none")
+        log_prob_t = -bce.sum(dim=-1)
+
+    if asymmetric_critic is not None and feature_hook is not None and priv_t is not None:
+        val = asymmetric_critic(feature_hook.pop(), priv_t)
+    else:
+        val = blind_val
+    return act_t, log_prob_t, val, next_hidden
 
 
 def collect_rollout(
@@ -580,40 +793,52 @@ def collect_rollout(
     episode_starts: np.ndarray,
     device: str | Any,
     deterministic: bool = False,
-) -> tuple[dict[str, np.ndarray], np.ndarray, Any, np.ndarray, list[EpisodeMetrics]]:
-    """Collect `buffer.num_steps` transitions across `vec_env` into `buffer`.
-
-    Handles truncation bootstrapping via `infos[i]["final_obs"]` and zeros hidden state
-    plus `prev_action` on any episode boundary before returning the next rollout state.
-    """
+    *,
+    asymmetric_critic: Any = None,
+    feature_hook: Any = None,
+    curiosity: Any = None,
+) -> tuple[dict[str, np.ndarray], np.ndarray, Any, np.ndarray, list[EpisodeMetrics], np.ndarray]:
+    """Collect `buffer.num_steps` transitions, returning `(obs, prev_action, hidden, starts, eps, last_values)`."""
     import torch
-    import torch.nn.functional as F
 
     from submission.obs import obs_to_torch
 
     completed_episodes: list[EpisodeMetrics] = []
+    intrinsic_rewards_sum = 0.0
     policy.eval()
+    if asymmetric_critic is not None:
+        asymmetric_critic.eval()
 
     with torch.no_grad():
+        priv_batch, aux_batch = vec_env.get_privileged_batch()
+
         for step in range(buffer.num_steps):
             hidden_before = hidden.detach().cpu().numpy()
             obs_t = obs_to_torch(obs, device)
             prev_t = torch.as_tensor(prev_action, dtype=torch.float32, device=device)
+            priv_t = torch.as_tensor(priv_batch, dtype=torch.float32, device=device)
 
-            logits, value, next_hidden = policy.act_step(obs_t, prev_t, hidden)
-            if deterministic:
-                act_t = (logits > 0.0).float()
-            else:
-                probs = torch.sigmoid(logits)
-                act_t = torch.bernoulli(probs)
-
-            bce = F.binary_cross_entropy_with_logits(logits, act_t, reduction="none")
-            log_prob = (-bce.sum(dim=-1)).cpu().numpy()
+            act_t, log_prob_t, value, next_hidden = _policy_step(
+                policy,
+                obs_t,
+                prev_t,
+                hidden,
+                deterministic=deterministic,
+                asymmetric_critic=asymmetric_critic,
+                feature_hook=feature_hook,
+                priv_t=priv_t,
+            )
+            log_prob = log_prob_t.cpu().numpy().astype(np.float32)
             action_np = act_t.cpu().numpy().astype(np.float32)
             value_np = value.cpu().numpy().astype(np.float32)
 
             next_obs, rewards, terminated, truncated, infos = vec_env.step(action_np.astype(np.int8))
             done = terminated | truncated
+
+            if curiosity is not None:
+                intr = curiosity.compute_reward(next_obs)
+                intrinsic_rewards_sum += float(np.mean(intr))
+                rewards = rewards + intr
 
             bootstrap_values = np.zeros(vec_env.num_envs, dtype=np.float32)
             trunc_only_indices = [
@@ -624,7 +849,20 @@ def collect_rollout(
                 final_obs_t = obs_to_torch(final_batch, device)
                 final_prev_t = act_t[trunc_only_indices]
                 final_h_t = next_hidden[:, trunc_only_indices, :]
-                _, boot_vals, _ = policy.act_step(final_obs_t, final_prev_t, final_h_t)
+                final_priv_t = None
+                if asymmetric_critic is not None:
+                    final_priv_np = np.stack([infos[i]["final_priv_features"] for i in trunc_only_indices], axis=0)
+                    final_priv_t = torch.as_tensor(final_priv_np, dtype=torch.float32, device=device)
+                _, _, boot_vals, _ = _policy_step(
+                    policy,
+                    final_obs_t,
+                    final_prev_t,
+                    final_h_t,
+                    deterministic=deterministic,
+                    asymmetric_critic=asymmetric_critic,
+                    feature_hook=feature_hook,
+                    priv_t=final_priv_t,
+                )
                 for idx_pos, env_idx in enumerate(trunc_only_indices):
                     bootstrap_values[env_idx] = float(boot_vals[idx_pos].item())
 
@@ -645,9 +883,10 @@ def collect_rollout(
                 bootstrap_value=bootstrap_values,
                 episode_start=episode_starts,
                 hidden=hidden_before,
+                priv_features=priv_batch,
+                aux_targets=aux_batch,
             )
 
-            # Reset recurrent state & prev_action at episode boundaries for the NEXT step.
             if np.any(done):
                 keep_np = (~done).astype(np.float32)
                 keep_t = torch.as_tensor(keep_np, device=device).view(1, -1, 1)
@@ -660,11 +899,22 @@ def collect_rollout(
             prev_action = next_prev_action
             hidden = next_hidden
             episode_starts = done.copy()
+            priv_batch, aux_batch = vec_env.get_privileged_batch()
 
-        # Bootstrap value for the final rollout state (step T)
         obs_last_t = obs_to_torch(obs, device)
         prev_last_t = torch.as_tensor(prev_action, dtype=torch.float32, device=device)
-        _, last_values_t, _ = policy.act_step(obs_last_t, prev_last_t, hidden)
+        priv_last_t = torch.as_tensor(priv_batch, dtype=torch.float32, device=device)
+        _, _, last_values_t, _ = _policy_step(
+            policy,
+            obs_last_t,
+            prev_last_t,
+            hidden,
+            deterministic=deterministic,
+            asymmetric_critic=asymmetric_critic,
+            feature_hook=feature_hook,
+            priv_t=priv_last_t,
+        )
         last_values = last_values_t.cpu().numpy().astype(np.float32)
 
+    buffer.last_mean_intrinsic_reward = intrinsic_rewards_sum / float(max(1, buffer.num_steps))
     return obs, prev_action, hidden, episode_starts, completed_episodes, last_values
