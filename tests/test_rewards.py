@@ -145,7 +145,7 @@ def test_exploration_cap_combat_and_reward_hierarchy():
 def test_reward_shaper_on_real_key_door_exit_doom_env():
     from doom_env import make_env
     from doom_env import spaces as S
-    from tests.fixtures import fixture_wad
+    from fixtures import fixture_wad
 
     wad = fixture_wad("############\n#P.r..R...E#\n############")
     env = make_env(wad, "MAP01", episode_ticks=1000, render_buffers=False)

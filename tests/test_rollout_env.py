@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tests.fixtures import fixture_wad
+from fixtures import fixture_wad
 from training.interfaces import EpisodeMetrics, MapSpec
 from training.rollout import RolloutBuffer, SubprocVecDoomEnv, SyncVecDoomEnv, compute_gae
 
