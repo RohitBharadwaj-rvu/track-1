@@ -185,6 +185,8 @@ class EgocentricSpatialMap:
         w_sin = np.sin(world_ray_angles)
 
         # 1. Visited & post-key visited channels (reset ch1 on new key pickup)
+        px_i_arr, py_i_arr = self._to_grid_idx(self.x_odom, self.y_odom)
+        px_i, py_i = int(px_i_arr), int(py_i_arr)
         key_count = int(np.sum(vitals[8:14] > 0.5))
         if key_count > self._prev_key_count:
             self._grid[CH_POST_KEY_VISITED].fill(0.0)
@@ -193,7 +195,6 @@ class EgocentricSpatialMap:
             px_lo, px_hi = max(0, px_i - 1), min(_BACKING_SIZE, px_i + 2)
             py_lo, py_hi = max(0, py_i - 1), min(_BACKING_SIZE, py_i + 2)
             self._grid[CH_ITEMS_KEYS, px_lo:px_hi, py_lo:py_hi] = 0.0
-        px_i, py_i = self._to_grid_idx(self.x_odom, self.y_odom)
         self._grid[CH_VISITED, px_i, py_i] = 1.0
         if key_count > 0:
             self._grid[CH_POST_KEY_VISITED, px_i, py_i] = 1.0

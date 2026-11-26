@@ -12,6 +12,7 @@ import torch
 from doom_env import make_env
 from submission.agent import DoomAgent
 from submission.ego_map import (
+    CH_ITEMS_KEYS,
     CH_LOCKED_DOOR,
     CH_POST_KEY_VISITED,
     CH_VISITED,
@@ -23,6 +24,7 @@ from submission.obs import NUM_ACTIONS
 from submission.policy import PolicyConfig, build_policy, load_checkpoint, save_checkpoint
 from training.interfaces import MapSpec
 from training.rollout import _DoomWorkerSlot
+from training.wad_gen.udmf import build_grid_wad
 
 
 def test_ego_map_odometry_accuracy_and_speed_on_real_env():
@@ -226,3 +228,56 @@ def test_spatial_map_policy_forward_backward_and_checkpoint_roundtrip(tmp_path):
     assert loaded_cfg.use_ego_map is True
     assert loaded_cfg.ego_map_out_dim == 128
     assert loaded.ego_map_encoder is not None
+
+
+def test_ego_map_key_pickup_resets_post_key_and_clears_key_marker(tmp_path):
+    wad = str(build_grid_wad(tmp_path / "key_corridor.wad", "#######\n#P.r.E#\n#######", cell_size=64, player_angle=0))
+    env = make_env(wad, "MAP01", episode_ticks=600, render_buffers=False)
+    ego = EgocentricSpatialMap()
+    try:
+        obs, _ = env.reset(seed=0)
+        ego.reset()
+        zero_act = np.zeros(NUM_ACTIONS, dtype=np.int8)
+        ego.update(obs, zero_act)
+
+        # Synthetic key pickup: stamp nearby item/key marker and stale post-key marker, then trigger key pickup
+        px_i, py_i = (int(v) for v in ego._to_grid_idx(ego.x_odom, ego.y_odom))
+        ego._grid[CH_ITEMS_KEYS, px_i, min(py_i + 1, ego._grid.shape[2] - 1)] = 1.0
+        ego._grid[CH_ITEMS_KEYS, min(px_i + 1, ego._grid.shape[1] - 1), py_i] = 1.0
+        ego._grid[CH_POST_KEY_VISITED, 0, 0] = 1.0
+
+        obs_with_key = {
+            k: (dict(v) if isinstance(v, dict) else np.array(v, copy=True))
+            for k, v in obs.items()
+        }
+        obs_with_key["vitals"][10] = 1.0  # RedCard held
+        ego.update(obs_with_key, zero_act)
+        assert ego._prev_key_count == 1
+        assert float(ego._grid[CH_POST_KEY_VISITED, 0, 0]) == 0.0
+        assert float(ego._grid[CH_POST_KEY_VISITED, px_i, py_i]) == 1.0
+        assert float(
+            ego._grid[
+                CH_ITEMS_KEYS,
+                max(0, px_i - 1) : min(ego._grid.shape[1], px_i + 2),
+                max(0, py_i - 1) : min(ego._grid.shape[2], py_i + 2),
+            ].max()
+        ) == 0.0
+
+        # Real engine key pickup while running forward
+        ego2 = EgocentricSpatialMap()
+        ego2.reset()
+        ego2.update(obs, zero_act)
+        fwd = np.array([1, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int8)
+        picked_up = False
+        for _ in range(25):
+            obs, _, term, trunc, _ = env.step(fwd)
+            ego2.update(obs, fwd)
+            if float(obs["vitals"][10]) > 0.5:
+                picked_up = True
+                break
+            if term or trunc:
+                break
+        assert picked_up, "Expected agent walking down corridor to pick up Red key"
+        assert ego2._prev_key_count >= 1
+    finally:
+        env.close()
