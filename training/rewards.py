@@ -37,16 +37,16 @@ class RewardConfig:
     explore_decay_cells: float = 60.0
     post_key_cell_reward: float = 0.02
     max_post_key_cells: int = 30
-    kill_reward: float = 0.8
-    damage_penalty: float = -0.032
-    death_penalty: float = -5.0
+    kill_reward: float = 1.2
+    damage_penalty: float = -0.050
+    death_penalty: float = -7.0
     door_bounce_penalty: float = -0.25
-    use_waste_penalty: float = -0.008
+    use_waste_penalty: float = -0.004
     use_hold_penalty: float = -0.08
     wasted_ammo_penalty: float = -0.02
     weapon_switch_waste_penalty: float = -0.02
     weapon_pickup_reward: float = 0.6
-    max_pickup_bonus: float = 2.5
+    max_pickup_bonus: float = 3.5
     pbrs_scale: float = 3.0
     pbrs_gamma: float = 1.0
     spin_penalty: float = -0.015
@@ -235,10 +235,10 @@ class RewardShaper:
         pickup = 0.0
         if self._pickup_bonus_earned < cfg.max_pickup_bonus:
             raw_pickup = 0.0
-            if curr_health > self._prev_health and self._prev_health < 80.0:
-                raw_pickup += 0.015 * (curr_health - self._prev_health)
-            if curr_armor > self._prev_armor and self._prev_armor < 50.0:
-                raw_pickup += 0.008 * (curr_armor - self._prev_armor)
+            if curr_health > self._prev_health and self._prev_health < 90.0:
+                raw_pickup += 0.025 * (curr_health - self._prev_health)
+            if curr_armor > self._prev_armor and self._prev_armor < 80.0:
+                raw_pickup += 0.015 * (curr_armor - self._prev_armor)
             if obs is not None and "vitals" in obs:
                 cur_wpn = int(round(float(obs["vitals"][2])))
                 if cur_wpn >= 3 and cur_wpn not in self._owned_weapons:
