@@ -51,6 +51,7 @@ class TrainConfig:
     min_promote_episodes: int = 32
     promote_window_size: int = 48
     tier3_require_exit: bool = True
+    mirror_prob: float = 0.5
     maps: tuple[str, ...] = ()
     num_envs: int = 4
     vec_mode: str = "subproc"  # "subproc" | "sync"
@@ -119,6 +120,7 @@ def _make_vec_env(
     map_weights: list[float] | None = None,
     max_cached_envs: int = 32,
     use_ego_map: bool = False,
+    mirror_prob: float = 0.0,
 ):
     cache_size = max(1, min(int(max_cached_envs), len(map_specs)))
     if vec_mode == "sync":
@@ -131,6 +133,7 @@ def _make_vec_env(
             max_cached_envs=cache_size,
             map_weights=map_weights,
             use_ego_map=use_ego_map,
+            mirror_prob=mirror_prob,
         )
     if vec_mode == "subproc":
         return SubprocVecDoomEnv(
@@ -142,6 +145,7 @@ def _make_vec_env(
             max_cached_envs=cache_size,
             map_weights=map_weights,
             use_ego_map=use_ego_map,
+            mirror_prob=mirror_prob,
         )
     raise ValueError(f"Unsupported vec_mode: {vec_mode!r}")
 
@@ -291,6 +295,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
             map_weights=initial_weights,
             max_cached_envs=cfg.max_cached_envs,
             use_ego_map=use_ego_map,
+            mirror_prob=cfg.mirror_prob,
         ) as vec_env:
             obs = vec_env.reset()
             prev_action = np.zeros((cfg.num_envs, NUM_ACTIONS), dtype=np.float32)
@@ -664,6 +669,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--huber-vloss", dest="use_huber_vloss", action="store_true", default=True)
     p.add_argument("--no-huber-vloss", dest="use_huber_vloss", action="store_false")
     p.add_argument("--huber-delta", type=float, default=5.0)
+    p.add_argument("--mirror-prob", type=float, default=0.5)
     p.add_argument("--no-anneal-lr", action="store_true")
     p.add_argument("--checkpoint-dir", default="training/runs/default")
     p.add_argument("--export-path", default="submission/weights/policy.pt")
@@ -743,6 +749,7 @@ def main(argv: list[str] | None = None) -> None:
         clip_vloss=args.clip_vloss,
         use_huber_vloss=args.use_huber_vloss,
         huber_delta=args.huber_delta,
+        mirror_prob=args.mirror_prob,
         use_asymmetric_critic=args.use_asymmetric_critic,
         aux_coef=args.aux_coef,
         curiosity_coef=args.curiosity_coef,

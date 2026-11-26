@@ -481,6 +481,50 @@ def _build_angled_door_exit(path: Path, rng: random.Random) -> None:
     build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((100, 150, 200)))
 
 
+def _build_key_window_detour(path: Path, rng: random.Random) -> None:
+    """Key visible across an impassable low-ceiling window; player must detour around and return to lock."""
+    def _rect(name: str, x0: float, y0: float, x1: float, y1: float, **kwargs) -> PolygonSector:
+        return PolygonSector(name, ((x0, y0), (x0, y1), (x1, y1), (x1, y0)), **kwargs)
+
+    door_kind, key_card, key_skull = rng.choice((
+        ("door_red", 13, 38),
+        ("door_blue", 5, 40),
+        ("door_yellow", 6, 39),
+    ))
+    key_num = key_skull if rng.random() < 0.5 else key_card
+    bypass_north = rng.choice((True, False))
+    use_bypass_door = rng.random() < 0.5
+    win_ceil = rng.choice((36, 40, 44))
+    span = rng.choice((160.0, 192.0, 224.0))
+    bypass_h = rng.choice((144.0, 176.0, 208.0))
+    room_h = 160.0
+    gap_w = 64.0
+
+    # Bypass corridor either north (+y) or south (-y)
+    by0, by1 = (room_h, room_h + bypass_h) if bypass_north else (-bypass_h, 0.0)
+    sectors: list[PolygonSector] = [
+        _rect("spawn", 0.0, 0.0, span, room_h),
+        _rect("window", span, 0.0, span + gap_w, room_h, height_ceiling=win_ceil),
+        _rect("key_room", span + gap_w, 0.0, 2.0 * span + gap_w, room_h),
+        _rect("bypass_west", 0.0, by0, span, by1),
+        _rect("bypass_mid", span, by0, span + gap_w, by1, kind="door" if use_bypass_door else "room"),
+        _rect("bypass_east", span + gap_w, by0, 2.0 * span + gap_w, by1),
+        _rect("lock", -48.0, 0.0, 0.0, room_h, kind=door_kind),
+        _rect("vestibule", -176.0, 0.0, -48.0, room_h),
+        _rect("exit", -240.0, 0.0, -176.0, room_h, kind="exit"),
+    ]
+    things: list[ThingSpec] = [
+        ThingSpec(span * 0.45, room_h * 0.5, 1, rng.randrange(0, 360, 45)),
+        ThingSpec(1.5 * span + gap_w, room_h * 0.5, key_num, 0),
+    ]
+    if rng.random() < 0.5:
+        things.append(ThingSpec(1.5 * span + gap_w, (by0 + by1) * 0.5, rng.choice((3004, 3001)), 180))
+    ok, errors = verify_polygon_solvability(sectors, things)
+    if not ok:
+        raise ValueError(f"Invalid procedural key-window map: {errors}")
+    build_polygon_wad(path, sectors, things, door_close_delay=rng.choice((100, 150, 200)))
+
+
 def generate_procedural_wad(
     family: str,
     seed: int,
@@ -500,6 +544,9 @@ def generate_procedural_wad(
     if family == "door_exit" and rng.randrange(4) == 0:
         _build_angled_door_exit(out_path, rng)
         return MapSpec(str(out_path), family=family, tier=2, split=split, episode_ticks=2100)
+    if family == "key_return" and return_distance is None and rng.randrange(5) == 0:
+        _build_key_window_detour(out_path, rng)
+        return MapSpec(str(out_path), family=family, tier=3, split=split, episode_ticks=3150)
     if family == "door_exit":
         grid, angle, cell_size = _gen_door_exit_grid(rng)
         tier, ticks = 2, 2100

@@ -17,8 +17,8 @@ EGO_MAP_CHANNELS = 8
 EGO_MAP_SIZE = 25
 EGO_MAP_CELL_SIZE = 64.0  # covers 25 * 64 = 1600x1600 map units centered on player
 
-_BACKING_SIZE = 80
-_BACKING_CELL = 48.0  # 80 * 48 = 3840x3840 map units (±1920 around spawn)
+_BACKING_SIZE = 128
+_BACKING_CELL = 48.0  # 128 * 48 = 6144x6144 map units (±3072 around spawn)
 _BACKING_ORIGIN = _BACKING_SIZE // 2
 
 _NUM_RAYS = 64
@@ -56,6 +56,9 @@ _LOCAL_LEFT = (_HALF - _C_GRID) * EGO_MAP_CELL_SIZE
 # Doom turn-speed constants (360 / 65536 * 320 and * 640 degrees/tic)
 _SLOW_TURN_DEG = 1.7578125
 _FAST_TURN_DEG = 3.515625
+
+# Intensity for off-crop landmarks projected onto the 25x25 crop perimeter (vs 1.0 in-crop)
+_OFFCROP_BEACON_VAL = 0.65
 
 
 class EgocentricSpatialMap:
@@ -129,7 +132,7 @@ class EgocentricSpatialMap:
         vf, vr = float(vitals[14]), float(vitals[15])
 
         valid_wall = (ray_type == _RAY_WALL) & (ray_dist_m < 980.0)
-        pts = np.stack([ray_dist_m * _RAY_COS, ray_dist_m * _RAY_SIN], axis=1)  # (64, 2) ego (fwd, left)
+        pts = np.stack([ray_dist_m * _RAY_COS, ray_dist_m * _RAY_SIN], axis=1).astype(np.float32)  # (64, 2)
 
         if self._step_count == 0:
             self._prev_vel = (vf, vr)
@@ -142,7 +145,7 @@ class EgocentricSpatialMap:
             dl = -(1.25 * self._prev_vel[1] + 2.50 * vr)
             self._prev_vel = (vf, vr)
 
-            # Refine ego displacement against previous wall rays (cancels wall-snag drift)
+            # Refine ego displacement against previous wall rays (float32, <=32 pts for fast 1-CPU step)
             if (
                 self._prev_pts is not None
                 and self._prev_valid is not None
@@ -150,23 +153,26 @@ class EgocentricSpatialMap:
                 and int(self._prev_valid.sum()) >= 12
             ):
                 d_rad = math.radians(d_deg)
-                c_d, s_d = math.cos(d_rad), math.sin(d_rad)
+                c_d = np.float32(math.cos(d_rad))
+                s_d = np.float32(math.sin(d_rad))
                 p_prev = self._prev_pts[self._prev_valid]
-                p_rot_x = p_prev[:, 0] * c_d + p_prev[:, 1] * s_d
-                p_rot_y = -p_prev[:, 0] * s_d + p_prev[:, 1] * c_d
-                p_rot = np.stack([p_rot_x, p_rot_y], axis=1)
                 p_cur = pts[valid_wall]
+                p_rot = np.empty_like(p_prev)
+                p_rot[:, 0] = p_prev[:, 0] * c_d + p_prev[:, 1] * s_d
+                p_rot[:, 1] = -p_prev[:, 0] * s_d + p_prev[:, 1] * c_d
+                row_idx = np.arange(len(p_cur))
+                thresh2 = np.float32(48.0 * 48.0)
                 for _ in range(2):
-                    shifted = p_cur + np.array([df, dl], dtype=np.float64)
+                    shifted = p_cur + np.array([df, dl], dtype=np.float32)
                     diff = p_rot[None, :, :] - shifted[:, None, :]
                     dist2 = (diff * diff).sum(axis=2)
                     nn_idx = np.argmin(dist2, axis=1)
-                    d_nn = dist2[np.arange(len(p_cur)), nn_idx]
-                    inliers = d_nn < (48.0 * 48.0)
+                    d_nn = dist2[row_idx, nn_idx]
+                    inliers = d_nn < thresh2
                     if int(inliers.sum()) >= 8:
                         delta = (p_rot[nn_idx[inliers]] - shifted[inliers]).mean(axis=0)
-                        df = float(np.clip(df + delta[0], -48.0, 48.0))
-                        dl = float(np.clip(dl + delta[1], -48.0, 48.0))
+                        df = float(np.clip(df + float(delta[0]), -48.0, 48.0))
+                        dl = float(np.clip(dl + float(delta[1]), -48.0, 48.0))
 
             self._prev_pts = pts
             self._prev_valid = valid_wall
@@ -207,12 +213,13 @@ class EgocentricSpatialMap:
         my = self.y_odom + march_dist * w_sin[:, None]
         mgx, mgy = self._to_grid_idx(mx, my)
         self._grid[CH_FREE, mgx, mgy] = 1.0
-        # Clear door/locked-door flags in cells well short of the ray hit (dist_m - 48)
-        clear_mask = march_dist < np.maximum(0.0, ray_dist_m[:, None] - 48.0)
+        # Clear door flags well short of ray hit; never erase CH_LOCKED_DOOR while holding 0 keys
+        clear_mask = march_dist < np.maximum(0.0, ray_dist_m[:, None] - 56.0)
         if np.any(clear_mask):
             cgx, cgy = mgx[clear_mask], mgy[clear_mask]
             self._grid[CH_DOOR, cgx, cgy] = 0.0
-            self._grid[CH_LOCKED_DOOR, cgx, cgy] = 0.0
+            if key_count > 0:
+                self._grid[CH_LOCKED_DOOR, cgx, cgy] = 0.0
 
         # 3. Ray endpoints: walls (1), unlocked doors (2), locked doors (3), enemy rays (4)
         hit_x = self.x_odom + ray_dist_m * w_cos
@@ -275,9 +282,33 @@ class EgocentricSpatialMap:
                     self._grid[CH_ITEMS_KEYS, egx[is_supply], egy[is_supply]], 0.45
                 )
 
-        # 5. Extract zero-blur ego-aligned crop (8, 25, 25) as uint8
+        # 5. Extract zero-blur ego-aligned crop (8, 25, 25)
         crop_wx = self.x_odom + _LOCAL_FWD * c_y - _LOCAL_LEFT * s_y
         crop_wy = self.y_odom + _LOCAL_FWD * s_y + _LOCAL_LEFT * c_y
         cgx, cgy = self._to_grid_idx(crop_wx, crop_wy)
         crop = self._grid[:, cgx, cgy]
+
+        # 5b. Project off-crop stamped locked doors & keys onto the 25x25 perimeter ring so
+        # long key-return routes (>800u) retain an egocentric bearing cue to already-seen locks/keys.
+        for ch, thresh in ((CH_LOCKED_DOOR, 0.5), (CH_ITEMS_KEYS, 0.9)):
+            gx_arr, gy_arr = np.nonzero(self._grid[ch] >= thresh)
+            if gx_arr.size == 0:
+                continue
+            wx = (gx_arr.astype(np.float64) - _BACKING_ORIGIN) * _BACKING_CELL
+            wy = (gy_arr.astype(np.float64) - _BACKING_ORIGIN) * _BACKING_CELL
+            dx = wx - self.x_odom
+            dy = wy - self.y_odom
+            lfwd = dx * c_y + dy * s_y
+            lleft = -dx * s_y + dy * c_y
+            r_f = _HALF - lfwd / EGO_MAP_CELL_SIZE
+            c_f = _HALF - lleft / EGO_MAP_CELL_SIZE
+            outside = (r_f < 0.0) | (r_f > EGO_MAP_SIZE - 1) | (c_f < 0.0) | (c_f > EGO_MAP_SIZE - 1)
+            if np.any(outside):
+                dr = r_f[outside] - _HALF
+                dc = c_f[outside] - _HALF
+                scale = _HALF / np.maximum(np.maximum(np.abs(dr), np.abs(dc)), 1e-6)
+                br = np.clip(np.rint(_HALF + dr * scale).astype(np.intp), 0, EGO_MAP_SIZE - 1)
+                bc = np.clip(np.rint(_HALF + dc * scale).astype(np.intp), 0, EGO_MAP_SIZE - 1)
+                crop[ch, br, bc] = np.maximum(crop[ch, br, bc], _OFFCROP_BEACON_VAL)
+
         return np.clip(crop * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)

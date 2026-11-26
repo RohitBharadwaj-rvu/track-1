@@ -95,6 +95,37 @@ def test_pbrs_fails_safe_on_missing_wad():
     assert pbrs.step({"x": 64.0, "y": 0.0, "keys": np.zeros(6)}) == 0.0
 
 
+def test_pbrs_routes_around_impassable_window_and_reaches_wall_exit_switches():
+    # key_window has an impassable height_ceiling=40 window between spawn and blue skull -> strictly longer geodesic than key_open
+    p_open = GeodesicPBRS("maps/stress/key_open.wad", "MAP01", scale=3.0, gamma=1.0)
+    p_win = GeodesicPBRS("maps/stress/key_window.wad", "MAP01", scale=3.0, gamma=1.0)
+    env_open = make_env("maps/stress/key_open.wad", "MAP01", episode_ticks=200, render_buffers=False)
+    env_win = make_env("maps/stress/key_window.wad", "MAP01", episode_ticks=200, render_buffers=False)
+    try:
+        env_open.reset(seed=0)
+        env_win.reset(seed=0)
+        p_open.reset(env_open.privileged_state())
+        p_win.reset(env_win.privileged_state())
+        assert p_open._prev_stage_key == ("key", ())
+        assert p_win._prev_stage_key == ("key", ())
+        # Higher detour distance (+~98u around y=160 window) -> strictly lower potential on key_window
+        assert p_win._prev_phi < p_open._prev_phi - 0.05
+    finally:
+        env_open.close()
+        env_win.close()
+
+    # Wall exit switch must also have a reachable exit potential
+    p_sw = GeodesicPBRS("maps/stress/exit_switch.wad", "MAP01", scale=3.0, gamma=1.0)
+    env_sw = make_env("maps/stress/exit_switch.wad", "MAP01", episode_ticks=200, render_buffers=False)
+    try:
+        env_sw.reset(seed=0)
+        p_sw.reset(env_sw.privileged_state())
+        assert p_sw._prev_stage_key == ("exit",)
+        assert p_sw._prev_phi > 0.0
+    finally:
+        env_sw.close()
+
+
 def test_pbrs_never_rewards_standing_still(tmp_path):
     wad = str(
         build_grid_wad(

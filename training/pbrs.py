@@ -49,7 +49,9 @@ _KEY_THING_TO_COLOR: dict[int, int] = {
 
 _EXIT_SPECIALS = {11, 52, 243, 244}
 _INF = 1e9
-_MAX_POTENTIAL_DIST = 4.0
+_MAX_POTENTIAL_DIST = 6.0
+_PLAYER_HEIGHT = 56.0
+_MAX_STEP_UP = 24.0
 
 
 def _segments_intersect_batch(
@@ -140,16 +142,6 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
 
     one_sided = (front < 0) | (back < 0)
     solid_mask = one_sided | imp
-    solid_p1 = p1[solid_mask]
-    solid_p2 = p2[solid_mask]
-
-    # Locked door boundary segments
-    locked_sectors = {sid: lock for sid, lock in info.door_sectors.items() if lock > 0}
-    lock_line_idx: list[tuple[int, int, int]] = []  # (line_idx, sid, lock)
-    for sid, lock in locked_sectors.items():
-        m = ((front == sid) | (back == sid)) & (~solid_mask)
-        for li in np.flatnonzero(m).tolist():
-            lock_line_idx.append((li, sid, lock))
 
     exit_pts: list[tuple[float, float]] = []
     key_pts: list[tuple[float, float, int]] = []
@@ -160,13 +152,41 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
         sides = blocks.get("sidedef", [])
         sectors = blocks.get("sector", [])
 
+        # Block two-sided non-door linedefs whose opening < PLAYER_HEIGHT (windows) or |step| > MAX_STEP_UP (ledges)
+        if sectors:
+            sec_hf = np.array([float(s.get("heightfloor", 0.0)) for s in sectors], dtype=np.float64)
+            sec_hc = np.array([float(s.get("heightceiling", 128.0)) for s in sectors], dtype=np.float64)
+            n_sec = len(sectors)
+            door_sec_set = set(info.door_sectors.keys())
+            two_sided_idx = np.flatnonzero((~solid_mask) & (front >= 0) & (back >= 0) & (front < n_sec) & (back < n_sec))
+            for li in two_sided_idx.tolist():
+                sa, sb = int(front[li]), int(back[li])
+                if sa in door_sec_set or sb in door_sec_set:
+                    continue
+                opening = min(sec_hc[sa], sec_hc[sb]) - max(sec_hf[sa], sec_hf[sb])
+                step = abs(sec_hf[sa] - sec_hf[sb])
+                if opening < _PLAYER_HEIGHT or step > _MAX_STEP_UP:
+                    solid_mask[li] = True
+
         # Exits via exit linedef special or GATE3 floor sector
         for ld in blocks.get("linedef", []):
             spec = int(ld.get("special", 0) or 0)
             if spec in _EXIT_SPECIALS:
                 v1, v2 = int(ld.get("v1", -1)), int(ld.get("v2", -1))
                 if 0 <= v1 < len(verts) and 0 <= v2 < len(verts):
-                    exit_pts.append(((verts[v1][0] + verts[v2][0]) * 0.5, (verts[v1][1] + verts[v2][1]) * 0.5))
+                    x1, y1 = verts[v1]
+                    x2, y2 = verts[v2]
+                    mx, my = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+                    # For one-sided wall switches, offset 16u inward onto the front-side walkable room
+                    sb = ld.get("sideback", -1)
+                    if not (isinstance(sb, int) and sb >= 0):
+                        seg_len = math.hypot(x2 - x1, y2 - y1)
+                        if seg_len > 1e-6:
+                            # Doom front-side normal is to the right of v1 -> v2: (dy/L, -dx/L)
+                            nx_in = (y2 - y1) / seg_len
+                            ny_in = -(x2 - x1) / seg_len
+                            exit_pts.append((mx + 16.0 * nx_in, my + 16.0 * ny_in))
+                    exit_pts.append((mx, my))
 
         exit_sec_ids = {
             i for i, sec in enumerate(sectors) if str(sec.get("texturefloor", "")).upper() == "GATE3"
@@ -193,6 +213,17 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
             t_id = int(th.get("type", 0) or 0)
             if t_id in _KEY_THING_TO_COLOR:
                 key_pts.append((float(th.get("x", 0.0)), float(th.get("y", 0.0)), _KEY_THING_TO_COLOR[t_id]))
+
+    solid_p1 = p1[solid_mask]
+    solid_p2 = p2[solid_mask]
+
+    # Locked door boundary segments
+    locked_sectors = {sid: lock for sid, lock in info.door_sectors.items() if lock > 0}
+    lock_line_idx: list[tuple[int, int, int]] = []  # (line_idx, sid, lock)
+    for sid, lock in locked_sectors.items():
+        m = ((front == sid) | (back == sid)) & (~solid_mask)
+        for li in np.flatnonzero(m).tolist():
+            lock_line_idx.append((li, sid, lock))
 
     if not exit_pts:
         _NAV_CACHE[cache_key] = None

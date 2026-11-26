@@ -281,3 +281,33 @@ def test_ego_map_key_pickup_resets_post_key_and_clears_key_marker(tmp_path):
         assert ego2._prev_key_count >= 1
     finally:
         env.close()
+
+
+def test_ego_map_offcrop_locked_door_beacon_and_prekey_protection():
+    ego = EgocentricSpatialMap()
+    ego.reset()
+    # Stamp a locked door 1600u behind the player (outside the +-800u 25x25 crop)
+    ego.x_odom = 1600.0
+    ego.y_odom = 0.0
+    ego.yaw_odom_deg = 0.0  # facing +x, so locked door at x=0 is straight behind -> bottom edge (row=24, col=12)
+    gx0, gy0 = ego._to_grid_idx(0.0, 0.0)
+    ego._grid[CH_LOCKED_DOOR, int(gx0), int(gy0)] = 1.0
+
+    # Dummy observation with 0 keys held and open rays passing through x=0 -> must NOT erase locked door pre-key
+    raw_obs = {
+        "vitals": np.zeros(17, dtype=np.float32),
+        "rays": {
+            "distance": np.ones(64, dtype=np.float32),
+            "hit_type": np.zeros(64, dtype=np.int64),
+        },
+        "visible_entities": {
+            "features": np.zeros((32, 5), dtype=np.float32),
+            "entity_type": np.zeros(32, dtype=np.int64),
+            "mask": np.zeros(32, dtype=np.int8),
+        },
+    }
+    crop = ego.update(raw_obs, np.zeros(NUM_ACTIONS, dtype=np.int8))
+    # Locked door survives pre-key ray-march and projects onto the bottom center edge of the 25x25 crop
+    assert float(ego._grid[CH_LOCKED_DOOR, int(gx0), int(gy0)]) == 1.0
+    assert int(crop[CH_LOCKED_DOOR, EGO_MAP_SIZE - 1, EGO_MAP_SIZE // 2]) >= 150
+    assert int(crop[CH_LOCKED_DOOR, 0, EGO_MAP_SIZE // 2]) == 0
