@@ -23,6 +23,10 @@ class CurriculumConfig:
     min_episodes_to_promote: int = 16
     tier12_exit_promote_threshold: float = 0.40
     tier3_progress_promote_threshold: float = 0.30
+    tier3_require_exit: bool = False
+    adaptive_weights: bool = False
+    adaptive_window: int = 16
+    adaptive_floor: float = 0.15
 
 
 class CurriculumScheduler:
@@ -33,6 +37,7 @@ class CurriculumScheduler:
         self.phase = 0
         self._t12_exits: deque[float] = deque(maxlen=self.config.window_size)
         self._t3_progress: deque[float] = deque(maxlen=self.config.window_size)
+        self._map_exits: dict[str, deque[float]] = {}
 
     def current_tier_weights(self) -> dict[int, float]:
         if self.config.tier_weights is not None:
@@ -55,13 +60,26 @@ class CurriculumScheduler:
         for spec in map_specs:
             tw = float(tier_w.get(spec.tier, 1.0)) / float(max(1, tier_counts[spec.tier]))
             fw = float(fam_w.get(spec.family, 1.0))
-            raw.append(max(1e-6, tw * fw))
+            aw = 1.0
+            if self.config.adaptive_weights and spec.wad in self._map_exits and len(self._map_exits[spec.wad]) > 0:
+                hist = self._map_exits[spec.wad]
+                exit_rate = sum(hist) / len(hist)
+                aw = max(self.config.adaptive_floor, 1.0 - exit_rate + self.config.adaptive_floor)
+            raw.append(max(1e-6, tw * fw * aw))
 
         total = float(sum(raw))
         return [w / total for w in raw]
 
     def observe_episodes(self, episodes: list[EpisodeMetrics]) -> bool:
         """Record completed episodes and advance curriculum phase if mastery criteria are met."""
+        for ep in episodes:
+            if self.config.adaptive_weights:
+                hist = self._map_exits.get(ep.wad)
+                if hist is None:
+                    hist = deque(maxlen=self.config.adaptive_window)
+                    self._map_exits[ep.wad] = hist
+                hist.append(1.0 if ep.outcome == "exit" else 0.0)
+
         if not self.config.auto_curriculum or self.config.tier_weights is not None:
             return False
 
@@ -69,7 +87,11 @@ class CurriculumScheduler:
             if ep.tier in (1, 2):
                 self._t12_exits.append(1.0 if ep.outcome == "exit" else 0.0)
             elif ep.tier == 3:
-                progressed = (ep.outcome == "exit") or (ep.locked_doors_unlocked > 0)
+                progressed = (
+                    (ep.outcome == "exit")
+                    if self.config.tier3_require_exit
+                    else ((ep.outcome == "exit") or (ep.locked_doors_unlocked > 0))
+                )
                 self._t3_progress.append(1.0 if progressed else 0.0)
 
         min_eps = self.config.min_episodes_to_promote

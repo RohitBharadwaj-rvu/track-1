@@ -168,13 +168,19 @@ def test_use_waste_door_bounce_and_combat_resource_rewards():
     assert c_ammo["ammo_waste"] == pytest.approx(cfg.wasted_ammo_penalty)
     assert c_ammo["pickup"] > 0.0
 
-    # 4. Damage rebalance: taking 20 HP fireball outweighs kill_reward (0.5 + 20 * -0.035 = -0.20 < 0)
+    # 4. Rebalanced combat: killing an enemy while taking one 20 HP hit stays positive (no combat cowardice),
+    # while dying after heavy damage remains strongly negative.
     _, _, c_trade = shaper.step(
         _priv(tic=20, health=50.0, armor=30.0, kills=1, damage_taken=20.0, sector_ceiling=[4.0, 0.0, 128.0]),
         obs=_obs(bullets=48.0, enemy_visible=True),
     )
     assert c_trade["ammo_waste"] == pytest.approx(0.0)
-    assert c_trade["kill"] + c_trade["damage"] < 0.0
+    assert c_trade["kill"] + c_trade["damage"] > 0.0
+    _, _, c_dead = shaper.step(
+        _priv(tic=24, health=0.0, dead=True, damage_taken=50.0, sector_ceiling=[4.0, 0.0, 128.0]),
+        obs=_obs(bullets=48.0, enemy_visible=True),
+    )
+    assert c_dead["death"] + c_dead["damage"] < -1.0
 
 
 def test_reward_shaper_on_real_key_door_exit_doom_env():

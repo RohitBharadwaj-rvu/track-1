@@ -21,24 +21,27 @@ _ENEMY_ENTITY_TYPES = (1, 2, 3)
 class RewardConfig:
     """Hierarchical reward weights keeping exit completion dominant over exploration & combat."""
 
-    exit_reward: float = 10.0
-    efficiency_bonus: float = 2.0
+    exit_reward: float = 12.0
+    efficiency_bonus: float = 2.5
     health_efficiency_bonus: float = 1.5
-    key_pickup_reward: float = 3.0
-    locked_door_unlock_reward: float = 4.0
-    door_open_reward: float = 1.5
-    new_cell_reward: float = 0.12
+    key_pickup_reward: float = 4.0
+    locked_door_unlock_reward: float = 5.0
+    door_open_reward: float = 2.0
+    new_cell_reward: float = 0.10
     max_exploration_cells: int = 250
-    explore_decay_cells: float = 25.0
-    post_key_cell_reward: float = 0.06
-    max_post_key_cells: int = 60
-    kill_reward: float = 0.5
-    damage_penalty: float = -0.035
-    death_penalty: float = -2.5
-    door_bounce_penalty: float = -0.15
-    use_waste_penalty: float = -0.02
-    wasted_ammo_penalty: float = -0.005
-    max_pickup_bonus: float = 2.0
+    explore_decay_cells: float = 60.0
+    post_key_cell_reward: float = 0.08
+    max_post_key_cells: int = 80
+    kill_reward: float = 1.5
+    damage_penalty: float = -0.018
+    death_penalty: float = -3.0
+    door_bounce_penalty: float = -0.25
+    use_waste_penalty: float = -0.015
+    wasted_ammo_penalty: float = -0.008
+    weapon_pickup_reward: float = 0.6
+    max_pickup_bonus: float = 2.5
+    pbrs_scale: float = 2.0
+    pbrs_gamma: float = 0.995
     step_penalty: float = -0.002
     cell_size: float = 64.0
     open_threshold: float = 8.0
@@ -70,8 +73,9 @@ def _has_visible_enemy(obs: dict[str, Any] | None) -> bool:
 class RewardShaper:
     """Computes dense, bounded per-step training rewards from `env.privileged_state()`."""
 
-    def __init__(self, config: RewardConfig | None = None):
+    def __init__(self, config: RewardConfig | None = None, *, pbrs: Any = None):
         self.config = config or RewardConfig()
+        self.pbrs = pbrs
         self.tracker = PrivilegedEventTracker(
             open_threshold=self.config.open_threshold,
             cell_size=self.config.cell_size,
@@ -83,6 +87,7 @@ class RewardShaper:
         self._prev_health: float = 100.0
         self._prev_armor: float = 0.0
         self._prev_ammo: float | None = None
+        self._owned_weapons: set[int] = set()
         self._pickup_bonus_earned: float = 0.0
 
     @property
@@ -99,7 +104,9 @@ class RewardShaper:
             int(np.floor(float(priv_state["y"]) / self.config.cell_size)),
         )
 
-    def reset(self, priv_state: dict[str, Any], obs: dict[str, Any] | None = None) -> None:
+    def reset(self, priv_state: dict[str, Any], obs: dict[str, Any] | None = None, *, pbrs: Any = None) -> None:
+        if pbrs is not None:
+            self.pbrs = pbrs
         self.tracker.reset(priv_state)
         self._post_key_visited_cells = {self._cell(priv_state)}
         self._post_key_explore_count = 0
@@ -110,7 +117,12 @@ class RewardShaper:
         ammo, armor = _extract_ammo_and_armor(priv_state, obs)
         self._prev_armor = armor
         self._prev_ammo = ammo
+        self._owned_weapons = set()
+        if obs is not None and "vitals" in obs:
+            self._owned_weapons.add(int(round(float(obs["vitals"][2]))))
         self._pickup_bonus_earned = 0.0
+        if self.pbrs is not None:
+            self.pbrs.reset(priv_state)
 
     def step(
         self,
@@ -206,9 +218,16 @@ class RewardShaper:
                 raw_pickup += 0.015 * (curr_health - self._prev_health)
             if curr_armor > self._prev_armor and self._prev_armor < 50.0:
                 raw_pickup += 0.008 * (curr_armor - self._prev_armor)
+            if obs is not None and "vitals" in obs:
+                cur_wpn = int(round(float(obs["vitals"][2])))
+                if cur_wpn >= 3 and cur_wpn not in self._owned_weapons:
+                    self._owned_weapons.add(cur_wpn)
+                    raw_pickup += cfg.weapon_pickup_reward
             if raw_pickup > 0.0:
                 pickup = min(raw_pickup, cfg.max_pickup_bonus - self._pickup_bonus_earned)
                 self._pickup_bonus_earned += pickup
+
+        pbrs_rew = self.pbrs.step(priv_state) if self.pbrs is not None else 0.0
 
         self._prev_health = curr_health
         self._prev_armor = curr_armor
@@ -229,6 +248,7 @@ class RewardShaper:
             "use_penalty": use_penalty,
             "ammo_waste": ammo_waste,
             "pickup": pickup,
+            "pbrs": pbrs_rew,
             "time": cfg.step_penalty,
         }
         return float(sum(components.values())), events, components

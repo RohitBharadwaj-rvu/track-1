@@ -31,10 +31,10 @@ class PPOConfig:
     num_minibatches: int = 4
     target_kl: float | None = 0.03
     normalize_advantages: bool = True
-    clip_vloss: bool = True
+    clip_vloss: bool = False
     use_asymmetric_critic: bool = True
     aux_coef: float = 0.2
-    curiosity_coef: float = 0.02
+    curiosity_coef: float = 0.0
     detach_asymmetric_critic_feat: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,6 +57,7 @@ class RecurrentPPOTrainer:
     ):
         self.policy = policy
         self.config = config or PPOConfig()
+        self._ent_coef = float(self.config.ent_coef)
         self.device = torch.device(device)
         hidden_dim = int(getattr(getattr(policy, "config", None), "hidden_size", 256))
 
@@ -93,6 +94,9 @@ class RecurrentPPOTrainer:
     def set_lr(self, lr: float) -> None:
         for group in self.optimizer.param_groups:
             group["lr"] = float(lr)
+
+    def set_ent_coef(self, ent_coef: float) -> None:
+        self._ent_coef = float(ent_coef)
 
     def close(self) -> None:
         if self.feature_hook is not None:
@@ -158,7 +162,7 @@ class RecurrentPPOTrainer:
                     v_loss = 0.5 * ((new_value - ret) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - cfg.ent_coef * entropy_loss + cfg.vf_coef * v_loss
+                loss = pg_loss - self._ent_coef * entropy_loss + cfg.vf_coef * v_loss
 
                 if self.aux_head is not None and cfg.aux_coef > 0.0 and feat_seq is not None:
                     aux_targets = torch.as_tensor(mb["aux_targets"], dtype=torch.float32, device=self.device)

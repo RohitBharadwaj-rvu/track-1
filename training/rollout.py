@@ -17,6 +17,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from submission.ego_map import EGO_MAP_CHANNELS, EGO_MAP_SIZE, EgocentricSpatialMap
 from submission.obs import (
     MAX_ENTITIES,
     NUM_ACTIONS,
@@ -27,6 +28,7 @@ from submission.obs import (
     preprocess_obs,
 )
 from training.interfaces import EpisodeMetrics, MapSpec
+from training.pbrs import GeodesicPBRS
 from training.rewards import RewardConfig, RewardShaper
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -111,6 +113,7 @@ def resolve_train_maps(
                     out_dir,
                     count_per_family=int(procedural_per_family),
                     base_seed=int(procedural_seed),
+                    families=("door_exit", "combat", "multi_room", "key_return", "gauntlet"),
                 )
                 specs = [*specs, *proc_specs]
         except ModuleNotFoundError:
@@ -153,6 +156,7 @@ class _DoomWorkerSlot:
         render_buffers: bool = False,
         max_cached_envs: int = 32,
         map_weights: Sequence[float] | None = None,
+        use_ego_map: bool = False,
     ):
         if not map_specs:
             raise ValueError("map_specs must not be empty")
@@ -162,6 +166,9 @@ class _DoomWorkerSlot:
         self.shaper = RewardShaper(reward_config)
         self.render_buffers = render_buffers
         self.max_cached_envs = max(1, max_cached_envs)
+        self.use_ego_map = bool(use_ego_map)
+        self._ego_map = EgocentricSpatialMap() if self.use_ego_map else None
+        self._pbrs_cache: dict[tuple[str, str], GeodesicPBRS | None] = {}
         self._rng = np.random.default_rng(base_seed + slot_id * 10007)
         self._episode_counter = 0
         self._envs: OrderedDict[tuple[str, str, int], Any] = OrderedDict()
@@ -180,6 +187,28 @@ class _DoomWorkerSlot:
         self._locked_door_xy: tuple[float, float] | None = None
         self._last_priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
         self._last_aux_targets = np.zeros(AUX_TARGET_DIM, dtype=np.float32)
+
+    def _get_pbrs(self, spec: MapSpec) -> GeodesicPBRS | None:
+        cfg = self.shaper.config
+        if cfg.pbrs_scale <= 0.0:
+            return None
+        wad_path = _resolve_wad_path(spec.wad)
+        key = (wad_path, spec.map_name.upper())
+        if key not in self._pbrs_cache:
+            pbrs = GeodesicPBRS(
+                wad_path,
+                spec.map_name,
+                scale=cfg.pbrs_scale,
+                gamma=cfg.pbrs_gamma,
+            )
+            self._pbrs_cache[key] = pbrs if pbrs.graph is not None else None
+        return self._pbrs_cache[key]
+
+    def _preprocess_with_ego(self, raw_obs: dict[str, Any], action_for_ego: np.ndarray) -> dict[str, np.ndarray]:
+        prep = preprocess_obs(raw_obs)
+        if self._ego_map is not None:
+            prep["ego_map"] = self._ego_map.update(raw_obs, action_for_ego)
+        return prep
 
     def set_map_weights(self, weights: Sequence[float]) -> None:
         self.map_probs = _normalize_weights(weights, len(self.map_specs))
@@ -268,7 +297,7 @@ class _DoomWorkerSlot:
 
         raw_obs, _ = env.reset(seed=self._current_seed)
         priv = env.privileged_state()
-        self.shaper.reset(priv, obs=raw_obs)
+        self.shaper.reset(priv, obs=raw_obs, pbrs=self._get_pbrs(spec))
         self._steps = 0
         self._total_reward = 0.0
         self._keys_picked_up = 0
@@ -277,9 +306,11 @@ class _DoomWorkerSlot:
         self._kills = 0
         self._damage_taken = 0.0
         self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
+        if self._ego_map is not None:
+            self._ego_map.reset()
         self._locked_door_xy = None
         self._last_priv_features, self._last_aux_targets = self._update_door_sighting_and_features(raw_obs, priv)
-        return preprocess_obs(raw_obs)
+        return self._preprocess_with_ego(raw_obs, self._prev_action)
 
     def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         if self._active_env is None:
@@ -306,7 +337,7 @@ class _DoomWorkerSlot:
 
         info: dict[str, Any] = {}
         if terminated or truncated:
-            final_obs = preprocess_obs(raw_obs)
+            final_obs = self._preprocess_with_ego(raw_obs, act)
             if priv.get("exit_reached"):
                 outcome = "exit"
             elif priv.get("dead"):
@@ -342,7 +373,7 @@ class _DoomWorkerSlot:
             self._last_aux_targets = aux_t
             info["priv_features"] = priv_f
             info["aux_targets"] = aux_t
-            next_obs = preprocess_obs(raw_obs)
+            next_obs = self._preprocess_with_ego(raw_obs, act)
         return next_obs, float(reward), bool(terminated), bool(truncated), info
 
     def close(self) -> None:
@@ -367,6 +398,7 @@ class SyncVecDoomEnv:
         num_envs: int | None = None,
         max_cached_envs: int = 32,
         map_weights: Sequence[float] | None = None,
+        use_ego_map: bool = False,
     ):
         self.num_envs = num_envs if num_envs is not None else max(1, len(map_specs))
         self.slots = [
@@ -378,6 +410,7 @@ class SyncVecDoomEnv:
                 render_buffers=render_buffers,
                 max_cached_envs=max_cached_envs,
                 map_weights=map_weights,
+                use_ego_map=use_ego_map,
             )
             for i in range(self.num_envs)
         ]
@@ -439,6 +472,7 @@ def _worker_loop(
     render_buffers: bool,
     max_cached_envs: int,
     map_weights: Sequence[float] | None,
+    use_ego_map: bool = False,
 ) -> None:
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(var, "1")
@@ -450,6 +484,7 @@ def _worker_loop(
         render_buffers=render_buffers,
         max_cached_envs=max_cached_envs,
         map_weights=map_weights,
+        use_ego_map=use_ego_map,
     )
     try:
         while True:
@@ -486,6 +521,7 @@ class SubprocVecDoomEnv:
         num_envs: int = 4,
         max_cached_envs: int = 32,
         map_weights: Sequence[float] | None = None,
+        use_ego_map: bool = False,
     ):
         self.num_envs = int(num_envs)
         ctx = mp.get_context("spawn")
@@ -507,6 +543,7 @@ class SubprocVecDoomEnv:
                     render_buffers,
                     max_cached_envs,
                     map_weights,
+                    use_ego_map,
                 ),
                 daemon=True,
             )
@@ -618,7 +655,14 @@ def compute_gae(
 class RolloutBuffer:
     """Stores contiguous `(T, N, ...)` rollouts (incl. optional privileged/aux targets)."""
 
-    def __init__(self, num_steps: int, num_envs: int, hidden_shape: tuple[int, ...]):
+    def __init__(
+        self,
+        num_steps: int,
+        num_envs: int,
+        hidden_shape: tuple[int, ...],
+        *,
+        use_ego_map: bool = False,
+    ):
         self.num_steps = int(num_steps)
         self.num_envs = int(num_envs)
         self.hidden_shape = tuple(hidden_shape)
@@ -632,6 +676,10 @@ class RolloutBuffer:
             "ent_mask": np.zeros((T, N, MAX_ENTITIES), dtype=np.float32),
             "vitals": np.zeros((T, N, NUM_VITALS), dtype=np.float32),
         }
+        if use_ego_map:
+            self.obs["ego_map"] = np.zeros(
+                (T, N, EGO_MAP_CHANNELS, EGO_MAP_SIZE, EGO_MAP_SIZE), dtype=np.uint8
+            )
         self.prev_actions = np.zeros((T, N, NUM_ACTIONS), dtype=np.float32)
         self.actions = np.zeros((T, N, NUM_ACTIONS), dtype=np.float32)
         self.log_probs = np.zeros((T, N), dtype=np.float32)
