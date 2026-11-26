@@ -1,4 +1,4 @@
-"""Integration tests for Role 2 training loop, checkpoint resume, and two-map export."""
+"""Integration tests for Role 2 training loop, curriculum, asymmetric critic, aux, and RND."""
 
 from __future__ import annotations
 
@@ -11,20 +11,23 @@ from training.interfaces import MapSpec
 from training.train import TrainConfig, run_training, verify_checkpoint_two_maps
 
 
-def test_run_training_saves_resumes_and_plays_two_maps(tmp_path):
-    run_dir = tmp_path / "run1"
+def test_run_training_with_curriculum_asym_aux_rnd_resumes_and_plays_two_maps(tmp_path):
+    run_dir = tmp_path / "run_connect"
     export_pt = tmp_path / "weights" / "policy.pt"
     cfg = TrainConfig(
-        arch="stub",
-        hidden_size=32,
-        maps=("maps/two_rooms.wad:MAP01:door_exit:1:120",),
+        arch="telemetry_gru_v1",
+        stage="connect",
+        auto_curriculum=True,
+        use_asymmetric_critic=True,
+        aux_coef=0.2,
+        curiosity_coef=0.02,
         num_envs=2,
         vec_mode="sync",
         rollout_steps=16,
         chunk_len=8,
         num_minibatches=2,
         update_epochs=1,
-        total_steps=64,  # 2 updates * (16 * 2 = 32 steps)
+        total_steps=64,
         seed=0,
         device="cpu",
         checkpoint_dir=str(run_dir),
@@ -34,15 +37,18 @@ def test_run_training_saves_resumes_and_plays_two_maps(tmp_path):
     res1 = run_training(cfg)
     assert res1["optimizer_updates"] == 2
     assert res1["total_decisions"] == 64
+    assert res1["num_maps"] >= 2
     assert export_pt.is_file()
     assert (run_dir / "latest_train_state.pt").is_file()
     assert (run_dir / "metrics.jsonl").is_file()
 
-    # Resume for 2 more updates
+    # Resume for 2 more updates with all training heads restored
     cfg_resume = TrainConfig(
-        arch="stub",
-        hidden_size=32,
-        maps=("maps/two_rooms.wad:MAP01:door_exit:1:120",),
+        arch="telemetry_gru_v1",
+        stage="connect",
+        use_asymmetric_critic=True,
+        aux_coef=0.2,
+        curiosity_coef=0.02,
         num_envs=2,
         vec_mode="sync",
         rollout_steps=16,
@@ -61,7 +67,7 @@ def test_run_training_saves_resumes_and_plays_two_maps(tmp_path):
     assert res2["optimizer_updates"] == 4
     assert res2["total_decisions"] == 128
 
-    # Verify exported weights play 2 consecutive maps with clean memory resets
+    # Verify exported weights reload blindly via DoomAgent across 2 consecutive maps
     eps = verify_checkpoint_two_maps(
         export_pt,
         [MapSpec(wad="maps/two_rooms.wad", map_name="MAP01", family="door_exit", tier=1, episode_ticks=80)],

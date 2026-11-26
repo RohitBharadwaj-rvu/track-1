@@ -207,7 +207,7 @@ def test_evaluate_chunks_matches_step_by_step_with_resets(arch: str, with_resets
 
             obs_t = {k: v[t] for k, v in obs_seq.items()}
             logits_t, value_t, h = policy.act_step(obs_t, prev_a, h)
-            act_t, lp_t = policy.sample_action(logits_t, deterministic=False, generator=gen)
+            act_t, lp_t = policy.sample_from_logits(logits_t, deterministic=False, generator=gen)
             lp_check, ent_t = policy.logprob_and_entropy(logits_t, act_t)
             torch.testing.assert_close(lp_t, lp_check, atol=1e-5, rtol=1e-5)
 
@@ -234,13 +234,19 @@ def test_factorized_action_head_forbids_contradictory_buttons():
     policy.eval()
     logits = torch.randn(512, 12)
     gen = torch.Generator().manual_seed(77)
-    act, lp = policy.sample_action(logits, deterministic=False, generator=gen)
+    act, lp = policy.sample_from_logits(logits, deterministic=False, generator=gen)
     assert act.shape == (512, NUM_ACTIONS)
     assert torch.isfinite(lp).all()
     # Mutually exclusive pairs must never both be 1
     assert not bool(((act[:, 0] > 0.5) & (act[:, 1] > 0.5)).any())
     assert not bool(((act[:, 2] > 0.5) & (act[:, 3] > 0.5)).any())
     assert not bool(((act[:, 4] > 0.5) & (act[:, 5] > 0.5)).any())
+
+    # Also verify Role 2's 4-tuple sample_action(obs, prev_action, hidden) contract
+    obs1 = {k: v.squeeze(0) for k, v in _random_preprocessed_seq(1, 2, seed=9).items()}
+    a2, lp2, val2, h2 = policy.sample_action(obs1, torch.zeros(2, NUM_ACTIONS), policy.init_hidden(2, "cpu"))
+    assert a2.shape == (2, NUM_ACTIONS) and lp2.shape == (2,) and val2.shape == (2,)
+    assert h2.shape == (1, 2, policy.config.hidden_size)
 
 
 def test_sign_verified_entity_kinematics_and_ammo_empty_flag():

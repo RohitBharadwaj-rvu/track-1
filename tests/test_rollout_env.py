@@ -7,7 +7,15 @@ import pytest
 
 from fixtures import fixture_wad
 from training.interfaces import EpisodeMetrics, MapSpec
-from training.rollout import RolloutBuffer, SubprocVecDoomEnv, SyncVecDoomEnv, compute_gae
+from training.rollout import (
+    AUX_TARGET_DIM,
+    PRIV_FEATURE_DIM,
+    RolloutBuffer,
+    SubprocVecDoomEnv,
+    SyncVecDoomEnv,
+    compute_gae,
+    resolve_train_maps,
+)
 
 
 def test_sync_vec_env_truncation_final_obs_metrics_and_autoreset():
@@ -144,18 +152,73 @@ def test_rollout_buffer_chunk_minibatches_preserve_order_and_hidden_alignment():
     assert seen_starts == {0.0, 4.0, 100.0, 104.0}
 
 
-def test_weighted_curriculum_resolution_and_sampling():
-    from training.rollout import resolve_train_maps_and_weights
+def test_weighted_map_sampling_on_sync_and_subproc_vec_env():
+    wad_a = fixture_wad("#####\n#P..#\n#####")
+    wad_b = fixture_wad("#######\n#P...E#\n#######")
+    specs = [
+        MapSpec(wad=wad_a, family="door_exit", tier=1, split="train", episode_ticks=40),
+        MapSpec(wad=wad_b, family="door_exit", tier=2, split="train", episode_ticks=40),
+    ]
+    noop = np.zeros((1, 9), dtype=np.int8)
 
-    specs, weights = resolve_train_maps_and_weights(curriculum_stage="mvp")
-    assert len(specs) >= 5
-    assert weights is not None and len(weights) == len(specs)
-    assert sum(weights) == pytest.approx(1.0, abs=1e-6)
+    with SyncVecDoomEnv(specs, map_weights=[0.0, 1.0], num_envs=1) as vec:
+        vec.reset()
+        for _ in range(10):
+            _, _, _, _, infos = vec.step(noop)
+        assert infos[0]["episode"].wad == wad_b
 
-    # Extreme weights [1.0, 0.0] must always select index 0 across resets
-    s0 = MapSpec(wad="maps/train/train_door_straight.wad", family="door_exit", tier=2, split="train", episode_ticks=40)
-    s1 = MapSpec(wad="maps/train/train_key_short_red.wad", family="key_return", tier=3, split="train", episode_ticks=40)
-    with SyncVecDoomEnv([s0, s1], base_seed=0, render_buffers=False, num_envs=1, map_weights=[1.0, 0.0]) as vec:
-        for _ in range(5):
-            vec.reset()
-            assert vec.slots[0]._active_spec.wad == s0.wad
+        vec.set_map_weights([1.0, 0.0])
+        # Finish the already-started wad_b episode (step 10 auto-reset before set_map_weights),
+        # then the next 10 steps complete an episode sampled under the new [1.0, 0.0] weights.
+        for _ in range(20):
+            _, _, _, _, infos2 = vec.step(noop)
+        assert infos2[0]["episode"].wad == wad_a
+
+    with SubprocVecDoomEnv(specs, map_weights=[0.0, 1.0], num_envs=2) as pvec:
+        pvec.reset()
+        noop2 = np.zeros((2, 9), dtype=np.int8)
+        for _ in range(10):
+            _, _, _, _, pinfos = pvec.step(noop2)
+        assert all(info["episode"].wad == wad_b for info in pinfos)
+
+
+def test_locked_door_sighting_populates_priv_features_and_aux_targets():
+    wad = fixture_wad("############\n#P.r..R...E#\n############")
+    spec = MapSpec(wad=wad, family="key_return", tier=3, split="train", episode_ticks=400)
+    noop = np.zeros((1, 9), dtype=np.int8)
+
+    with SyncVecDoomEnv([spec], num_envs=1) as vec:
+        vec.reset()
+        priv_batch, aux_batch = vec.get_privileged_batch()
+        assert priv_batch.shape == (1, PRIV_FEATURE_DIM)
+        assert aux_batch.shape == (1, AUX_TARGET_DIM)
+        assert np.all(np.isfinite(priv_batch))
+
+        # Walk forward past the red keycard 'r' so ray 0 clears the item and hits locked door 'R'
+        fwd = np.zeros((1, 9), dtype=np.int8)
+        fwd[0, 0] = 1
+        for _ in range(15):
+            _, _, _, _, infos = vec.step(fwd)
+        priv_f = infos[0]["priv_features"]
+        aux_t = infos[0]["aux_targets"]
+        assert priv_f.shape == (PRIV_FEATURE_DIM,)
+        assert aux_t.shape == (AUX_TARGET_DIM,)
+        assert aux_t[0] == pytest.approx(1.0)  # seen_locked_door
+        # (sin, cos) forms a unit vector pointing toward the locked door ahead
+        assert np.hypot(aux_t[1], aux_t[2]) == pytest.approx(1.0, abs=1e-4)
+        assert aux_t[2] > 0.5  # straight ahead -> cos > 0
+
+
+def test_resolve_train_maps_wires_role3_curriculum_and_procedural(tmp_path):
+    specs = resolve_train_maps(
+        split="train",
+        stage="mvp",
+        procedural_per_family=1,
+        procedural_dir=tmp_path,
+        procedural_seed=500,
+    )
+    assert len(specs) > 4
+    families = {s.family for s in specs}
+    assert {"combat", "multi_room", "key_return"} <= families
+    # Procedural WADs were materialized into tmp_path
+    assert any(tmp_path.glob("*.wad"))

@@ -1,4 +1,4 @@
-"""Role 2 CLI training loop, throughput sweep, and Stage-1 two-map checkpoint verifier."""
+"""Role 2 CLI training loop, staged curriculum, throughput sweep, and Stage-1 two-map verifier."""
 
 from __future__ import annotations
 
@@ -12,8 +12,9 @@ from typing import Any
 
 import numpy as np
 
-from submission.obs import NUM_ACTIONS, batch_preprocessed_obs, obs_to_torch, preprocess_obs
-from submission.policy import PolicyConfig, build_policy, load_checkpoint, save_checkpoint
+from submission.obs import NUM_ACTIONS
+from submission.policy import PolicyConfig, build_policy, save_checkpoint
+from training.curriculum import CurriculumConfig, CurriculumScheduler
 from training.interfaces import EpisodeMetrics, MapSpec
 from training.ppo import PPOConfig, RecurrentPPOTrainer, load_training_state, save_training_state
 from training.rewards import RewardConfig, RewardShaper
@@ -23,7 +24,6 @@ from training.rollout import (
     SyncVecDoomEnv,
     collect_rollout,
     resolve_train_maps,
-    resolve_train_maps_and_weights,
 )
 
 
@@ -37,8 +37,11 @@ class TrainConfig:
     vitals_dim: int = 64
     num_memory_slots: int = 0
     split: str = "train"
-    curriculum_stage: str | None = None
-    procedural_count: int = 0
+    stage: str | None = None
+    procedural_per_family: int = 0
+    procedural_dir: str | None = None
+    tier_weights: dict[int, float] | None = None
+    auto_curriculum: bool = True
     maps: tuple[str, ...] = ()
     num_envs: int = 4
     vec_mode: str = "subproc"  # "subproc" | "sync"
@@ -58,6 +61,9 @@ class TrainConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: float | None = 0.03
+    use_asymmetric_critic: bool = True
+    aux_coef: float = 0.2
+    curiosity_coef: float = 0.02
     anneal_lr: bool = True
     checkpoint_dir: str = "training/runs/default"
     export_path: str = "submission/weights/policy.pt"
@@ -75,6 +81,19 @@ def resolve_device(device_spec: str = "auto") -> str:
     return device_spec
 
 
+def _parse_tier_weights(raw: str | None) -> dict[int, float] | None:
+    if not raw:
+        return None
+    out: dict[int, float] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        k, v = part.split(":", 1)
+        out[int(k.strip())] = float(v.strip())
+    return out or None
+
+
 def _make_vec_env(
     map_specs: list[MapSpec],
     num_envs: int,
@@ -85,7 +104,7 @@ def _make_vec_env(
     map_weights: list[float] | None = None,
     max_cached_envs: int = 32,
 ):
-    cache_size = max(max_cached_envs, len(map_specs))
+    cache_size = max(int(max_cached_envs), len(map_specs))
     if vec_mode == "sync":
         return SyncVecDoomEnv(
             map_specs=map_specs,
@@ -139,32 +158,28 @@ def _summarize_episodes(episodes: list[EpisodeMetrics]) -> dict[str, float]:
 
 
 def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) -> dict[str, Any]:
-    """Run end-to-end recurrent PPO training and export inference + resumable checkpoints."""
+    """Run end-to-end recurrent PPO training with curriculum, asymmetric critic, aux & RND."""
     import torch
 
     device = resolve_device(cfg.device)
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    map_specs, map_weights = resolve_train_maps_and_weights(
+    map_specs = resolve_train_maps(
         list(cfg.maps) if cfg.maps else None,
         split=cfg.split,
-        curriculum_stage=cfg.curriculum_stage,
+        stage=cfg.stage,
+        procedural_per_family=cfg.procedural_per_family,
+        procedural_dir=cfg.procedural_dir,
+        procedural_seed=cfg.seed + 1000,
     )
-    ckpt_dir = Path(cfg.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    if cfg.procedural_count > 0 and not cfg.maps:
-        from training.maps import generate_training_variations
-
-        proc_specs = generate_training_variations(
-            ckpt_dir / "procedural_maps",
-            count_per_family=cfg.procedural_count,
-            base_seed=cfg.seed + 1000,
+    scheduler = CurriculumScheduler(
+        CurriculumConfig(
+            auto_curriculum=cfg.auto_curriculum,
+            tier_weights=cfg.tier_weights,
         )
-        if map_weights is not None:
-            mean_w = float(np.mean(map_weights))
-            map_weights = [*map_weights, *([mean_w] * len(proc_specs))]
-        map_specs = [*map_specs, *proc_specs]
+    )
+    initial_weights = scheduler.compute_map_weights(map_specs)
 
     ppo_cfg = PPOConfig(
         lr=cfg.lr,
@@ -178,17 +193,30 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
         chunk_len=cfg.chunk_len,
         num_minibatches=cfg.num_minibatches,
         target_kl=cfg.target_kl,
+        use_asymmetric_critic=cfg.use_asymmetric_critic,
+        aux_coef=cfg.aux_coef,
+        curiosity_coef=cfg.curiosity_coef,
     )
 
     start_update = 0
     total_decisions = 0
     episodes_completed = 0
     if cfg.resume:
-        policy, policy_cfg, optimizer, step_info = load_training_state(cfg.resume, device=device)
+        policy, policy_cfg, optimizer, step_info, extras = load_training_state(
+            cfg.resume, device=device, return_extras=True
+        )
         start_update = int(step_info.get("updates", 0))
         total_decisions = int(step_info.get("total_decisions", 0))
         episodes_completed = int(step_info.get("episodes_completed", 0))
-        trainer = RecurrentPPOTrainer(policy, ppo_cfg, device=device, optimizer=optimizer)
+        trainer = RecurrentPPOTrainer(
+            policy,
+            ppo_cfg,
+            device=device,
+            optimizer=optimizer,
+            asymmetric_critic=extras.get("asymmetric_critic"),
+            aux_head=extras.get("aux_head"),
+            curiosity=extras.get("curiosity"),
+        )
     else:
         policy_cfg = PolicyConfig(
             arch=cfg.arch,
@@ -205,6 +233,8 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     steps_per_update = cfg.rollout_steps * cfg.num_envs
     target_updates = max(1, (cfg.total_steps + steps_per_update - 1) // steps_per_update)
 
+    ckpt_dir = Path(cfg.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = ckpt_dir / "metrics.jsonl"
     resume_path = ckpt_dir / "latest_train_state.pt"
 
@@ -212,118 +242,137 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     last_summary: dict[str, float] = {}
     t_start = time.perf_counter()
 
-    with _make_vec_env(
-        map_specs,
-        num_envs=cfg.num_envs,
-        vec_mode=cfg.vec_mode,
-        seed=cfg.seed,
-        render_buffers=cfg.render_buffers,
-        reward_config=reward_config,
-        map_weights=map_weights,
-        max_cached_envs=cfg.max_cached_envs,
-    ) as vec_env:
-        obs = vec_env.reset()
-        prev_action = np.zeros((cfg.num_envs, NUM_ACTIONS), dtype=np.float32)
-        hidden = policy.init_hidden(cfg.num_envs, device)
-        episode_starts = np.ones(cfg.num_envs, dtype=bool)
-        hidden_shape = tuple(hidden.shape)
-        buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, hidden_shape=hidden_shape)
+    try:
+        with _make_vec_env(
+            map_specs,
+            num_envs=cfg.num_envs,
+            vec_mode=cfg.vec_mode,
+            seed=cfg.seed,
+            render_buffers=cfg.render_buffers,
+            reward_config=reward_config,
+            map_weights=initial_weights,
+        ) as vec_env:
+            obs = vec_env.reset()
+            prev_action = np.zeros((cfg.num_envs, NUM_ACTIONS), dtype=np.float32)
+            hidden = policy.init_hidden(cfg.num_envs, device)
+            episode_starts = np.ones(cfg.num_envs, dtype=bool)
+            hidden_shape = tuple(hidden.shape)
+            buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, hidden_shape=hidden_shape)
 
-        for local_idx in range(target_updates):
-            update_idx = start_update + local_idx + 1
-            if cfg.anneal_lr and target_updates > 1:
-                frac = max(0.05, 1.0 - float(local_idx) / float(target_updates))
-                trainer.set_lr(cfg.lr * frac)
+            for local_idx in range(target_updates):
+                update_idx = start_update + local_idx + 1
+                if cfg.anneal_lr and target_updates > 1:
+                    frac = max(0.05, 1.0 - float(local_idx) / float(target_updates))
+                    trainer.set_lr(cfg.lr * frac)
 
-            t_iter = time.perf_counter()
-            obs, prev_action, hidden, episode_starts, ep_list, last_values = collect_rollout(
-                vec_env=vec_env,
-                policy=policy,
-                buffer=buffer,
-                obs=obs,
-                prev_action=prev_action,
-                hidden=hidden,
-                episode_starts=episode_starts,
-                device=device,
-            )
-            buffer.compute_returns_and_advantages(
-                last_values=last_values,
-                gamma=cfg.gamma,
-                gae_lambda=cfg.gae_lambda,
-            )
-            ppo_metrics = trainer.update(buffer, rng=rng)
-            iter_s = max(1e-6, time.perf_counter() - t_iter)
-
-            total_decisions += steps_per_update
-            episodes_completed += len(ep_list)
-            all_recent_episodes.extend(ep_list)
-            recent_window = all_recent_episodes[-max(20, cfg.num_envs * 4) :]
-            ep_summary = _summarize_episodes(recent_window)
-            sps = steps_per_update / iter_s
-
-            record = {
-                "update": update_idx,
-                "total_decisions": total_decisions,
-                "episodes_completed": episodes_completed,
-                "decisions_per_sec": round(sps, 1),
-                **ppo_metrics,
-                **ep_summary,
-            }
-            last_summary = record
-            with metrics_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record) + "\n")
-
-            if update_idx % max(1, cfg.log_interval) == 0:
-                print(
-                    f"[update {update_idx}/{start_update + target_updates}] "
-                    f"steps={total_decisions} sps={sps:.0f} "
-                    f"eps={episodes_completed} exit={ep_summary['exit_rate']:.2f} "
-                    f"door={ep_summary['door_open_rate']:.2f} key={ep_summary['key_rate']:.2f} "
-                    f"unlock={ep_summary['unlock_rate']:.2f} rew={ep_summary['mean_reward']:.2f} "
-                    f"kl={ppo_metrics['approx_kl']:.4f}",
-                    flush=True,
+                t_iter = time.perf_counter()
+                obs, prev_action, hidden, episode_starts, ep_list, last_values = collect_rollout(
+                    vec_env=vec_env,
+                    policy=policy,
+                    buffer=buffer,
+                    obs=obs,
+                    prev_action=prev_action,
+                    hidden=hidden,
+                    episode_starts=episode_starts,
+                    device=device,
+                    asymmetric_critic=trainer.asymmetric_critic,
+                    feature_hook=trainer.feature_hook,
+                    curiosity=trainer.curiosity,
                 )
-
-            if cfg.save_interval > 0 and update_idx % cfg.save_interval == 0:
-                save_training_state(
-                    resume_path,
-                    policy,
-                    policy_cfg,
-                    trainer.optimizer,
-                    ppo_cfg,
-                    {
-                        "updates": update_idx,
-                        "total_decisions": total_decisions,
-                        "episodes_completed": episodes_completed,
-                    },
+                buffer.compute_returns_and_advantages(
+                    last_values=last_values,
+                    gamma=cfg.gamma,
+                    gae_lambda=cfg.gae_lambda,
                 )
-                if cfg.export_path:
-                    plain_meta = {k: (v.item() if hasattr(v, "item") else v) for k, v in record.items()}
-                    save_checkpoint(cfg.export_path, policy, policy_cfg, meta=plain_meta)
+                ppo_metrics = trainer.update(buffer, rng=rng)
+                iter_s = max(1e-6, time.perf_counter() - t_iter)
 
-        # Always save final checkpoints at end of run.
-        save_training_state(
-            resume_path,
-            policy,
-            policy_cfg,
-            trainer.optimizer,
-            ppo_cfg,
-            {
-                "updates": start_update + target_updates,
-                "total_decisions": total_decisions,
-                "episodes_completed": episodes_completed,
-            },
-        )
-        export_out = None
-        if cfg.export_path:
-            plain_meta = {k: (v.item() if hasattr(v, "item") else v) for k, v in last_summary.items()}
-            export_out = str(save_checkpoint(cfg.export_path, policy, policy_cfg, meta=plain_meta))
+                if ep_list and scheduler.observe_episodes(ep_list):
+                    new_weights = scheduler.compute_map_weights(map_specs)
+                    vec_env.set_map_weights(new_weights)
+                    print(f"[curriculum] Promoted to phase {scheduler.phase} (tier weights={scheduler.current_tier_weights()})", flush=True)
+
+                total_decisions += steps_per_update
+                episodes_completed += len(ep_list)
+                all_recent_episodes.extend(ep_list)
+                recent_window = all_recent_episodes[-max(20, cfg.num_envs * 4) :]
+                ep_summary = _summarize_episodes(recent_window)
+                sps = steps_per_update / iter_s
+
+                record = {
+                    "update": update_idx,
+                    "total_decisions": total_decisions,
+                    "episodes_completed": episodes_completed,
+                    "decisions_per_sec": round(sps, 1),
+                    "curriculum_phase": scheduler.phase,
+                    **ppo_metrics,
+                    **ep_summary,
+                }
+                last_summary = record
+                with metrics_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record) + "\n")
+
+                if update_idx % max(1, cfg.log_interval) == 0:
+                    print(
+                        f"[update {update_idx}/{start_update + target_updates}] "
+                        f"steps={total_decisions} sps={sps:.0f} p={scheduler.phase} "
+                        f"eps={episodes_completed} exit={ep_summary['exit_rate']:.2f} "
+                        f"door={ep_summary['door_open_rate']:.2f} key={ep_summary['key_rate']:.2f} "
+                        f"unlock={ep_summary['unlock_rate']:.2f} rew={ep_summary['mean_reward']:.2f} "
+                        f"aux={ppo_metrics['aux_loss']:.3f} rnd={ppo_metrics['rnd_loss']:.3f} "
+                        f"kl={ppo_metrics['approx_kl']:.4f}",
+                        flush=True,
+                    )
+
+                if cfg.save_interval > 0 and update_idx % cfg.save_interval == 0:
+                    save_training_state(
+                        resume_path,
+                        policy,
+                        policy_cfg,
+                        trainer.optimizer,
+                        ppo_cfg,
+                        {
+                            "updates": update_idx,
+                            "total_decisions": total_decisions,
+                            "episodes_completed": episodes_completed,
+                        },
+                        asymmetric_critic=trainer.asymmetric_critic,
+                        aux_head=trainer.aux_head,
+                        curiosity=trainer.curiosity,
+                    )
+                    if cfg.export_path:
+                        plain_meta = {k: (v.item() if hasattr(v, "item") else v) for k, v in record.items()}
+                        save_checkpoint(cfg.export_path, policy, policy_cfg, meta=plain_meta)
+
+            save_training_state(
+                resume_path,
+                policy,
+                policy_cfg,
+                trainer.optimizer,
+                ppo_cfg,
+                {
+                    "updates": start_update + target_updates,
+                    "total_decisions": total_decisions,
+                    "episodes_completed": episodes_completed,
+                },
+                asymmetric_critic=trainer.asymmetric_critic,
+                aux_head=trainer.aux_head,
+                curiosity=trainer.curiosity,
+            )
+            export_out = None
+            if cfg.export_path:
+                plain_meta = {k: (v.item() if hasattr(v, "item") else v) for k, v in last_summary.items()}
+                export_out = str(save_checkpoint(cfg.export_path, policy, policy_cfg, meta=plain_meta))
+    finally:
+        trainer.close()
 
     elapsed_s = max(1e-6, time.perf_counter() - t_start)
     overall_sps = (target_updates * steps_per_update) / elapsed_s
     return {
         "device": device,
         "arch": policy_cfg.arch,
+        "num_maps": len(map_specs),
+        "curriculum_phase": scheduler.phase,
         "total_decisions": total_decisions,
         "optimizer_updates": start_update + target_updates,
         "episodes_completed": episodes_completed,
@@ -339,7 +388,7 @@ def bench_throughput(
     map_specs: list[MapSpec],
     worker_counts: list[int],
     rollout_steps: int = 128,
-    arch: str = "stub",
+    arch: str = "telemetry_gru_v1",
     hidden_size: int = 256,
     device: str = "auto",
     vec_mode: str = "subproc",
@@ -352,37 +401,45 @@ def bench_throughput(
     results = []
     for n_workers in worker_counts:
         policy = build_policy(policy_cfg).to(dev)
-        ppo_cfg = PPOConfig(chunk_len=min(32, rollout_steps), num_minibatches=min(4, max(1, n_workers)))
+        ppo_cfg = PPOConfig(chunk_len=min(64, rollout_steps), num_minibatches=min(4, max(1, n_workers)))
         trainer = RecurrentPPOTrainer(policy, ppo_cfg, device=dev)
         rng = np.random.default_rng(0)
 
-        with _make_vec_env(map_specs, num_envs=n_workers, vec_mode=vec_mode, seed=0) as vec_env:
-            obs = vec_env.reset()
-            prev_action = np.zeros((n_workers, NUM_ACTIONS), dtype=np.float32)
-            hidden = policy.init_hidden(n_workers, dev)
-            episode_starts = np.ones(n_workers, dtype=bool)
-            buf = RolloutBuffer(rollout_steps, n_workers, tuple(hidden.shape))
+        try:
+            with _make_vec_env(map_specs, num_envs=n_workers, vec_mode=vec_mode, seed=0) as vec_env:
+                obs = vec_env.reset()
+                prev_action = np.zeros((n_workers, NUM_ACTIONS), dtype=np.float32)
+                hidden = policy.init_hidden(n_workers, dev)
+                episode_starts = np.ones(n_workers, dtype=bool)
+                buf = RolloutBuffer(rollout_steps, n_workers, tuple(hidden.shape))
 
-            # 1 warmup rollout+update (pays ViZDoom/CUDA JIT init)
-            obs, prev_action, hidden, episode_starts, _, last_v = collect_rollout(
-                vec_env, policy, buf, obs, prev_action, hidden, episode_starts, dev
-            )
-            buf.compute_returns_and_advantages(last_v)
-            trainer.update(buf, rng=rng)
-            if dev == "cuda":
-                torch.cuda.synchronize()
-
-            t0 = time.perf_counter()
-            n_iters = 2
-            for _ in range(n_iters):
                 obs, prev_action, hidden, episode_starts, _, last_v = collect_rollout(
-                    vec_env, policy, buf, obs, prev_action, hidden, episode_starts, dev
+                    vec_env, policy, buf, obs, prev_action, hidden, episode_starts, dev,
+                    asymmetric_critic=trainer.asymmetric_critic,
+                    feature_hook=trainer.feature_hook,
+                    curiosity=trainer.curiosity,
                 )
-                buf.compute_returns_and_advantages(last_v)
+                buf.compute_returns_and_advantages(last_v, gamma=ppo_cfg.gamma)
                 trainer.update(buf, rng=rng)
-            if dev == "cuda":
-                torch.cuda.synchronize()
-            elapsed = max(1e-6, time.perf_counter() - t0)
+                if dev == "cuda":
+                    torch.cuda.synchronize()
+
+                t0 = time.perf_counter()
+                n_iters = 2
+                for _ in range(n_iters):
+                    obs, prev_action, hidden, episode_starts, _, last_v = collect_rollout(
+                        vec_env, policy, buf, obs, prev_action, hidden, episode_starts, dev,
+                        asymmetric_critic=trainer.asymmetric_critic,
+                        feature_hook=trainer.feature_hook,
+                        curiosity=trainer.curiosity,
+                    )
+                    buf.compute_returns_and_advantages(last_v, gamma=ppo_cfg.gamma)
+                    trainer.update(buf, rng=rng)
+                if dev == "cuda":
+                    torch.cuda.synchronize()
+                elapsed = max(1e-6, time.perf_counter() - t0)
+        finally:
+            trainer.close()
 
         decisions = n_iters * rollout_steps * n_workers
         dps = decisions / elapsed
@@ -440,19 +497,18 @@ def verify_checkpoint_two_maps(
         try:
             raw_obs, _ = env.reset(seed=idx)
             agent.reset()
-            shaper.reset(env.privileged_state())
+            shaper.reset(env.privileged_state(), obs=raw_obs)
+            prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
             steps = keys = doors = unlocks = kills = 0
             dmg = total_rew = 0.0
             t0 = time.perf_counter()
 
             while True:
-                t_act = time.perf_counter()
                 act_np = np.asarray(agent.act(raw_obs), dtype=np.int8)
-                t_act_elapsed = time.perf_counter() - t_act
-
                 raw_obs, _, term, trunc, _ = env.step(act_np)
                 priv = env.privileged_state()
-                rew, ev, _ = shaper.step(priv)
+                rew, ev, _ = shaper.step(priv, action=act_np, prev_action=prev_action, obs=raw_obs)
+                prev_action = act_np
                 steps += 1
                 total_rew += rew
                 keys += ev.keys_picked_up
@@ -480,7 +536,7 @@ def verify_checkpoint_two_maps(
                             final_health=float(priv["health"]),
                             unique_cells_visited=shaper.unique_cells_visited,
                             total_reward=float(total_rew),
-                            agent_time_s=float(time.perf_counter() - t0 + 0.0 * t_act_elapsed),
+                            agent_time_s=float(time.perf_counter() - t0),
                         )
                     )
                     break
@@ -500,11 +556,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-memory-slots", type=int, default=0)
     p.add_argument("--map", dest="maps", action="append", default=[])
     p.add_argument("--split", default="train")
-    p.add_argument("--curriculum-stage", default=None, help="Role 3 stage: connect|mvp|progression|full|...")
-    p.add_argument("--procedural-count", type=int, default=0, help="Extra procedural WADs per family")
+    p.add_argument("--stage", default=None)
+    p.add_argument("--procedural-per-family", type=int, default=0)
+    p.add_argument("--procedural-dir", default=None)
+    p.add_argument("--tier-weights", default=None, help="Comma-separated tier:weight, e.g. 1:0.4,2:0.3,3:0.2,4:0.1")
+    p.add_argument("--auto-curriculum", dest="auto_curriculum", action="store_true", default=True)
+    p.add_argument("--no-auto-curriculum", dest="auto_curriculum", action="store_false")
+    p.add_argument("--asymmetric-critic", dest="use_asymmetric_critic", action="store_true", default=True)
+    p.add_argument("--no-asymmetric-critic", dest="use_asymmetric_critic", action="store_false")
+    p.add_argument("--aux-coef", type=float, default=0.2)
+    p.add_argument("--curiosity-coef", type=float, default=0.02)
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--vec-mode", choices=("subproc", "sync"), default="subproc")
-    p.add_argument("--max-cached-envs", type=int, default=32)
     p.add_argument("--rollout-steps", type=int, default=256)
     p.add_argument("--chunk-len", type=int, default=64)
     p.add_argument("--num-minibatches", type=int, default=4)
@@ -531,7 +594,13 @@ def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
     if args.bench_workers:
         workers = [int(x.strip()) for x in args.bench_workers.split(",") if x.strip()]
-        specs = resolve_train_maps(args.maps or None, split=args.split)
+        specs = resolve_train_maps(
+            args.maps or None,
+            split=args.split,
+            stage=args.stage,
+            procedural_per_family=args.procedural_per_family,
+            procedural_dir=args.procedural_dir,
+        )
         res = bench_throughput(
             map_specs=specs,
             worker_counts=workers,
@@ -555,12 +624,14 @@ def main(argv: list[str] | None = None) -> None:
         vitals_dim=args.vitals_dim,
         num_memory_slots=args.num_memory_slots,
         split=args.split,
-        curriculum_stage=args.curriculum_stage,
-        procedural_count=args.procedural_count,
+        stage=args.stage,
+        procedural_per_family=args.procedural_per_family,
+        procedural_dir=args.procedural_dir,
+        tier_weights=_parse_tier_weights(args.tier_weights),
+        auto_curriculum=args.auto_curriculum,
         maps=tuple(args.maps),
         num_envs=args.num_envs,
         vec_mode=args.vec_mode,
-        max_cached_envs=args.max_cached_envs,
         rollout_steps=args.rollout_steps,
         chunk_len=args.chunk_len,
         num_minibatches=args.num_minibatches,
@@ -572,6 +643,9 @@ def main(argv: list[str] | None = None) -> None:
         ent_coef=args.ent_coef,
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
+        use_asymmetric_critic=args.use_asymmetric_critic,
+        aux_coef=args.aux_coef,
+        curiosity_coef=args.curiosity_coef,
         anneal_lr=not args.no_anneal_lr,
         checkpoint_dir=args.checkpoint_dir,
         export_path=args.export_path,
@@ -583,7 +657,7 @@ def main(argv: list[str] | None = None) -> None:
     print("TRAIN_SUMMARY:", json.dumps(summary, default=str), flush=True)
 
     if args.verify_two_maps and summary["export_path"]:
-        specs = resolve_train_maps(args.maps or None, split=args.split)
+        specs = resolve_train_maps(args.maps or None, split=args.split, stage=args.stage)
         eps = verify_checkpoint_two_maps(summary["export_path"], specs, device=summary["device"])
         print("TWO_MAP_VERIFY:", json.dumps([asdict(e) for e in eps]), flush=True)
 

@@ -1,4 +1,4 @@
-"""TDD tests for Role 2 reward shaping (`training/rewards.py`)."""
+"""TDD tests for upgraded Role 2 reward shaping (`training/rewards.py`)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,9 @@ def _priv(
     episode_ticks: int = 1000,
     x: float = 0.0,
     y: float = 0.0,
+    health: float | None = None,
+    armor: float = 0.0,
+    ammo_total: float = 50.0,
     kills: int = 0,
     damage_taken: float = 0.0,
     keys: list[int] | None = None,
@@ -30,7 +33,9 @@ def _priv(
         "y": y,
         "z": 0.0,
         "angle": 0.0,
-        "health": 0.0 if dead else 100.0,
+        "health": (0.0 if dead else 100.0) if health is None else health,
+        "armor": armor,
+        "ammo_total": ammo_total,
         "kills": kills,
         "items": 0,
         "damage_taken": damage_taken,
@@ -45,161 +50,131 @@ def _priv(
     }
 
 
-def test_progression_and_exit_rewards_fire_once_with_efficiency():
-    cfg = RewardConfig(
-        exit_reward=10.0,
-        efficiency_bonus=2.0,
-        key_pickup_reward=3.0,
-        locked_door_unlock_reward=4.0,
-        door_open_reward=1.5,
-        new_cell_reward=0.15,
-        step_penalty=-0.002,
-    )
-    shaper = RewardShaper(cfg)
-    shaper.reset(_priv(tic=0, x=0.0, y=0.0))
+def _obs(*, bullets: float = 50.0, enemy_visible: bool = False) -> dict:
+    vitals = np.zeros(17, dtype=np.float32)
+    vitals[4] = bullets
+    mask = np.zeros(32, dtype=np.int8)
+    etype = np.zeros(32, dtype=np.int64)
+    if enemy_visible:
+        mask[0] = 1
+        etype[0] = 2  # enemy_hitscan
+    return {
+        "vitals": vitals,
+        "visible_entities": {
+            "features": np.zeros((32, 5), dtype=np.float32),
+            "entity_type": etype,
+            "mask": mask,
+        },
+    }
 
-    # Step 1: pick up red key + open unlocked door (sector 0), stay in same cell
+
+def test_progression_and_exit_time_plus_health_efficiency():
+    cfg = RewardConfig()
+    shaper = RewardShaper(cfg)
+    shaper.reset(_priv(tic=0, x=0.0, y=0.0, health=100.0))
+
     r1, ev1, c1 = shaper.step(_priv(tic=4, keys=[0, 0, 1, 0, 0, 0], sector_ceiling=[64.0, 0.0, 128.0]))
     assert ev1.keys_picked_up == 1
     assert ev1.doors_opened == 1
-    assert c1["key"] == pytest.approx(3.0)
-    assert c1["door"] == pytest.approx(1.5)
-    assert c1["explore"] == pytest.approx(0.0)
-    assert c1["time"] == pytest.approx(-0.002)
+    assert c1["key"] == pytest.approx(cfg.key_pickup_reward)
+    assert c1["door"] == pytest.approx(cfg.door_open_reward)
     assert r1 == pytest.approx(sum(c1.values()))
 
-    # Step 2: unlock locked door (sector 1); sector 0 oscillates slightly and must NOT double-count
-    r2, ev2, c2 = shaper.step(_priv(tic=8, keys=[0, 0, 1, 0, 0, 0], sector_ceiling=[48.0, 64.0, 128.0]))
+    # Locked door unlock; sector 0 oscillates within margin without door-bounce threshold or double-count
+    r2, ev2, c2 = shaper.step(_priv(tic=8, keys=[0, 0, 1, 0, 0, 0], sector_ceiling=[64.0, 64.0, 128.0]))
     assert ev2.doors_opened == 0
     assert ev2.locked_doors_unlocked == 1
-    assert c2["door"] == pytest.approx(0.0)
-    assert c2["unlock"] == pytest.approx(4.0)
+    assert c2["unlock"] == pytest.approx(cfg.locked_door_unlock_reward)
     assert r2 == pytest.approx(sum(c2.values()))
 
-    # Step 3: reach exit at tic=250 out of 1000 -> efficiency fraction = 0.75
+    # Exit at tic=250/1000 (0.75 time remaining) and health=80 (0.80 health frac)
     r3, ev3, c3 = shaper.step(
         _priv(
             tic=250,
             episode_ticks=1000,
+            health=80.0,
             keys=[0, 0, 1, 0, 0, 0],
             sector_ceiling=[64.0, 64.0, 128.0],
             exit_reached=True,
         )
     )
     assert ev3.exit_reached is True
-    assert c3["exit"] == pytest.approx(10.0)
-    assert c3["efficiency"] == pytest.approx(2.0 * 0.75)
+    assert c3["exit"] == pytest.approx(cfg.exit_reward)
+    expected_eff = cfg.efficiency_bonus * 0.75 + cfg.health_efficiency_bonus * 0.80
+    assert c3["efficiency"] == pytest.approx(expected_eff)
     assert r3 == pytest.approx(sum(c3.values()))
 
 
-def test_exploration_cap_combat_and_reward_hierarchy():
+def test_diminishing_exploration_250_cells_and_post_key_reset():
     cfg = RewardConfig()
     shaper = RewardShaper(cfg)
-
-    # 1. Completed run (minimal exploration, reaches exit halfway through episode)
     shaper.reset(_priv(tic=0, x=0.0))
-    completed_return = 0.0
-    for step_idx in range(1, 11):
-        r, _, _ = shaper.step(
-            _priv(
-                tic=step_idx * 40,
-                episode_ticks=1000,
-                x=float(step_idx * 64),
-                exit_reached=(step_idx == 10),
-            )
-        )
-        completed_return += r
 
-    # 2. Stalled max-exploration + moderate combat run (visits 170 cells > cap 150, 2 kills, times out)
-    shaper.reset(_priv(tic=0, x=0.0))
-    explore_sum = 0.0
-    stalled_return = 0.0
-    for step_idx in range(1, 171):
-        r, _, comp = shaper.step(
-            _priv(
-                tic=step_idx * 12,
-                episode_ticks=2100,
-                x=float(step_idx * 64),
-                kills=2 if step_idx >= 20 else 0,
-                timeout=(step_idx == 170),
-            )
-        )
-        explore_sum += comp["explore"]
-        stalled_return += r
+    # Visit 280 cells: 250 should earn diminishing reward, >250 earns 0, total < exit_reward
+    explore_total = 0.0
+    for step_idx in range(1, 281):
+        _, _, comp = shaper.step(_priv(tic=step_idx * 4, x=float(step_idx * 64)))
+        explore_total += comp["explore"]
 
-    assert shaper.unique_cells_visited == 171
-    assert explore_sum == pytest.approx(cfg.max_exploration_cells * cfg.new_cell_reward)
+    assert cfg.max_exploration_cells == 250
+    assert 0.0 < explore_total < cfg.exit_reward
+    _, _, comp_extra = shaper.step(_priv(tic=1200, x=float(281 * 64)))
+    assert comp_extra["explore"] == pytest.approx(0.0)
 
-    # 3. Early death run with damage
-    shaper.reset(_priv(tic=0, x=0.0))
-    death_r, ev_death, comp_death = shaper.step(
-        _priv(tic=40, x=0.0, damage_taken=100.0, dead=True)
-    )
-    assert ev_death.dead is True
-    assert comp_death["damage"] == pytest.approx(100.0 * cfg.damage_penalty)
-    assert comp_death["death"] == pytest.approx(cfg.death_penalty)
+    # Pick up key at cell x=281*64, then backtrack through already-visited cells x=280*64, 279*64
+    _, ev_k, comp_k = shaper.step(_priv(tic=1204, x=float(281 * 64), keys=[1, 0, 0, 0, 0, 0]))
+    assert ev_k.keys_picked_up == 1
+    assert comp_k["post_key_explore"] == pytest.approx(0.0)
 
-    assert completed_return > stalled_return > death_r
+    _, _, comp_back1 = shaper.step(_priv(tic=1208, x=float(280 * 64), keys=[1, 0, 0, 0, 0, 0]))
+    _, _, comp_back2 = shaper.step(_priv(tic=1212, x=float(279 * 64), keys=[1, 0, 0, 0, 0, 0]))
+    assert comp_back1["explore"] == pytest.approx(0.0)
+    assert comp_back1["post_key_explore"] == pytest.approx(cfg.post_key_cell_reward)
+    assert comp_back2["post_key_explore"] == pytest.approx(cfg.post_key_cell_reward)
 
 
-def test_post_key_reset_door_bounce_wasted_ammo_and_health_exit():
+def test_use_waste_door_bounce_and_combat_resource_rewards():
     cfg = RewardConfig()
     shaper = RewardShaper(cfg)
+    shaper.reset(_priv(tic=0, health=50.0, armor=10.0, sector_ceiling=[0.0, 0.0, 128.0]))
 
-    def _obs(ammo: float, has_enemy: bool):
-        mask = np.zeros(32, dtype=np.int8)
-        etypes = np.zeros(32, dtype=np.int64)
-        if has_enemy:
-            mask[0] = 1
-            etypes[0] = 2  # enemy_hitscan
-        vitals = np.zeros(17, dtype=np.float32)
-        vitals[3] = ammo
-        return {"vitals": vitals, "visible_entities": {"mask": mask, "entity_type": etypes}}
+    prev_act = np.zeros(9, dtype=np.int8)
+    use_act = np.zeros(9, dtype=np.int8)
+    use_act[7] = 1
 
-    shaper.reset(_priv(tic=0, x=0.0), obs=_obs(10.0, False))
-    # Visit cell x=64 before key pickup
-    _, _, c1 = shaper.step(_priv(tic=4, x=64.0), obs=_obs(10.0, False))
-    assert c1["explore"] == pytest.approx(cfg.new_cell_reward)
-    assert c1["post_key_explore"] == pytest.approx(0.0)
-
-    # Pick up key at x=128
-    _, _, c2 = shaper.step(_priv(tic=8, x=128.0, keys=[1, 0, 0, 0, 0, 0]), obs=_obs(10.0, False))
-    assert c2["key"] == pytest.approx(cfg.key_pickup_reward)
-
-    # Backtrack to already-visited cell x=64 -> earns bounded post-key exploration!
-    _, _, c3 = shaper.step(_priv(tic=12, x=64.0, keys=[1, 0, 0, 0, 0, 0]), obs=_obs(9.0, False))
-    assert c3["explore"] == pytest.approx(0.0)
-    assert c3["post_key_explore"] == pytest.approx(cfg.post_key_cell_reward)
-    # Ammo dropped from 10->9 with no visible enemy -> wasted ammo penalty
-    assert c3["wasted_ammo"] == pytest.approx(cfg.wasted_ammo_penalty)
-
-    # Door starts rising, then USE pulses 0->1 and door ceiling drops -> exact door bounce penalty
-    use_act = np.array([0, 0, 0, 0, 0, 0, 0, 1, 0], dtype=np.int8)
-    noop_act = np.zeros(9, dtype=np.int8)
-    _, _, c4 = shaper.step(
-        _priv(tic=16, x=64.0, keys=[1, 0, 0, 0, 0, 0], sector_ceiling=[24.0, 0.0, 128.0]),
+    # 1. Wasted USE pulse (no door opens, no door sector starts rising)
+    _, _, c_waste = shaper.step(
+        _priv(tic=4, health=50.0, sector_ceiling=[0.0, 0.0, 128.0]),
         action=use_act,
-        prev_action=noop_act,
-        obs=_obs(8.0, True),  # enemy visible -> no wasted ammo penalty
+        prev_action=prev_act,
+        obs=_obs(bullets=50.0, enemy_visible=False),
     )
-    assert c4["door_bounce"] == pytest.approx(0.0)
-    assert c4["wasted_ammo"] == pytest.approx(0.0)
+    assert c_waste["use_penalty"] == pytest.approx(cfg.use_waste_penalty)
 
-    _, _, c5 = shaper.step(
-        _priv(tic=20, x=64.0, keys=[1, 0, 0, 0, 0, 0], sector_ceiling=[16.0, 0.0, 128.0]),
+    # 2. Door sector 0 starts rising (+12.0), then bounces back down (-8.0) -> door bounce penalty
+    shaper.step(_priv(tic=8, health=50.0, sector_ceiling=[12.0, 0.0, 128.0]), action=use_act, prev_action=prev_act)
+    _, _, c_bounce = shaper.step(
+        _priv(tic=12, health=50.0, sector_ceiling=[4.0, 0.0, 128.0]),
         action=use_act,
-        prev_action=noop_act,
-        obs=_obs(8.0, True),
+        prev_action=prev_act,
     )
-    assert c5["door_bounce"] == pytest.approx(cfg.door_bounce_penalty)
+    assert c_bounce["use_penalty"] == pytest.approx(cfg.door_bounce_penalty)
 
-    # Exit with full health -> both time efficiency and health_exit bonus fire
-    _, _, c6 = shaper.step(
-        _priv(tic=500, episode_ticks=1000, x=64.0, keys=[1, 0, 0, 0, 0, 0], exit_reached=True),
-        obs=_obs(8.0, False),
+    # 3. Wasted ammo (ammo drops 50 -> 49, no kill, no enemy visible) + low-health pickup bonus
+    _, _, c_ammo = shaper.step(
+        _priv(tic=16, health=70.0, armor=30.0, sector_ceiling=[4.0, 0.0, 128.0]),
+        obs=_obs(bullets=49.0, enemy_visible=False),
     )
-    assert c6["health_exit"] == pytest.approx(cfg.health_exit_bonus)
-    assert c6["efficiency"] == pytest.approx(cfg.efficiency_bonus * 0.5)
+    assert c_ammo["ammo_waste"] == pytest.approx(cfg.wasted_ammo_penalty)
+    assert c_ammo["pickup"] > 0.0
+
+    # 4. Damage rebalance: taking 20 HP fireball outweighs kill_reward (0.5 + 20 * -0.035 = -0.20 < 0)
+    _, _, c_trade = shaper.step(
+        _priv(tic=20, health=50.0, armor=30.0, kills=1, damage_taken=20.0, sector_ceiling=[4.0, 0.0, 128.0]),
+        obs=_obs(bullets=48.0, enemy_visible=True),
+    )
+    assert c_trade["ammo_waste"] == pytest.approx(0.0)
+    assert c_trade["kill"] + c_trade["damage"] < 0.0
 
 
 def test_reward_shaper_on_real_key_door_exit_doom_env():
@@ -216,8 +191,9 @@ def test_reward_shaper_on_real_key_door_exit_doom_env():
     use[S.BUTTONS.index("USE")] = 1
 
     try:
-        env.reset(seed=0)
+        obs, _ = env.reset(seed=0)
         shaper.reset(env.privileged_state())
+        prev_action = np.zeros(len(S.BUTTONS), dtype=np.int8)
         totals = {"key": 0.0, "unlock": 0.0, "exit": 0.0, "explore": 0.0}
         last_x = None
         for i in range(240):
@@ -225,8 +201,9 @@ def test_reward_shaper_on_real_key_door_exit_doom_env():
             stuck = last_x is not None and abs(st["x"] - last_x) < 0.5
             last_x = st["x"]
             action = use if (stuck and i % 6 == 0) else fwd
-            _, _, term, trunc, _ = env.step(action)
-            _, _, comp = shaper.step(env.privileged_state())
+            obs, _, term, trunc, _ = env.step(action)
+            _, _, comp = shaper.step(env.privileged_state(), action=action, prev_action=prev_action, obs=obs)
+            prev_action = action
             for k in totals:
                 totals[k] += comp[k]
             if term or trunc:

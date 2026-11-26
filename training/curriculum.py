@@ -1,0 +1,86 @@
+"""Staged curriculum and tier/family sampling weights for Role 2 training (`TRACK1_IMPROVEMENTS.md §2.2`)."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+from training.interfaces import EpisodeMetrics, MapSpec
+
+_DEFAULT_PHASE_TIER_WEIGHTS: tuple[dict[int, float], ...] = (
+    {1: 0.45, 2: 0.35, 3: 0.15, 4: 0.05},  # Phase 0 (warmup): dense short tasks + replay
+    {1: 0.20, 2: 0.30, 3: 0.40, 4: 0.10},  # Phase 1 (progression): key-return focus + T1-2 replay
+    {1: 0.15, 2: 0.20, 3: 0.35, 4: 0.30},  # Phase 2 (gauntlet): full difficulty mixture
+)
+
+
+@dataclass(frozen=True)
+class CurriculumConfig:
+    auto_curriculum: bool = True
+    tier_weights: dict[int, float] | None = None
+    family_weights: dict[str, float] | None = None
+    window_size: int = 32
+    min_episodes_to_promote: int = 16
+    tier12_exit_promote_threshold: float = 0.40
+    tier3_progress_promote_threshold: float = 0.30
+
+
+class CurriculumScheduler:
+    """Computes normalized per-map sampling weights and advances curriculum phases from episode outcomes."""
+
+    def __init__(self, config: CurriculumConfig | None = None):
+        self.config = config or CurriculumConfig()
+        self.phase = 0
+        self._t12_exits: deque[float] = deque(maxlen=self.config.window_size)
+        self._t3_progress: deque[float] = deque(maxlen=self.config.window_size)
+
+    def current_tier_weights(self) -> dict[int, float]:
+        if self.config.tier_weights is not None:
+            return dict(self.config.tier_weights)
+        idx = min(self.phase, len(_DEFAULT_PHASE_TIER_WEIGHTS) - 1)
+        return dict(_DEFAULT_PHASE_TIER_WEIGHTS[idx])
+
+    def compute_map_weights(self, map_specs: list[MapSpec]) -> list[float]:
+        if not map_specs:
+            raise ValueError("map_specs must not be empty")
+        tier_w = self.current_tier_weights()
+        fam_w = self.config.family_weights or {}
+
+        # Count how many maps fall into each tier so tier budget splits fairly per tier.
+        tier_counts: dict[int, int] = {}
+        for spec in map_specs:
+            tier_counts[spec.tier] = tier_counts.get(spec.tier, 0) + 1
+
+        raw = []
+        for spec in map_specs:
+            tw = float(tier_w.get(spec.tier, 1.0)) / float(max(1, tier_counts[spec.tier]))
+            fw = float(fam_w.get(spec.family, 1.0))
+            raw.append(max(1e-6, tw * fw))
+
+        total = float(sum(raw))
+        return [w / total for w in raw]
+
+    def observe_episodes(self, episodes: list[EpisodeMetrics]) -> bool:
+        """Record completed episodes and advance curriculum phase if mastery criteria are met."""
+        if not self.config.auto_curriculum or self.config.tier_weights is not None:
+            return False
+
+        for ep in episodes:
+            if ep.tier in (1, 2):
+                self._t12_exits.append(1.0 if ep.outcome == "exit" else 0.0)
+            elif ep.tier == 3:
+                progressed = (ep.outcome == "exit") or (ep.locked_doors_unlocked > 0)
+                self._t3_progress.append(1.0 if progressed else 0.0)
+
+        min_eps = self.config.min_episodes_to_promote
+        if self.phase == 0 and len(self._t12_exits) >= min_eps:
+            rate = sum(self._t12_exits) / len(self._t12_exits)
+            if rate >= self.config.tier12_exit_promote_threshold:
+                self.phase = 1
+                return True
+        elif self.phase == 1 and len(self._t3_progress) >= min_eps:
+            rate = sum(self._t3_progress) / len(self._t3_progress)
+            if rate >= self.config.tier3_progress_promote_threshold:
+                self.phase = 2
+                return True
+        return False

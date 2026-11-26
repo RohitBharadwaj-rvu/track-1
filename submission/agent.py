@@ -95,9 +95,10 @@ class DoomAgent:
         """Return a MultiBinary action: int8 array of shape (9,) with values in {0, 1}."""
         with torch.inference_mode():
             obs_t = _obs_to_batch_tensors(observation, self.device)
-            logits, _, next_hidden = self.policy.act_step(obs_t, self._prev_action, self._hidden)
-            action_t, _ = self.policy.sample_action(
-                logits,
+            action_t, _, _, next_hidden = self.policy.sample_action(
+                obs_t,
+                self._prev_action,
+                self._hidden,
                 deterministic=self.deterministic,
                 threshold=self.action_threshold,
             )

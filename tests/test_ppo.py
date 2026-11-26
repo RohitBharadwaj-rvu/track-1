@@ -65,7 +65,17 @@ def test_recurrent_ppo_learns_rewarded_button_on_synthetic_bandit():
     rng = np.random.default_rng(7)
     cfg = PolicyConfig(arch="stub", hidden_size=32)
     policy = build_policy(cfg)
-    ppo_cfg = PPOConfig(lr=5e-3, update_epochs=4, chunk_len=4, num_minibatches=2, ent_coef=0.005, target_kl=None)
+    ppo_cfg = PPOConfig(
+        lr=5e-3,
+        update_epochs=4,
+        chunk_len=4,
+        num_minibatches=2,
+        ent_coef=0.005,
+        target_kl=None,
+        use_asymmetric_critic=False,
+        aux_coef=0.0,
+        curiosity_coef=0.0,
+    )
     trainer = RecurrentPPOTrainer(policy, ppo_cfg, device="cpu")
 
     T, N, H = 8, 4, 32
@@ -131,7 +141,16 @@ def test_checkpoint_save_and_resume_preserves_outputs_and_optimizer(tmp_path):
     torch.manual_seed(0)
     cfg = PolicyConfig(arch="stub", hidden_size=16)
     policy = build_policy(cfg)
-    ppo_cfg = PPOConfig(lr=1e-3, update_epochs=1, chunk_len=4, num_minibatches=2, target_kl=None)
+    ppo_cfg = PPOConfig(
+        lr=1e-3,
+        update_epochs=1,
+        chunk_len=4,
+        num_minibatches=2,
+        target_kl=None,
+        use_asymmetric_critic=False,
+        aux_coef=0.0,
+        curiosity_coef=0.0,
+    )
     trainer = RecurrentPPOTrainer(policy, ppo_cfg, device="cpu")
     buf = _synthetic_buffer(T=8, N=2, H=16)
     trainer.update(buf, rng=np.random.default_rng(0))

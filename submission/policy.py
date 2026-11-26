@@ -270,7 +270,7 @@ def build_policy(config: PolicyConfig):
             value = self.critic(h).squeeze(-1)
             return logits, value, next_hidden
 
-        def sample_action(
+        def sample_from_logits(
             self,
             logits: torch.Tensor,
             *,
@@ -285,6 +285,25 @@ def build_policy(config: PolicyConfig):
                 threshold=threshold,
                 generator=generator,
             )
+
+        def sample_action(
+            self,
+            obs_batch: dict[str, torch.Tensor],
+            prev_action: torch.Tensor,
+            hidden: torch.Tensor,
+            *,
+            deterministic: bool = False,
+            threshold: float = 0.5,
+            generator: Any = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            logits, value, next_hidden = self.act_step(obs_batch, prev_action, hidden)
+            act, log_prob = self.sample_from_logits(
+                logits,
+                deterministic=deterministic,
+                threshold=threshold,
+                generator=generator,
+            )
+            return act, log_prob, value, next_hidden
 
         def logprob_and_entropy(
             self, logits: torch.Tensor, action_9d: torch.Tensor
@@ -649,7 +668,7 @@ def build_policy(config: PolicyConfig):
             logits, value = self._heads(out.squeeze(0), fused)
             return logits, value, next_hidden
 
-        def sample_action(
+        def sample_from_logits(
             self,
             logits: torch.Tensor,
             *,
@@ -664,6 +683,25 @@ def build_policy(config: PolicyConfig):
                 threshold=threshold,
                 generator=generator,
             )
+
+        def sample_action(
+            self,
+            obs_batch: dict[str, torch.Tensor],
+            prev_action: torch.Tensor,
+            hidden: torch.Tensor,
+            *,
+            deterministic: bool = False,
+            threshold: float = 0.5,
+            generator: Any = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            logits, value, next_hidden = self.act_step(obs_batch, prev_action, hidden)
+            act, log_prob = self.sample_from_logits(
+                logits,
+                deterministic=deterministic,
+                threshold=threshold,
+                generator=generator,
+            )
+            return act, log_prob, value, next_hidden
 
         def logprob_and_entropy(
             self, logits: torch.Tensor, action_9d: torch.Tensor

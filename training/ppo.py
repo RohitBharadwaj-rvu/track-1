@@ -1,7 +1,4 @@
-"""Recurrent PPO trainer with chunked BPTT, KL early stopping, and resumable checkpoints (Role 2).
-
-Uses only the frozen Role 1 contract (`policy.evaluate_chunks`, `PolicyConfig`, `save_checkpoint`).
-"""
+"""Recurrent PPO trainer with chunked BPTT, asymmetric critic, aux memory, and RND curiosity (Role 2)."""
 
 from __future__ import annotations
 
@@ -15,7 +12,9 @@ import torch.nn as nn
 
 from submission.obs import obs_to_torch
 from submission.policy import CHECKPOINT_FORMAT_VERSION, PolicyConfig, build_policy
-from training.rollout import RolloutBuffer
+from training.aux_heads import AsymmetricCritic, AuxMemoryHead, FeatureCaptureHook
+from training.curiosity import RNDConfig, RNDIntrinsicCuriosity
+from training.rollout import PRIV_FEATURE_DIM, RolloutBuffer
 
 
 @dataclass(frozen=True)
@@ -33,13 +32,17 @@ class PPOConfig:
     target_kl: float | None = 0.03
     normalize_advantages: bool = True
     clip_vloss: bool = True
+    use_asymmetric_critic: bool = True
+    aux_coef: float = 0.2
+    curiosity_coef: float = 0.02
+    detach_asymmetric_critic_feat: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class RecurrentPPOTrainer:
-    """Performs recurrent PPO updates over contiguous chunks from a `RolloutBuffer`."""
+    """Performs recurrent PPO updates over contiguous chunks with optional training-only heads."""
 
     def __init__(
         self,
@@ -47,23 +50,67 @@ class RecurrentPPOTrainer:
         config: PPOConfig | None = None,
         device: str | torch.device = "cpu",
         optimizer: torch.optim.Optimizer | None = None,
+        *,
+        asymmetric_critic: AsymmetricCritic | None = None,
+        aux_head: AuxMemoryHead | None = None,
+        curiosity: RNDIntrinsicCuriosity | None = None,
     ):
         self.policy = policy
         self.config = config or PPOConfig()
         self.device = torch.device(device)
-        self.optimizer = optimizer or torch.optim.Adam(self.policy.parameters(), lr=self.config.lr, eps=1e-5)
+        hidden_dim = int(getattr(getattr(policy, "config", None), "hidden_size", 256))
+
+        self.asymmetric_critic = asymmetric_critic
+        if self.config.use_asymmetric_critic and self.asymmetric_critic is None:
+            self.asymmetric_critic = AsymmetricCritic(hidden_dim, PRIV_FEATURE_DIM).to(self.device)
+
+        self.aux_head = aux_head
+        if self.config.aux_coef > 0.0 and self.aux_head is None:
+            self.aux_head = AuxMemoryHead(hidden_dim).to(self.device)
+
+        self.curiosity = curiosity
+        if self.config.curiosity_coef > 0.0 and self.curiosity is None:
+            self.curiosity = RNDIntrinsicCuriosity(
+                RNDConfig(coef=self.config.curiosity_coef), device=self.device
+            )
+
+        self.feature_hook = (
+            FeatureCaptureHook(self.policy)
+            if (self.asymmetric_critic is not None or self.aux_head is not None) and hasattr(self.policy, "critic")
+            else None
+        )
+
+        if optimizer is not None:
+            self.optimizer = optimizer
+        else:
+            params = list(self.policy.parameters())
+            if self.asymmetric_critic is not None:
+                params.extend(self.asymmetric_critic.parameters())
+            if self.aux_head is not None:
+                params.extend(self.aux_head.parameters())
+            self.optimizer = torch.optim.Adam(params, lr=self.config.lr, eps=1e-5)
 
     def set_lr(self, lr: float) -> None:
         for group in self.optimizer.param_groups:
             group["lr"] = float(lr)
 
+    def close(self) -> None:
+        if self.feature_hook is not None:
+            self.feature_hook.remove()
+            self.feature_hook = None
+
     def update(self, buffer: RolloutBuffer, rng: np.random.Generator | None = None) -> dict[str, float]:
         cfg = self.config
         self.policy.train()
+        if self.asymmetric_critic is not None:
+            self.asymmetric_critic.train()
+        if self.aux_head is not None:
+            self.aux_head.train()
         if rng is None:
             rng = np.random.default_rng()
 
         pg_losses, v_losses, entropies, kls, clipfracs, grad_norms = [], [], [], [], [], []
+        aux_losses, aux_accs, rnd_losses = [], [], []
         epochs_run = 0
         early_stopped = False
 
@@ -83,9 +130,17 @@ class RecurrentPPOTrainer:
                 if cfg.normalize_advantages and adv.numel() > 1:
                     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-                new_logprob, entropy, new_value = self.policy.evaluate_chunks(
+                new_logprob, entropy, blind_value = self.policy.evaluate_chunks(
                     obs_seq, prev_action_seq, action_seq, init_hidden, episode_starts
                 )
+
+                feat_seq = self.feature_hook.pop() if self.feature_hook is not None else None
+                if self.asymmetric_critic is not None and feat_seq is not None:
+                    priv_seq = torch.as_tensor(mb["priv_features"], dtype=torch.float32, device=self.device)
+                    critic_feat = feat_seq.detach() if cfg.detach_asymmetric_critic_feat else feat_seq
+                    new_value = self.asymmetric_critic(critic_feat, priv_seq)
+                else:
+                    new_value = blind_value
 
                 logratio = new_logprob - old_logprob
                 ratio = torch.exp(logratio)
@@ -105,9 +160,25 @@ class RecurrentPPOTrainer:
                 entropy_loss = entropy.mean()
                 loss = pg_loss - cfg.ent_coef * entropy_loss + cfg.vf_coef * v_loss
 
+                if self.aux_head is not None and cfg.aux_coef > 0.0 and feat_seq is not None:
+                    aux_targets = torch.as_tensor(mb["aux_targets"], dtype=torch.float32, device=self.device)
+                    aux_loss, aux_m = self.aux_head.compute_loss(feat_seq, aux_targets)
+                    loss = loss + cfg.aux_coef * aux_loss
+                    aux_losses.append(float(aux_loss.item()))
+                    aux_accs.append(aux_m["aux_seen_acc"])
+
+                if self.curiosity is not None:
+                    rnd_losses.append(self.curiosity.update(mb["obs"]))
+
+                all_params = list(self.policy.parameters())
+                if self.asymmetric_critic is not None:
+                    all_params.extend(self.asymmetric_critic.parameters())
+                if self.aux_head is not None:
+                    all_params.extend(self.aux_head.parameters())
+
                 self.optimizer.zero_grad()
                 loss.backward()
-                grad_norm = float(nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm).item())
+                grad_norm = float(nn.utils.clip_grad_norm_(all_params, cfg.max_grad_norm).item())
                 self.optimizer.step()
 
                 with torch.no_grad():
@@ -143,6 +214,10 @@ class RecurrentPPOTrainer:
             "clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
             "grad_norm": float(np.mean(grad_norms)) if grad_norms else 0.0,
             "explained_variance": explained_var,
+            "aux_loss": float(np.mean(aux_losses)) if aux_losses else 0.0,
+            "aux_seen_acc": float(np.mean(aux_accs)) if aux_accs else 0.0,
+            "rnd_loss": float(np.mean(rnd_losses)) if rnd_losses else 0.0,
+            "mean_intrinsic_reward": float(getattr(buffer, "last_mean_intrinsic_reward", 0.0)),
         }
 
 
@@ -153,11 +228,15 @@ def save_training_state(
     optimizer: torch.optim.Optimizer,
     ppo_config: PPOConfig,
     step_info: dict[str, Any] | None = None,
+    *,
+    asymmetric_critic: AsymmetricCritic | None = None,
+    aux_head: AuxMemoryHead | None = None,
+    curiosity: RNDIntrinsicCuriosity | None = None,
 ) -> Path:
-    """Save a resumable training checkpoint containing model + optimizer + step metadata."""
+    """Save a resumable training checkpoint containing model + optimizer + optional training heads."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    payload: dict[str, Any] = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "config": policy_config.to_dict(),
         "ppo_config": ppo_config.to_dict(),
@@ -165,6 +244,12 @@ def save_training_state(
         "optimizer_state_dict": optimizer.state_dict(),
         "step_info": dict(step_info or {}),
     }
+    if asymmetric_critic is not None:
+        payload["asymmetric_critic_state"] = asymmetric_critic.state_dict()
+    if aux_head is not None:
+        payload["aux_head_state"] = aux_head.state_dict()
+    if curiosity is not None:
+        payload["curiosity_state"] = curiosity.state_dict()
     torch.save(payload, out)
     return out
 
@@ -174,15 +259,49 @@ def load_training_state(
     device: str | torch.device = "cpu",
     policy: nn.Module | None = None,
     optimizer: torch.optim.Optimizer | None = None,
-) -> tuple[nn.Module, PolicyConfig, torch.optim.Optimizer, dict[str, Any]]:
+    *,
+    return_extras: bool = False,
+):
     """Restore a resumable training checkpoint saved by `save_training_state`."""
     payload = torch.load(Path(path), map_location=device, weights_only=False)
     policy_config = PolicyConfig.from_dict(payload["config"])
     if policy is None:
         policy = build_policy(policy_config).to(device)
     policy.load_state_dict(payload["state_dict"])
+
+    ppo_raw = payload.get("ppo_config", {})
+    hidden_dim = int(policy_config.hidden_size)
+    extras: dict[str, Any] = {}
+    params = list(policy.parameters())
+
+    asym = None
+    if "asymmetric_critic_state" in payload:
+        asym = AsymmetricCritic(hidden_dim, PRIV_FEATURE_DIM).to(device)
+        asym.load_state_dict(payload["asymmetric_critic_state"])
+        params.extend(asym.parameters())
+        extras["asymmetric_critic"] = asym
+        extras["asymmetric_critic_state"] = payload["asymmetric_critic_state"]
+
+    aux_head = None
+    if "aux_head_state" in payload:
+        aux_head = AuxMemoryHead(hidden_dim).to(device)
+        aux_head.load_state_dict(payload["aux_head_state"])
+        params.extend(aux_head.parameters())
+        extras["aux_head"] = aux_head
+        extras["aux_head_state"] = payload["aux_head_state"]
+
+    if "curiosity_state" in payload:
+        coef = float(ppo_raw.get("curiosity_coef", 0.02))
+        rnd = RNDIntrinsicCuriosity(RNDConfig(coef=coef), device=device)
+        rnd.load_state_dict(payload["curiosity_state"])
+        extras["curiosity"] = rnd
+        extras["curiosity_state"] = payload["curiosity_state"]
+
     if optimizer is None:
-        lr = float(payload.get("ppo_config", {}).get("lr", 3e-4))
-        optimizer = torch.optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
+        lr = float(ppo_raw.get("lr", 3e-4))
+        optimizer = torch.optim.Adam(params, lr=lr, eps=1e-5)
     optimizer.load_state_dict(payload["optimizer_state_dict"])
-    return policy, policy_config, optimizer, dict(payload.get("step_info", {}))
+    step_info = dict(payload.get("step_info", {}))
+    if return_extras:
+        return policy, policy_config, optimizer, step_info, extras
+    return policy, policy_config, optimizer, step_info
