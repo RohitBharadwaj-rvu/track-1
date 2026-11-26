@@ -276,3 +276,35 @@ def test_resolve_role3_suites_and_check_mvp_gate():
     assert check_mvp_gate(passing, baseline)["passed"] is True
     assert check_mvp_gate(failing_doors, baseline)["checks"]["simple_door_exit_pass"] is False
     assert check_mvp_gate(failing_combat, baseline)["checks"]["combat_pass"] is False
+
+
+def test_wasted_attack_diagnostics_and_eval_mode():
+    class _EmptyRoomShooter:
+        def __init__(self, observation_space, action_space, device: str):
+            self.action_space = action_space
+            self.eval_deterministic = False
+
+        def reset(self) -> None:
+            pass
+
+        def act(self, observation: dict) -> np.ndarray:
+            action = np.zeros(self.action_space.shape, dtype=np.int8)
+            action[S.BUTTONS.index("ATTACK")] = 1
+            return action
+
+    idle_wad = fixture_wad("#####\n#P..#\n#####")
+    spec = MapSpec(wad=idle_wad, family="multi_room", tier=2, split="dev", episode_ticks=40, seeds=(0,))
+    report = evaluate_suite(
+        [spec],
+        agent_factory=_EmptyRoomShooter,
+        agent_spec="tests.test_eval:_EmptyRoomShooter",
+        device="cpu",
+        eval_mode="deterministic",
+    )
+    overall = report["summary"]["overall"]
+    assert overall["attack_steps"] == 10
+    assert overall["wasted_attack_steps"] == 10
+    assert report["metadata"]["eval_mode"] == "deterministic"
+    assert report["metadata"]["eval_mode_applied"] is True
+    codes = {d["code"] for d in report["diagnosis"]}
+    assert "wasted_ammo" in codes
