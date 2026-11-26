@@ -49,6 +49,7 @@ _KEY_THING_TO_COLOR: dict[int, int] = {
 
 _EXIT_SPECIALS = {11, 52, 243, 244}
 _INF = 1e9
+_MAX_POTENTIAL_DIST = 4.0
 
 
 def _segments_intersect_batch(
@@ -305,7 +306,7 @@ class GeodesicPBRS:
         map_name: str = "MAP01",
         *,
         scale: float = 2.0,
-        gamma: float = 0.995,
+        gamma: float = 1.0,
         cell_size: float = 32.0,
     ) -> None:
         self.scale = float(scale)
@@ -394,7 +395,7 @@ class GeodesicPBRS:
         exit_dists = [float(dist[c]) for c in self.graph.exit_cells if dist[c] < _INF * 0.5]
         if exit_dists:
             d_min = min(exit_dists)
-            return ("exit",), -d_min / 1024.0
+            return ("exit",), max(0.0, _MAX_POTENTIAL_DIST - d_min / 1024.0)
 
         # Priority 2: Nearest reachable uncollected key whose color is still needed
         key_dists: list[tuple[float, int]] = []
@@ -403,7 +404,7 @@ class GeodesicPBRS:
                 key_dists.append((float(dist[k_cell]), idx))
         if key_dists:
             d_min, k_idx = min(key_dists)
-            return ("key", tuple(sorted(held_colors))), -d_min / 1024.0
+            return ("key", tuple(sorted(held_colors))), max(0.0, _MAX_POTENTIAL_DIST - d_min / 1024.0)
 
         return ("none",), 0.0
 
@@ -422,9 +423,9 @@ class GeodesicPBRS:
         if self.graph is None or self.scale <= 0.0:
             return 0.0
         if bool(priv_state.get("exit_reached")):
-            # Potential at exit is 0.0
-            raw = self.scale * (self.gamma * 0.0 - self._prev_phi)
-            self._prev_phi = 0.0
+            # Potential at exit (d=0) is _MAX_POTENTIAL_DIST
+            raw = self.scale * (self.gamma * _MAX_POTENTIAL_DIST - self._prev_phi)
+            self._prev_phi = _MAX_POTENTIAL_DIST
             return float(np.clip(raw, -0.5, 0.5))
         if bool(priv_state.get("dead")):
             return 0.0

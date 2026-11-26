@@ -38,15 +38,15 @@ class RewardConfig:
     damage_penalty: float = -0.032
     death_penalty: float = -3.0
     door_bounce_penalty: float = -0.25
-    use_waste_penalty: float = -0.02
-    use_hold_penalty: float = -0.03
-    wasted_ammo_penalty: float = -0.025
-    weapon_switch_waste_penalty: float = -0.025
+    use_waste_penalty: float = -0.008
+    use_hold_penalty: float = -0.025
+    wasted_ammo_penalty: float = -0.02
+    weapon_switch_waste_penalty: float = -0.02
     weapon_pickup_reward: float = 0.6
     max_pickup_bonus: float = 2.5
-    pbrs_scale: float = 2.0
-    pbrs_gamma: float = 0.995
-    step_penalty: float = -0.002
+    pbrs_scale: float = 3.0
+    pbrs_gamma: float = 1.0
+    step_penalty: float = -0.005
     cell_size: float = 64.0
     open_threshold: float = 8.0
 

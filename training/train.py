@@ -78,7 +78,7 @@ class TrainConfig:
     use_asymmetric_critic: bool = True
     aux_coef: float = 0.2
     curiosity_coef: float = 0.0
-    pbrs_scale: float = 2.0
+    pbrs_scale: float = 3.0
     anneal_lr: bool = True
     checkpoint_dir: str = "training/runs/default"
     export_path: str = "submission/weights/policy.pt"
@@ -194,7 +194,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     effective_reward_cfg = (
         reward_config
         if reward_config is not None
-        else RewardConfig(pbrs_scale=cfg.pbrs_scale, pbrs_gamma=cfg.gamma)
+        else RewardConfig(pbrs_scale=cfg.pbrs_scale, pbrs_gamma=1.0)
     )
     scheduler = CurriculumScheduler(
         CurriculumConfig(
@@ -642,7 +642,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-asymmetric-critic", dest="use_asymmetric_critic", action="store_false")
     p.add_argument("--aux-coef", type=float, default=0.2)
     p.add_argument("--curiosity-coef", type=float, default=0.0)
-    p.add_argument("--pbrs-scale", type=float, default=2.0)
+    p.add_argument("--pbrs-scale", type=float, default=3.0)
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--vec-mode", choices=("subproc", "sync"), default="subproc")
     p.add_argument("--max-cached-envs", type=int, default=24)

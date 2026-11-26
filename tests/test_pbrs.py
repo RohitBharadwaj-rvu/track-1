@@ -56,7 +56,7 @@ def test_pbrs_gives_positive_shaping_moving_toward_key_and_exit_and_resets_on_st
             player_angle=0,
         )
     )
-    pbrs = GeodesicPBRS(wad, "MAP01", scale=2.0, gamma=0.995)
+    pbrs = GeodesicPBRS(wad, "MAP01", scale=2.0, gamma=1.0)
     env = make_env(wad, "MAP01", episode_ticks=600, render_buffers=False)
     try:
         env.reset(seed=0)
@@ -64,19 +64,23 @@ def test_pbrs_gives_positive_shaping_moving_toward_key_and_exit_and_resets_on_st
         pbrs.reset(p0)
         assert pbrs._prev_stage_key is not None and pbrs._prev_stage_key[0] == "key"
 
-        # Walking 3 steps toward Red key moves closer without reaching it yet (positive PBRS)
+        # Walking toward Red key moves closer across 32u grid cells without picking up yet (positive PBRS)
         fwd = np.array([1, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int8)
         rewards = []
-        for _ in range(3):
+        for _ in range(10):
             env.step(fwd)
-            rewards.append(pbrs.step(env.privileged_state()))
+            priv = env.privileged_state()
+            if float(priv["keys"][2]) > 0.5:
+                break
+            rewards.append(pbrs.step(priv))
+        assert len(rewards) >= 2
         assert sum(rewards) > 0.0
         assert pbrs._prev_stage_key[0] == "key"
 
         # Picking up the Red key switches stage cleanly from 'key' to 'exit' with 0.0 spike
         p_key = dict(env.privileged_state())
-        assert p_key["keys"][2] < 0.5
-        p_key["keys"] = np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        if float(p_key["keys"][2]) < 0.5:
+            p_key["keys"] = np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         switch_rew = pbrs.step(p_key)
         assert switch_rew == pytest.approx(0.0)
         assert pbrs._prev_stage_key == ("exit",)
@@ -89,3 +93,29 @@ def test_pbrs_fails_safe_on_missing_wad():
     assert pbrs.graph is None
     pbrs.reset({"x": 0.0, "y": 0.0, "keys": np.zeros(6)})
     assert pbrs.step({"x": 64.0, "y": 0.0, "keys": np.zeros(6)}) == 0.0
+
+
+def test_pbrs_never_rewards_standing_still(tmp_path):
+    wad = str(
+        build_grid_wad(
+            tmp_path / "still.wad",
+            "###########\n#P..r#....#\n#....R..E.#\n#....#....#\n###########",
+            cell_size=64,
+            player_angle=0,
+        )
+    )
+    env = make_env(wad, "MAP01", episode_ticks=200, render_buffers=False)
+    try:
+        env.reset(seed=0)
+        p0 = env.privileged_state()
+    finally:
+        env.close()
+
+    pbrs_exact = GeodesicPBRS(wad, "MAP01", scale=3.0, gamma=1.0)
+    pbrs_exact.reset(p0)
+    assert pbrs_exact._prev_phi > 0.0
+    assert pbrs_exact.step(p0) == pytest.approx(0.0)
+
+    pbrs_disc = GeodesicPBRS(wad, "MAP01", scale=3.0, gamma=0.995)
+    pbrs_disc.reset(p0)
+    assert pbrs_disc.step(p0) <= 0.0
