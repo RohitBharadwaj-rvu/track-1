@@ -291,3 +291,56 @@ def test_use_hold_attack_press_and_weapon_switch_penalties():
         obs=obs_fist,
     )
     assert c_sw_fist["weapon_switch_penalty"] == pytest.approx(0.0)
+
+
+def test_continuous_spin_penalty_allows_normal_turns_and_penalizes_spinning():
+    cfg = RewardConfig()
+    shaper = RewardShaper(cfg)
+    shaper.reset(_priv(tic=0, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]))
+
+    turn_l = np.zeros(9, dtype=np.int8)
+    turn_l[4] = 1
+    turn_r = np.zeros(9, dtype=np.int8)
+    turn_r[5] = 1
+    straight = np.zeros(9, dtype=np.int8)
+
+    prev = straight
+    for i in range(cfg.spin_threshold_steps):
+        _, _, comp = shaper.step(
+            _priv(tic=(i + 1) * 4, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+            action=turn_l,
+            prev_action=prev,
+        )
+        assert comp["spin_penalty"] == pytest.approx(0.0)
+        prev = turn_l
+
+    # Step 9+ consecutive left turns trigger spin_penalty
+    _, _, comp9 = shaper.step(
+        _priv(tic=40, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=turn_l,
+        prev_action=turn_l,
+    )
+    assert comp9["spin_penalty"] == pytest.approx(cfg.spin_penalty)
+
+    # Switching to TURN_RIGHT or going straight resets streak to 0.0
+    _, _, comp_flip = shaper.step(
+        _priv(tic=44, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=turn_r,
+        prev_action=turn_l,
+    )
+    assert comp_flip["spin_penalty"] == pytest.approx(0.0)
+
+    for i in range(cfg.spin_threshold_steps):
+        _, _, comp_r = shaper.step(
+            _priv(tic=48 + i * 4, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+            action=turn_r,
+            prev_action=turn_r,
+        )
+    assert comp_r["spin_penalty"] == pytest.approx(cfg.spin_penalty)
+
+    _, _, comp_str = shaper.step(
+        _priv(tic=100, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=straight,
+        prev_action=turn_r,
+    )
+    assert comp_str["spin_penalty"] == pytest.approx(0.0)

@@ -13,6 +13,8 @@ import numpy as np
 
 from training.interfaces import PrivilegedEventTracker, StepEvents
 
+_TURN_LEFT_IDX = 4
+_TURN_RIGHT_IDX = 5
 _ATTACK_IDX = 6
 _USE_IDX = 7
 _WEAPON_SWITCH_IDX = 8
@@ -46,6 +48,8 @@ class RewardConfig:
     max_pickup_bonus: float = 2.5
     pbrs_scale: float = 3.0
     pbrs_gamma: float = 1.0
+    spin_penalty: float = -0.010
+    spin_threshold_steps: int = 8
     step_penalty: float = -0.005
     cell_size: float = 64.0
     open_threshold: float = 8.0
@@ -93,6 +97,8 @@ class RewardShaper:
         self._prev_ammo: float | None = None
         self._owned_weapons: set[int] = set()
         self._pickup_bonus_earned: float = 0.0
+        self._consec_turn_dir: int = 0
+        self._consec_turn_steps: int = 0
 
     @property
     def unique_cells_visited(self) -> int:
@@ -125,6 +131,8 @@ class RewardShaper:
         if obs is not None and "vitals" in obs:
             self._owned_weapons.add(int(round(float(obs["vitals"][2]))))
         self._pickup_bonus_earned = 0.0
+        self._consec_turn_dir = 0
+        self._consec_turn_steps = 0
         if self.pbrs is not None:
             self.pbrs.reset(priv_state)
 
@@ -240,6 +248,20 @@ class RewardShaper:
 
         pbrs_rew = self.pbrs.step(priv_state) if self.pbrs is not None else 0.0
 
+        spin_pen = 0.0
+        if action is not None:
+            td = int(action[_TURN_LEFT_IDX] > 0) - int(action[_TURN_RIGHT_IDX] > 0)
+            if td != 0 and td == self._consec_turn_dir:
+                self._consec_turn_steps += 1
+            elif td != 0:
+                self._consec_turn_dir = td
+                self._consec_turn_steps = 1
+            else:
+                self._consec_turn_dir = 0
+                self._consec_turn_steps = 0
+            if self._consec_turn_steps > cfg.spin_threshold_steps:
+                spin_pen = cfg.spin_penalty
+
         self._prev_health = curr_health
         self._prev_armor = curr_armor
         if curr_ammo is not None:
@@ -261,6 +283,7 @@ class RewardShaper:
             "weapon_switch_penalty": weapon_switch_penalty,
             "pickup": pickup,
             "pbrs": pbrs_rew,
+            "spin_penalty": spin_pen,
             "time": cfg.step_penalty,
         }
         return float(sum(components.values())), events, components
