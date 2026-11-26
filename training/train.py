@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -27,7 +28,7 @@ from training.rollout import (
 
 @dataclass
 class TrainConfig:
-    arch: str = "stub"
+    arch: str = "telemetry_gru_v1"
     hidden_size: int = 256
     ray_channels: int = 32
     entity_dim: int = 64
@@ -265,7 +266,8 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                     },
                 )
                 if cfg.export_path:
-                    save_checkpoint(cfg.export_path, policy, policy_cfg, meta=record)
+                    plain_meta = {k: (v.item() if hasattr(v, "item") else v) for k, v in record.items()}
+                    save_checkpoint(cfg.export_path, policy, policy_cfg, meta=plain_meta)
 
         # Always save final checkpoints at end of run.
         save_training_state(
@@ -282,7 +284,8 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
         )
         export_out = None
         if cfg.export_path:
-            export_out = str(save_checkpoint(cfg.export_path, policy, policy_cfg, meta=last_summary))
+            plain_meta = {k: (v.item() if hasattr(v, "item") else v) for k, v in last_summary.items()}
+            export_out = str(save_checkpoint(cfg.export_path, policy, policy_cfg, meta=plain_meta))
 
     elapsed_s = max(1e-6, time.perf_counter() - t_start)
     overall_sps = (target_updates * steps_per_update) / elapsed_s
@@ -374,14 +377,28 @@ def verify_checkpoint_two_maps(
     device: str = "cpu",
     deterministic: bool = True,
 ) -> list[EpisodeMetrics]:
-    """Reload an exported checkpoint and play two consecutive maps with explicit memory resets."""
-    import torch
+    """Reload an exported checkpoint through `DoomAgent` and play two consecutive maps with reset()."""
     from doom_env import make_env
+    from doom_env.spaces import action_space as make_action_space
+    from doom_env.spaces import observation_space as make_observation_space
+    from submission.agent import DoomAgent
     from training.rollout import _resolve_wad_path
 
     if not map_specs:
         raise ValueError("map_specs must not be empty")
-    policy, _, _ = load_checkpoint(checkpoint_path, device=device)
+
+    prev_override = os.environ.get("DOOM_AGENT_WEIGHTS")
+    os.environ["DOOM_AGENT_WEIGHTS"] = str(Path(checkpoint_path).resolve())
+    try:
+        agent = DoomAgent(make_observation_space(), make_action_space(), device=device)
+        if hasattr(agent, "deterministic"):
+            agent.deterministic = deterministic
+    finally:
+        if prev_override is None:
+            os.environ.pop("DOOM_AGENT_WEIGHTS", None)
+        else:
+            os.environ["DOOM_AGENT_WEIGHTS"] = prev_override
+
     chosen = [map_specs[0], map_specs[1 % len(map_specs)]]
     outcomes: list[EpisodeMetrics] = []
 
@@ -390,21 +407,16 @@ def verify_checkpoint_two_maps(
         shaper = RewardShaper()
         try:
             raw_obs, _ = env.reset(seed=idx)
+            agent.reset()
             shaper.reset(env.privileged_state())
-            hidden = policy.init_hidden(1, device)
-            prev_action = torch.zeros(1, NUM_ACTIONS, dtype=torch.float32, device=device)
             steps = keys = doors = unlocks = kills = 0
             dmg = total_rew = 0.0
             t0 = time.perf_counter()
 
             while True:
-                p_obs = batch_preprocessed_obs([preprocess_obs(raw_obs)])
-                obs_t = obs_to_torch(p_obs, device)
-                with torch.no_grad():
-                    logits, _, hidden = policy.act_step(obs_t, prev_action, hidden)
-                    act_t = (logits > 0.0).float() if deterministic else torch.bernoulli(torch.sigmoid(logits))
-                prev_action = act_t
-                act_np = act_t.squeeze(0).cpu().numpy().astype(np.int8)
+                t_act = time.perf_counter()
+                act_np = np.asarray(agent.act(raw_obs), dtype=np.int8)
+                t_act_elapsed = time.perf_counter() - t_act
 
                 raw_obs, _, term, trunc, _ = env.step(act_np)
                 priv = env.privileged_state()
@@ -436,7 +448,7 @@ def verify_checkpoint_two_maps(
                             final_health=float(priv["health"]),
                             unique_cells_visited=shaper.unique_cells_visited,
                             total_reward=float(total_rew),
-                            agent_time_s=float(time.perf_counter() - t0),
+                            agent_time_s=float(time.perf_counter() - t0 + 0.0 * t_act_elapsed),
                         )
                     )
                     break
@@ -447,7 +459,7 @@ def verify_checkpoint_two_maps(
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Role 2 Recurrent PPO Trainer & Throughput Sweeper")
-    p.add_argument("--arch", default="stub")
+    p.add_argument("--arch", default="telemetry_gru_v1")
     p.add_argument("--hidden-size", type=int, default=256)
     p.add_argument("--ray-channels", type=int, default=32)
     p.add_argument("--entity-dim", type=int, default=64)

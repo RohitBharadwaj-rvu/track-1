@@ -165,3 +165,26 @@ def test_checkpoint_save_and_resume_preserves_outputs_and_optimizer(tmp_path):
     torch.testing.assert_close(v_res, val_before)
     torch.testing.assert_close(l_exp, logits_before)
     torch.testing.assert_close(v_exp, val_before)
+
+
+def test_recurrent_ppo_updates_real_telemetry_gru_v1_policy(tmp_path):
+    torch.manual_seed(0)
+    cfg = PolicyConfig(arch="telemetry_gru_v1")
+    policy = build_policy(cfg)
+    before = [p.detach().clone() for p in policy.parameters()]
+    ppo_cfg = PPOConfig(lr=3e-4, update_epochs=2, chunk_len=4, num_minibatches=2, target_kl=None)
+    trainer = RecurrentPPOTrainer(policy, ppo_cfg, device="cpu")
+    buf = _synthetic_buffer(T=8, N=2, H=cfg.hidden_size)
+
+    metrics = trainer.update(buf, rng=np.random.default_rng(0))
+    assert metrics["updates"] > 0
+    for key in ("policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac", "grad_norm"):
+        assert np.isfinite(metrics[key]), f"{key} is not finite: {metrics[key]}"
+    assert any(not torch.allclose(b, a) for b, a in zip(before, policy.parameters()))
+
+    ckpt = tmp_path / "telemetry_v1.pt"
+    save_checkpoint(ckpt, policy, cfg, {"arch": "telemetry_gru_v1", "updates": 1})
+    loaded, loaded_cfg, meta = load_checkpoint(ckpt, device="cpu")
+    assert loaded_cfg.arch == "telemetry_gru_v1"
+    assert meta["updates"] == 1
+    assert sum(p.numel() for p in loaded.parameters()) == sum(p.numel() for p in policy.parameters())
