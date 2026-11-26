@@ -78,8 +78,10 @@ We ignore `rgb` `(120, 160, 3)` and `depth` `(120, 160)` and encode only the thr
     *   **No Latent Rollouts at Test Time:** `act()` runs only `Encoder -> Posterior Update -> Spatial Memory Read -> Actor Head` (~2–5 ms, well under the **40 ms/step** budget; e.g., 21 s total for 2,100-tick maps, 42 s for 4,200-tick maps).
     *   **Stateless Resets:** `reset(self)` completely zeros GRU hidden states, spatial memory grids, and `prev_action` buffers (`RESET_TIMEOUT_S = 10.0`).
     *   **Fast Warm-Up:** `__init__(self)` (`INIT_TIMEOUT_S = 60.0`) loads weights onto `device` and runs a dummy forward pass so CUDA/JIT initialization finishes before the `FIRST_ACT_TIMEOUT_S = 10.0` (and `ACT_TIMEOUT_S = 5.0` thereafter).
-*   **Pre-Submission Verification:**
+*   **Pre-Submission Verification & Deliverables:**
     *   Run `uv run python validate.py` locally and `python validate.py --docker` (against `Dockerfile` / official image) before every major milestone and before final submission.
+    *   Do **not** rely on a custom `Dockerfile` (evaluation always runs in the organizers' official base image + `submission/requirements.txt`).
+    *   Prepare the **2-Page Project Brief (PDF, max 2 pages)** summarizing our USP, neural architecture, spatial memory design, and training/exploration pipeline (required alongside the public GitHub repo URL).
 
 ---
 
