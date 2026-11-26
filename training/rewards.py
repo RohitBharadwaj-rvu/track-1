@@ -38,10 +38,10 @@ class RewardConfig:
     max_post_key_cells: int = 30
     kill_reward: float = 0.8
     damage_penalty: float = -0.032
-    death_penalty: float = -3.0
+    death_penalty: float = -5.0
     door_bounce_penalty: float = -0.25
     use_waste_penalty: float = -0.008
-    use_hold_penalty: float = -0.025
+    use_hold_penalty: float = -0.12
     wasted_ammo_penalty: float = -0.02
     weapon_switch_waste_penalty: float = -0.02
     weapon_pickup_reward: float = 0.6
