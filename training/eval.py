@@ -3,7 +3,7 @@
 Follows the frozen contracts in `training/interfaces.py` and `docs/EVALUATION.md`.
 Usage:
     python -m training.eval --seeds 0 1
-    python -m training.eval --split dev --out eval_dev.json
+    python -m training.eval --split dev --out eval_dev.json --record-dir /tmp/replays --keep-key-replays
     python -m training.eval --compare baseline.json eval_dev.json
 """
 
@@ -18,7 +18,6 @@ import json
 from pathlib import Path
 import statistics
 import subprocess
-import sys
 import time
 from typing import Any, Callable
 
@@ -26,7 +25,7 @@ import numpy as np
 
 from doom_env import make_env
 from doom_env.limits import agent_budget_s
-from doom_env.spaces import FRAME_SKIP
+from doom_env.spaces import BUTTONS, FRAME_SKIP
 from training.interfaces import EpisodeMetrics, MapSpec, PrivilegedEventTracker
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +41,14 @@ DEFAULT_FALLBACK_MAPS = [
         seeds=(0, 1),
     )
 ]
+
+_IDX_FWD = BUTTONS.index("MOVE_FORWARD")
+_IDX_BACK = BUTTONS.index("MOVE_BACKWARD")
+_IDX_LEFT = BUTTONS.index("MOVE_LEFT")
+_IDX_RIGHT = BUTTONS.index("MOVE_RIGHT")
+_IDX_TURN_L = BUTTONS.index("TURN_LEFT")
+_IDX_TURN_R = BUTTONS.index("TURN_RIGHT")
+_IDX_USE = BUTTONS.index("USE")
 
 
 def load_agent_factory(agent_spec: str = DEFAULT_AGENT_SPEC) -> Callable[[Any, Any, str], Any]:
@@ -169,6 +176,10 @@ def evaluate_episode(
     locked_doors_unlocked = 0
     kills = 0
     damage_taken = 0.0
+    use_presses = 0
+    consecutive_use_presses = 0
+    opposing_button_steps = 0
+    prev_use = 0
     step_times_ms: list[float] = []
     outcome = "timeout"
     error_msg: str | None = None
@@ -200,6 +211,20 @@ def evaluate_episode(
                 break
 
             step_times_ms.append((time.perf_counter() - t0) * 1000.0)
+            curr_use = int(action[_IDX_USE])
+            if curr_use:
+                use_presses += 1
+                if prev_use:
+                    consecutive_use_presses += 1
+            prev_use = curr_use
+
+            if (
+                (action[_IDX_FWD] and action[_IDX_BACK])
+                or (action[_IDX_LEFT] and action[_IDX_RIGHT])
+                or (action[_IDX_TURN_L] and action[_IDX_TURN_R])
+            ):
+                opposing_button_steps += 1
+
             obs, reward, terminated, truncated, info = env.step(action)
             steps += 1
             total_reward += float(reward)
@@ -230,6 +255,8 @@ def evaluate_episode(
     finally:
         env.close()
 
+    had_key_pickup = keys_picked_up > 0
+    died_after_pickup = outcome == "death" and had_key_pickup
     agent_time_s = sum(step_times_ms) / 1000.0
     budget_s = agent_budget_s(spec.episode_ticks)
     sorted_ms = sorted(step_times_ms)
@@ -244,6 +271,11 @@ def evaluate_episode(
         "max_act_ms": round(max(step_times_ms), 3) if step_times_ms else 0.0,
         "budget_s": round(budget_s, 3),
         "within_budget": (agent_time_s <= budget_s) and (error_msg is None),
+        "use_presses": use_presses,
+        "consecutive_use_presses": consecutive_use_presses,
+        "opposing_button_steps": opposing_button_steps,
+        "had_key_pickup": had_key_pickup,
+        "died_after_pickup": died_after_pickup,
     }
     if replay_path is not None:
         extra["replay_path"] = str(replay_path)
@@ -286,11 +318,26 @@ def _aggregate_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
             "doors_opened": 0,
             "locked_doors_unlocked": 0,
             "kills": 0,
+            "episodes_with_pickup": 0,
+            "episodes_with_unlock": 0,
+            "deaths_after_pickup": 0,
+            "unlock_given_pickup_rate": None,
+            "exit_given_unlock_rate": None,
             "mean_unique_cells": 0.0,
+            "total_steps": 0,
+            "use_presses": 0,
+            "consecutive_use_presses": 0,
+            "opposing_button_steps": 0,
             "total_agent_time_s": 0.0,
             "max_step_ms": 0.0,
             "all_within_budget": True,
         }
+    episodes_with_pickup = sum(1 for e in episodes if e.keys_picked_up > 0)
+    episodes_with_unlock = sum(1 for e in episodes if e.locked_doors_unlocked > 0)
+    episodes_with_exit_after_unlock = sum(
+        1 for e in episodes if e.locked_doors_unlocked > 0 and e.outcome == "exit"
+    )
+    deaths_after_pickup = sum(1 for e in episodes if bool(e.extra.get("died_after_pickup", False)))
     return {
         "episodes": n,
         "exits": sum(1 for e in episodes if e.outcome == "exit"),
@@ -302,7 +349,22 @@ def _aggregate_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
         "doors_opened": sum(e.doors_opened for e in episodes),
         "locked_doors_unlocked": sum(e.locked_doors_unlocked for e in episodes),
         "kills": sum(e.kills for e in episodes),
+        "episodes_with_pickup": episodes_with_pickup,
+        "episodes_with_unlock": episodes_with_unlock,
+        "deaths_after_pickup": deaths_after_pickup,
+        "unlock_given_pickup_rate": (
+            round(episodes_with_unlock / episodes_with_pickup, 4) if episodes_with_pickup > 0 else None
+        ),
+        "exit_given_unlock_rate": (
+            round(episodes_with_exit_after_unlock / episodes_with_unlock, 4)
+            if episodes_with_unlock > 0
+            else None
+        ),
         "mean_unique_cells": round(sum(e.unique_cells_visited for e in episodes) / n, 2),
+        "total_steps": sum(e.steps for e in episodes),
+        "use_presses": sum(int(e.extra.get("use_presses", 0)) for e in episodes),
+        "consecutive_use_presses": sum(int(e.extra.get("consecutive_use_presses", 0)) for e in episodes),
+        "opposing_button_steps": sum(int(e.extra.get("opposing_button_steps", 0)) for e in episodes),
         "total_agent_time_s": round(sum(e.agent_time_s for e in episodes), 4),
         "max_step_ms": round(max((e.extra.get("max_act_ms", 0.0) for e in episodes), default=0.0), 3),
         "all_within_budget": all(bool(e.extra.get("within_budget", False)) for e in episodes),
@@ -324,6 +386,119 @@ def summarize_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
     return {"overall": overall, "by_tier": by_tier, "by_family": by_family}
 
 
+def diagnose_report(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Diagnose the primary bottlenecks from event counts (`REVISED_PLAN.md §4` & `updates.md §5`)."""
+    overall = report["summary"]["overall"]
+    findings: list[dict[str, Any]] = []
+
+    if overall.get("errors", 0) > 0 or not overall.get("all_within_budget", True):
+        findings.append(
+            {
+                "priority": 1,
+                "code": "runtime_errors_or_budget",
+                "evidence": f"errors={overall.get('errors', 0)}, all_within_budget={overall.get('all_within_budget')}, max_step_ms={overall.get('max_step_ms', 0.0)}",
+                "recommendation": "Fix agent runtime/action-shape errors or reduce model compute below 40 ms/step before training further.",
+            }
+        )
+
+    total_steps = int(overall.get("total_steps", 0))
+    opposing = int(overall.get("opposing_button_steps", 0))
+    if total_steps > 0 and (opposing / total_steps) >= 0.10:
+        findings.append(
+            {
+                "priority": 2,
+                "code": "opposing_buttons",
+                "evidence": f"opposing_button_steps={opposing}/{total_steps} ({opposing / total_steps:.1%})",
+                "recommendation": "Replace independent movement/turn binaries with mutually-exclusive 3-way categorical heads (updates.md §2).",
+            }
+        )
+
+    if overall.get("doors_opened", 0) == 0 and overall.get("locked_doors_unlocked", 0) == 0:
+        consec_use = int(overall.get("consecutive_use_presses", 0))
+        findings.append(
+            {
+                "priority": 3,
+                "code": "use_bounce_or_no_doors",
+                "evidence": f"doors_opened=0, locked_doors_unlocked=0, consecutive_use_presses={consec_use}",
+                "recommendation": "Check USE button-edge handling, add USE-spam penalty in training/rewards.py, and verify door_open_reward (updates.md §2).",
+            }
+        )
+
+    if overall.get("keys_picked_up", 0) > 0 and overall.get("locked_doors_unlocked", 0) == 0:
+        findings.append(
+            {
+                "priority": 4,
+                "code": "key_without_unlock",
+                "evidence": f"keys_picked_up={overall['keys_picked_up']}, locked_doors_unlocked=0",
+                "recommendation": "Agent finds keys but loses the return route; add key-return curriculum or test learned landmark memory slots (REVISED_PLAN.md §4).",
+            }
+        )
+
+    if overall.get("deaths_after_pickup", 0) > 0:
+        findings.append(
+            {
+                "priority": 5,
+                "code": "deaths_after_pickup",
+                "evidence": f"deaths_after_pickup={overall['deaths_after_pickup']}",
+                "recommendation": "Add combat encounters along the post-pickup return path in the training curriculum (REVISED_PLAN.md §4).",
+            }
+        )
+
+    if overall.get("mean_unique_cells", 0.0) < 10.0:
+        findings.append(
+            {
+                "priority": 6,
+                "code": "low_exploration",
+                "evidence": f"mean_unique_cells={overall.get('mean_unique_cells', 0.0)}",
+                "recommendation": "Increase first-visit exploration bonus and add branching/loop training maps.",
+            }
+        )
+
+    return findings
+
+
+def _select_and_prune_replays(
+    episodes: list[EpisodeMetrics],
+    *,
+    keep_key_replays: bool,
+) -> dict[str, str | None]:
+    recorded = [e for e in episodes if e.extra.get("replay_path")]
+    if not recorded:
+        return {"best_success": None, "representative_failure": None}
+
+    successes = [e for e in recorded if e.outcome == "exit"]
+    best_success_ep = min(successes, key=lambda e: e.steps) if successes else None
+
+    failures = [e for e in recorded if e.outcome != "exit"]
+    rep_failure_ep = None
+    if failures:
+        def _failure_rank(e: EpisodeMetrics) -> tuple[int, int]:
+            if e.keys_picked_up > 0 and e.locked_doors_unlocked == 0:
+                return (0, -e.unique_cells_visited)
+            if e.extra.get("died_after_pickup"):
+                return (1, -e.unique_cells_visited)
+            if e.outcome == "death":
+                return (2, -e.unique_cells_visited)
+            if e.outcome == "error":
+                return (3, 0)
+            return (4, -e.unique_cells_visited)
+
+        rep_failure_ep = min(failures, key=_failure_rank)
+
+    best_path = best_success_ep.extra["replay_path"] if best_success_ep else None
+    fail_path = rep_failure_ep.extra["replay_path"] if rep_failure_ep else None
+    keep_set = {p for p in (best_path, fail_path) if p is not None}
+
+    if keep_key_replays:
+        for e in recorded:
+            rp = e.extra.get("replay_path")
+            if rp and rp not in keep_set:
+                Path(rp).unlink(missing_ok=True)
+                e.extra["replay_pruned"] = True
+
+    return {"best_success": best_path, "representative_failure": fail_path}
+
+
 def evaluate_suite(
     specs: list[MapSpec],
     *,
@@ -333,6 +508,7 @@ def evaluate_suite(
     seeds_override: tuple[int, ...] | None = None,
     render_buffers: bool = False,
     record_dir: Path | None = None,
+    keep_key_replays: bool = False,
 ) -> dict[str, Any]:
     """Instantiate an agent once and evaluate all `(spec, seed)` episodes."""
     if not specs:
@@ -372,7 +548,12 @@ def evaluate_suite(
     wall_time_s = round(time.perf_counter() - wall_start, 4)
 
     summary = summarize_episodes(episodes)
-    return {
+    if record_dir is not None:
+        summary["key_replays"] = _select_and_prune_replays(
+            episodes, keep_key_replays=keep_key_replays
+        )
+
+    report = {
         "metadata": {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "git_commit": _git_commit(),
@@ -387,6 +568,22 @@ def evaluate_suite(
         "summary": summary,
         "episodes": [asdict(e) for e in episodes],
     }
+    report["diagnosis"] = diagnose_report(report)
+    return report
+
+
+def _per_map_totals(report: dict[str, Any]) -> dict[str, dict[str, int]]:
+    totals: dict[str, dict[str, int]] = {}
+    for ep in report.get("episodes", []):
+        key = f"{Path(ep['wad']).name}:{ep['map_name']}"
+        row = totals.setdefault(key, {"exits": 0, "unlocks": 0, "kills": 0, "deaths": 0})
+        if ep.get("outcome") == "exit":
+            row["exits"] += 1
+        elif ep.get("outcome") == "death":
+            row["deaths"] += 1
+        row["unlocks"] += int(ep.get("locked_doors_unlocked", 0))
+        row["kills"] += int(ep.get("kills", 0))
+    return totals
 
 
 def compare_reports(baseline: dict[str, Any], challenger: dict[str, Any]) -> dict[str, Any]:
@@ -404,40 +601,80 @@ def compare_reports(baseline: dict[str, Any], challenger: dict[str, Any]) -> dic
         "mean_unique_cells": round(c["mean_unique_cells"] - b["mean_unique_cells"], 2),
     }
 
+    b_maps = _per_map_totals(baseline)
+    c_maps = _per_map_totals(challenger)
+    all_map_keys = sorted(set(b_maps) | set(c_maps))
+    per_map_deltas: dict[str, dict[str, int]] = {}
+    regressed_maps: list[str] = []
+    maps_with_prog_gain = 0
+    for mk in all_map_keys:
+        bm = b_maps.get(mk, {"exits": 0, "unlocks": 0, "kills": 0, "deaths": 0})
+        cm = c_maps.get(mk, {"exits": 0, "unlocks": 0, "kills": 0, "deaths": 0})
+        md = {
+            "exits_delta": cm["exits"] - bm["exits"],
+            "unlocks_delta": cm["unlocks"] - bm["unlocks"],
+            "kills_delta": cm["kills"] - bm["kills"],
+            "deaths_delta": cm["deaths"] - bm["deaths"],
+        }
+        per_map_deltas[mk] = md
+        if md["exits_delta"] < 0 or md["unlocks_delta"] < 0:
+            regressed_maps.append(mk)
+        if md["exits_delta"] > 0 or md["unlocks_delta"] > 0:
+            maps_with_prog_gain += 1
+
+    single_map_gain_warning = (
+        len(all_map_keys) >= 2
+        and (deltas["tier34_exits"] + deltas["tier12_exits"] > 0 or deltas["locked_doors_unlocked"] > 0)
+        and maps_with_prog_gain == 1
+    )
+
     b_clean = b["errors"] == 0 and b.get("all_within_budget", True)
     c_clean = c["errors"] == 0 and c.get("all_within_budget", True)
     if not c_clean:
-        return {
-            "verdict": "keep_incumbent",
-            "reason": "Challenger failed clean-run / compute-budget gate.",
-            "deltas": deltas,
-        }
-    if not b_clean and c_clean:
-        return {
-            "verdict": "promote",
-            "reason": "Challenger passed clean-run gate where baseline failed.",
-            "deltas": deltas,
-        }
+        verdict = "keep_incumbent"
+        reason = "Challenger failed clean-run / compute-budget gate."
+    elif not b_clean and c_clean:
+        verdict = "promote"
+        reason = "Challenger passed clean-run gate where baseline failed."
+    else:
+        verdict = "tie"
+        reason = "No difference across selection metrics."
+        for key in ("tier34_exits", "locked_doors_unlocked", "tier12_exits", "kills"):
+            diff = deltas[key]
+            if diff > 0:
+                verdict = "promote"
+                reason = f"Challenger improved {key} (+{diff})."
+                break
+            if diff < 0:
+                verdict = "keep_incumbent"
+                reason = f"Challenger regressed {key} ({diff})."
+                break
 
-    for key in ("tier34_exits", "locked_doors_unlocked", "tier12_exits", "kills"):
-        diff = deltas[key]
-        if diff > 0:
-            return {"verdict": "promote", "reason": f"Challenger improved {key} (+{diff}).", "deltas": deltas}
-        if diff < 0:
-            return {"verdict": "keep_incumbent", "reason": f"Challenger regressed {key} ({diff}).", "deltas": deltas}
-
-    return {"verdict": "tie", "reason": "No difference across selection metrics.", "deltas": deltas}
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "deltas": deltas,
+        "per_map_deltas": per_map_deltas,
+        "regressed_maps": regressed_maps,
+        "single_map_gain_warning": single_map_gain_warning,
+    }
 
 
 def format_report_markdown(report: dict[str, Any]) -> str:
     """Format an evaluation report into a readable Markdown summary."""
     meta = report["metadata"]
     overall = report["summary"]["overall"]
+    unlock_rate = overall.get("unlock_given_pickup_rate")
+    exit_rate_u = overall.get("exit_given_unlock_rate")
+    unlock_str = f"{unlock_rate:.1%}" if unlock_rate is not None else "n/a"
+    exit_u_str = f"{exit_rate_u:.1%}" if exit_rate_u is not None else "n/a"
+
     lines = [
         f"## Evaluation Summary ({meta.get('git_commit') or 'uncommitted'})",
         f"- Agent: `{meta['agent_spec']}` | Device: `{meta['device']}` | Init: `{meta['init_time_s']}s` | Wall: `{meta['wall_time_s']}s`",
         f"- Episodes: `{overall['episodes']}` | Exits: `{overall['exits']}` | Deaths: `{overall['deaths']}` | Timeouts: `{overall['timeouts']}` | Errors: `{overall['errors']}`",
         f"- Progression: Keys `{overall['keys_picked_up']}` | Doors `{overall['doors_opened']}` | Unlocks `{overall['locked_doors_unlocked']}` | Kills `{overall['kills']}` | Mean cells `{overall['mean_unique_cells']}`",
+        f"- Funnel & Actions: `unlock|pickup={unlock_str}` | `exit|unlock={exit_u_str}` | Deaths after pickup `{overall.get('deaths_after_pickup', 0)}` | Opposing steps `{overall.get('opposing_button_steps', 0)}/{overall.get('total_steps', 0)}` | Consecutive USE `{overall.get('consecutive_use_presses', 0)}`",
         f"- Compute: Total agent `{overall['total_agent_time_s']}s` | Max step `{overall['max_step_ms']} ms` | Within budget: `{overall['all_within_budget']}`",
         "",
         "| Map | Tier | Family | Seed | Outcome | Steps | Keys | Doors | Unlocks | Kills | Cells | Agent(s) | Max(ms) |",
@@ -450,6 +687,24 @@ def format_report_markdown(report: dict[str, Any]) -> str:
             f"| {ep['locked_doors_unlocked']} | {ep['kills']} | {ep['unique_cells_visited']} "
             f"| {ep['agent_time_s']:.3f} | {ep['extra'].get('max_act_ms', 0.0):.2f} |"
         )
+
+    key_replays = report["summary"].get("key_replays")
+    if key_replays:
+        lines.extend(
+            [
+                "",
+                "### Key Replays",
+                f"- Best success: `{key_replays.get('best_success')}`",
+                f"- Representative failure: `{key_replays.get('representative_failure')}`",
+            ]
+        )
+
+    diagnosis = report.get("diagnosis") or diagnose_report(report)
+    if diagnosis:
+        lines.extend(["", "### Automated Diagnosis"])
+        for item in diagnosis:
+            lines.append(f"- **[{item['code']}]** ({item['evidence']}): {item['recommendation']}")
+
     return "\n".join(lines)
 
 
@@ -462,6 +717,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--agent", default=DEFAULT_AGENT_SPEC, help="Agent entry point module:Class")
     parser.add_argument("--render-buffers", action="store_true", help="Render RGB/depth buffers")
     parser.add_argument("--record-dir", type=Path, default=None, help="Directory to save ViZDoom .lmp replays")
+    parser.add_argument(
+        "--keep-key-replays",
+        action="store_true",
+        help="Prune non-selected .lmp replays in --record-dir after selecting best success & failure",
+    )
     parser.add_argument("--out", type=Path, default=None, help="Write JSON report to this path")
     parser.add_argument("--compare", nargs=2, metavar=("BASELINE_JSON", "CHALLENGER_JSON"), default=None)
     args = parser.parse_args(argv)
@@ -482,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
         seeds_override=seeds_override,
         render_buffers=args.render_buffers,
         record_dir=args.record_dir,
+        keep_key_replays=args.keep_key_replays,
     )
     print(format_report_markdown(report))
     if args.out is not None:
