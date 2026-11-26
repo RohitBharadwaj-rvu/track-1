@@ -69,7 +69,9 @@ class TrainConfig:
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    clip_vloss: bool = False
+    clip_vloss: bool = True
+    use_huber_vloss: bool = True
+    huber_delta: float = 5.0
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: float | None = 0.03
@@ -213,6 +215,8 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
         gae_lambda=cfg.gae_lambda,
         clip_coef=cfg.clip_coef,
         clip_vloss=cfg.clip_vloss,
+        use_huber_vloss=cfg.use_huber_vloss,
+        huber_delta=cfg.huber_delta,
         vf_coef=cfg.vf_coef,
         ent_coef=cfg.ent_coef,
         max_grad_norm=cfg.max_grad_norm,
@@ -655,8 +659,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ent-coef-end", type=float, default=0.004)
     p.add_argument("--gamma", type=float, default=0.995)
     p.add_argument("--gae-lambda", type=float, default=0.95)
-    p.add_argument("--clip-vloss", dest="clip_vloss", action="store_true", default=False)
+    p.add_argument("--clip-vloss", dest="clip_vloss", action="store_true", default=True)
     p.add_argument("--no-clip-vloss", dest="clip_vloss", action="store_false")
+    p.add_argument("--huber-vloss", dest="use_huber_vloss", action="store_true", default=True)
+    p.add_argument("--no-huber-vloss", dest="use_huber_vloss", action="store_false")
+    p.add_argument("--huber-delta", type=float, default=5.0)
     p.add_argument("--no-anneal-lr", action="store_true")
     p.add_argument("--checkpoint-dir", default="training/runs/default")
     p.add_argument("--export-path", default="submission/weights/policy.pt")
@@ -734,6 +741,8 @@ def main(argv: list[str] | None = None) -> None:
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         clip_vloss=args.clip_vloss,
+        use_huber_vloss=args.use_huber_vloss,
+        huber_delta=args.huber_delta,
         use_asymmetric_critic=args.use_asymmetric_critic,
         aux_coef=args.aux_coef,
         curiosity_coef=args.curiosity_coef,

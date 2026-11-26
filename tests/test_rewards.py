@@ -169,15 +169,20 @@ def test_use_waste_door_bounce_and_combat_resource_rewards():
     assert c_ammo["pickup"] > 0.0
 
     # 4. Rebalanced combat: killing an enemy while taking one 20 HP hit stays positive (no combat cowardice),
-    # while dying after heavy damage remains strongly negative.
+    # while facetanking 50 HP of damage for a single kill or dying remains strictly negative.
     _, _, c_trade = shaper.step(
         _priv(tic=20, health=50.0, armor=30.0, kills=1, damage_taken=20.0, sector_ceiling=[4.0, 0.0, 128.0]),
         obs=_obs(bullets=48.0, enemy_visible=True),
     )
     assert c_trade["ammo_waste"] == pytest.approx(0.0)
     assert c_trade["kill"] + c_trade["damage"] > 0.0
+    _, _, c_facetank = shaper.step(
+        _priv(tic=22, health=20.0, armor=30.0, kills=2, damage_taken=70.0, sector_ceiling=[4.0, 0.0, 128.0]),
+        obs=_obs(bullets=47.0, enemy_visible=True),
+    )
+    assert c_facetank["kill"] + c_facetank["damage"] < 0.0
     _, _, c_dead = shaper.step(
-        _priv(tic=24, health=0.0, dead=True, damage_taken=50.0, sector_ceiling=[4.0, 0.0, 128.0]),
+        _priv(tic=24, health=0.0, dead=True, damage_taken=120.0, sector_ceiling=[4.0, 0.0, 128.0]),
         obs=_obs(bullets=48.0, enemy_visible=True),
     )
     assert c_dead["death"] + c_dead["damage"] < -1.0

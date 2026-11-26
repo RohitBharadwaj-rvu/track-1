@@ -34,8 +34,8 @@ class RewardConfig:
     explore_decay_cells: float = 60.0
     post_key_cell_reward: float = 0.08
     max_post_key_cells: int = 80
-    kill_reward: float = 1.5
-    damage_penalty: float = -0.018
+    kill_reward: float = 0.8
+    damage_penalty: float = -0.032
     death_penalty: float = -3.0
     door_bounce_penalty: float = -0.25
     use_waste_penalty: float = -0.02
