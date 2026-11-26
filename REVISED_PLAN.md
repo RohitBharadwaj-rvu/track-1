@@ -64,3 +64,23 @@ For each candidate, save the code revision, checkpoint hash, training decisions,
 | Previous conservative synthesis | A fully functional MVP before feature work | Stronger attention encoder and hard-tier diagnostics from the beginning. Multiple successive promotions are possible. Easy exits qualify the MVP; difficult exits drive subsequent selection. |
 | Official starter | Its wrapper, sensor contract, action interface, and validator | The supplied agent samples random buttons. Our deliverables are a trained recurrent policy, task-specific curriculum, cross-layout evaluation, and evidence for the chosen upgrade. [Starter policy](https://github.com/Reinforce-SST/devforge-doom-template/blob/main/submission/agent.py) |
 | Sample Factory ViZDoom example | Parallel experience collection and measured learner throughput are relevant engineering ideas | Its published quickstart trains a pixel-based DoomBasic policy. Our target is the official telemetry contract and a multi-room progression task. Returning to a previously sighted door provides a specific behavioral comparison. Sample Factory also supports custom models. This comparison is with its example, and relative performance would require a matched run. [Sample Factory quickstart](https://github.com/alex-petrenko/sample-factory#quickstart) |
+
+## 7. Technical Contract & WAD Spec Appendix (`doom_env` `1.0.0-draft`)
+
+- **Telemetry Observation Shapes (`env/doom_env/spaces.py`):**
+  - `rays`: `distance` `(64,) float32` in `[0, 1]` (`RAY_RANGE = 1024.0`, 360° counter-clockwise from straight ahead: idx `0` = ahead, `16` = 90° left, `32` = behind); `hit_type` `MultiDiscrete([6] * 64)` (`0=none, 1=wall, 2=door, 3=locked_door, 4=enemy, 5=item`). Corpses, decorations, and projectiles do **not** stop rays.
+  - `visible_entities`: 90° horizontal FOV + LOS up to `4,096` units, `MAX_ENTITIES = 32` sorted nearest-first, zero-padded. `features` `(32, 5) float32` = `[distance/1024, sin(rel_angle), cos(rel_angle), rel_vel_forward, rel_vel_right]`; `mask` `MultiBinary(32)`; `entity_type` `MultiDiscrete([12] * 32)` (`0=pad, 1=enemy_melee, 2=enemy_hitscan, 3=enemy_projectile [monster], 4=projectile [incoming missile], 5=health, 6=armor, 7=ammo, 8=weapon, 9=key, 10=barrel, 11=other`).
+  - `vitals`: `(17,) float32` = `[health (0–200), armor (0–200), selected_weapon (0–7), selected_weapon_ammo, ammo_bullets, ammo_shells, ammo_rockets, ammo_cells, key_blue_card, key_yellow_card, key_red_card, key_blue_skull, key_yellow_skull, key_red_skull, vel_forward, vel_right, vel_up]`. Key flags are sticky `0/1`.
+  - `rgb` `(120, 160, 3) uint8` and `depth` `(120, 160) uint8` are skipped during training via `make_env(..., render_buffers=False)`.
+- **Action & Vanilla DOOM Mechanics (`docs/CONTRACT.md §3`):**
+  - `MultiBinary(9)` every `FRAME_SKIP = 4` tics (35 tics/s): `[MOVE_FORWARD, MOVE_BACKWARD, MOVE_LEFT, MOVE_RIGHT, TURN_LEFT, TURN_RIGHT, ATTACK, USE, SELECT_NEXT_WEAPON]`.
+  - `USE` and `SELECT_NEXT_WEAPON` fire on the **button-down edge** only (must output `0` for `>= 1` step before pressing again).
+  - Pressing `USE` on an already-moving door **reverses it**; pulse `USE` once and wait ~1–2 s (~9–18 steps) for the door to open.
+- **WAD & Training Map Requirements (`docs/CONTRACT.md §4, §7`):**
+  - Must run on `freedoom2.wad` IWAD, `skill 3` ("Hurt me plenty"), vanilla ViZDoom `1.3.3` rules, episode caps `2,100–4,200` ticks (`525–1,050` decisions).
+  - Must stay **under 2,048 sectors** per map (ViZDoom runtime sector limit) and use standard Doom/Boom/Hexen/UDMF door and locked-door linedef specials so `doom_env` emits `door` (`2`) and `locked_door` (`3`) ray hit types.
+  - Training-only helpers: `env.privileged_state()` (`x, y, z, angle, health, kills, items, damage_taken, keys, sector_floor, sector_ceiling, door_lock`) and `env.sector_polygons()` (never available at evaluation).
+- **Sandbox & Submission Limits (`env/doom_env/limits.py`):**
+  - `2 GB` VRAM, `8 GB` RAM (incl. `/tmp` and `/dev/shm`), `1` CPU thread (`OMP_NUM_THREADS=1`), read-only repo, no network, total repo + Git LFS `<= 1 GB`.
+  - Timeouts: `60 s` `__init__`, `10 s` `reset()`, `10 s` first `act()`, `5 s` subsequent `act()`, `40 ms × decision_steps` per-map agent compute budget (`21 s` for 2,100 ticks; `42 s` for 4,200 ticks).
+
