@@ -220,3 +220,66 @@ def test_reward_shaper_on_real_key_door_exit_doom_env():
         assert totals["explore"] > 0.0
     finally:
         env.close()
+
+
+def test_use_hold_attack_press_and_weapon_switch_penalties():
+    cfg = RewardConfig()
+    shaper = RewardShaper(cfg)
+    shaper.reset(_priv(tic=0, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]))
+
+    prev_use = np.zeros(9, dtype=np.int8)
+    prev_use[7] = 1
+    hold_use = np.zeros(9, dtype=np.int8)
+    hold_use[7] = 1
+    _, _, c_hold = shaper.step(
+        _priv(tic=4, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=hold_use,
+        prev_action=prev_use,
+        obs=_obs(bullets=50.0, enemy_visible=False),
+    )
+    assert c_hold["use_penalty"] == pytest.approx(cfg.use_hold_penalty)
+
+    atk_act = np.zeros(9, dtype=np.int8)
+    atk_act[6] = 1
+    _, _, c_atk = shaper.step(
+        _priv(tic=8, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=atk_act,
+        prev_action=np.zeros(9, dtype=np.int8),
+        obs=_obs(bullets=50.0, enemy_visible=False),
+    )
+    assert c_atk["ammo_waste"] == pytest.approx(cfg.wasted_ammo_penalty)
+
+    wpn_act = np.zeros(9, dtype=np.int8)
+    wpn_act[8] = 1
+    obs_loaded = _obs(bullets=50.0, enemy_visible=False)
+    obs_loaded["vitals"][2] = 2.0  # Pistol
+    obs_loaded["vitals"][3] = 50.0
+    _, _, c_sw_loaded = shaper.step(
+        _priv(tic=12, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=wpn_act,
+        prev_action=np.zeros(9, dtype=np.int8),
+        obs=obs_loaded,
+    )
+    assert c_sw_loaded["weapon_switch_penalty"] == pytest.approx(cfg.weapon_switch_waste_penalty)
+
+    obs_empty = _obs(bullets=0.0, enemy_visible=False)
+    obs_empty["vitals"][2] = 2.0
+    obs_empty["vitals"][3] = 0.0
+    _, _, c_sw_empty = shaper.step(
+        _priv(tic=16, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=wpn_act,
+        prev_action=np.zeros(9, dtype=np.int8),
+        obs=obs_empty,
+    )
+    assert c_sw_empty["weapon_switch_penalty"] == pytest.approx(0.0)
+
+    obs_fist = _obs(bullets=50.0, enemy_visible=False)
+    obs_fist["vitals"][2] = 1.0  # Fist
+    obs_fist["vitals"][3] = 50.0
+    _, _, c_sw_fist = shaper.step(
+        _priv(tic=20, health=100.0, sector_ceiling=[0.0, 0.0, 128.0]),
+        action=wpn_act,
+        prev_action=np.zeros(9, dtype=np.int8),
+        obs=obs_fist,
+    )
+    assert c_sw_fist["weapon_switch_penalty"] == pytest.approx(0.0)

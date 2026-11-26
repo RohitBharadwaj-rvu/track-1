@@ -13,7 +13,9 @@ import numpy as np
 
 from training.interfaces import PrivilegedEventTracker, StepEvents
 
+_ATTACK_IDX = 6
 _USE_IDX = 7
+_WEAPON_SWITCH_IDX = 8
 _ENEMY_ENTITY_TYPES = (1, 2, 3)
 
 
@@ -36,8 +38,10 @@ class RewardConfig:
     damage_penalty: float = -0.018
     death_penalty: float = -3.0
     door_bounce_penalty: float = -0.25
-    use_waste_penalty: float = -0.015
-    wasted_ammo_penalty: float = -0.008
+    use_waste_penalty: float = -0.02
+    use_hold_penalty: float = -0.03
+    wasted_ammo_penalty: float = -0.025
+    weapon_switch_waste_penalty: float = -0.025
     weapon_pickup_reward: float = 0.6
     max_pickup_bonus: float = 2.5
     pbrs_scale: float = 2.0
@@ -181,14 +185,15 @@ class RewardShaper:
         if bounced:
             use_penalty += cfg.door_bounce_penalty
         elif action is not None and prev_action is not None:
-            use_pulsed = int(action[_USE_IDX]) == 1 and int(prev_action[_USE_IDX]) == 0
             if (
-                use_pulsed
-                and events.doors_opened == 0
+                events.doors_opened == 0
                 and events.locked_doors_unlocked == 0
                 and not started_or_rising
             ):
-                use_penalty += cfg.use_waste_penalty
+                if int(action[_USE_IDX]) == 1 and int(prev_action[_USE_IDX]) == 0:
+                    use_penalty += cfg.use_waste_penalty
+                elif int(action[_USE_IDX]) == 1 and int(prev_action[_USE_IDX]) == 1:
+                    use_penalty += cfg.use_hold_penalty
 
         # 4. Exit + time/health efficiency
         efficiency = 0.0
@@ -199,17 +204,22 @@ class RewardShaper:
             health_frac = min(1.5, max(0.0, curr_health / 100.0))
             efficiency = cfg.efficiency_bonus * remaining_time + cfg.health_efficiency_bonus * health_frac
 
-        # 5. Combat, wasted ammo, and bounded low-health/armor pickup bonus
+        # 5. Combat, wasted ammo/action spam, and bounded low-health/armor pickup bonus
         curr_ammo, curr_armor = _extract_ammo_and_armor(priv_state, obs)
+        ammo_dropped = (
+            curr_ammo is not None and self._prev_ammo is not None and curr_ammo < self._prev_ammo
+        )
+        attack_pressed = action is not None and int(action[_ATTACK_IDX]) == 1
         ammo_waste = 0.0
-        if (
-            curr_ammo is not None
-            and self._prev_ammo is not None
-            and curr_ammo < self._prev_ammo
-            and events.kills == 0
-            and not _has_visible_enemy(obs)
-        ):
+        if (ammo_dropped or attack_pressed) and events.kills == 0 and not _has_visible_enemy(obs):
             ammo_waste = cfg.wasted_ammo_penalty
+
+        weapon_switch_penalty = 0.0
+        if action is not None and int(action[_WEAPON_SWITCH_IDX]) == 1 and obs is not None and "vitals" in obs:
+            sel_wpn = int(round(float(obs["vitals"][2])))
+            sel_ammo = float(obs["vitals"][3])
+            if sel_wpn >= 2 and sel_ammo > 0.5:
+                weapon_switch_penalty = cfg.weapon_switch_waste_penalty
 
         pickup = 0.0
         if self._pickup_bonus_earned < cfg.max_pickup_bonus:
@@ -247,6 +257,7 @@ class RewardShaper:
             "death": cfg.death_penalty if events.dead else 0.0,
             "use_penalty": use_penalty,
             "ammo_waste": ammo_waste,
+            "weapon_switch_penalty": weapon_switch_penalty,
             "pickup": pickup,
             "pbrs": pbrs_rew,
             "time": cfg.step_penalty,
