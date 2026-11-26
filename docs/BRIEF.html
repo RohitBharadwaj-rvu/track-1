@@ -29,17 +29,17 @@
 <h2>Page 1: Architecture &amp; Memory Design</h2>
 <h3>1. Problem &amp; Telemetry Choice</h3>
 <p>Our agent plays unseen <code>freedoom2.wad</code> (<code>skill 3</code>) levels zero-shot under strict inference limits (<code>2 GB VRAM</code>, <code>8 GB RAM</code>, <code>1 CPU thread</code>, <code>40 ms/step</code>). Rather than spending compute on raw pixel CNNs, we operate directly on <code>doom_env</code>'s ego-centric telemetry signals (<code>rays</code>, <code>visible_entities</code>, <code>vitals</code>) with <code>render_buffers=False</code> during training.</p>
-<h3>2. Policy &amp; Recurrent Memory (<code>submission/policy.py</code>, <code>telemetry_gru_v1</code>, <code>730,109</code> params)</h3>
+<h3>2. Policy &amp; Recurrent Memory (<code>submission/policy.py</code>, <code>telemetry_gru_v1</code>, <code>730,109</code> base params)</h3>
 <ul>
-<li><strong>Raycast Encoder:</strong> Circular 1D convolutions over the 64 ego-centric rays (normalized distance + hit type) preserving left/right directional bins across 360°.</li>
-<li><strong>Entity Encoder:</strong> Learned class embeddings + derived ego-frame combat kinematics (closing speed, lateral speed, inverse time-to-impact, crosshair alignment) + per-category threat/item counts, pooled with masked multi-query attention conditioned on vitals and ray context (with deterministic empty-set fallback).</li>
-<li><strong>Vitals &amp; Temporal Memory:</strong> GRU fusing <code>[ray_emb, entity_emb, vitals_action_emb]</code> with explicit <code>selected_ammo_empty</code>, <code>has_any_other_ammo</code>, <code>low_health</code>, horizontal speed, and <code>prev_action</code> features so the policy detects wall-snags and respects ViZDoom's button-down edge semantics for <code>USE</code> and <code>SELECT_NEXT_WEAPON</code>.</li>
-<li><strong>Factorized Action Heads &amp; Training Pipeline:</strong> Three 3-way categorical heads (forward/backward/none, strafe left/right/none, turn left/right/none) + three independent Bernoulli heads (<code>ATTACK</code>, <code>USE</code>, <code>SELECT_NEXT_WEAPON</code>) mapped deterministically to <code>MultiBinary(9)</code>, trained via Recurrent PPO (<code>gamma=0.995</code>, <code>chunk_len=64</code>) with a training-only asymmetric critic, auxiliary door-bearing supervision, intrinsic curiosity, and weighted curriculum sampling.</li>
+<li><strong>Raycast &amp; Entity Encoders:</strong> Circular 1D convolutions over 64 ego-centric rays (distance + hit type) paired with learned entity class embeddings, derived combat kinematics (closing/lateral speed, inverse TTI, crosshair alignment), and masked multi-query attention conditioned on vitals and ray context.</li>
+<li><strong>Vitals, Temporal &amp; Spatial Memory:</strong> GRU fusing <code>[ray_emb, entity_emb, vitals_action_emb]</code> with explicit ammo/health/speed and <code>prev_action</code> features (detecting wall-snags and <code>USE</code> / <code>SELECT_NEXT_WEAPON</code> edge semantics), optionally augmented with <code>EgocentricSpatialMap</code> 2D spatial memory (<code>submission/ego_map.py</code>, with off-crop objective beacons).</li>
+<li><strong>Factorized Action Heads &amp; Training Pipeline:</strong> Three 3-way categorical heads (move, strafe, turn) + three Bernoulli heads (<code>ATTACK</code>, <code>USE</code>, <code>SELECT_NEXT_WEAPON</code>) mapped deterministically to <code>MultiBinary(9)</code>, trained via Recurrent PPO (<code>gamma=0.995</code>, <code>chunk_len=64</code>) with a training-only asymmetric critic, non-negative PBRS (<code>training/pbrs.py</code>) supporting window/ledge/switch routing, L/R mirror symmetry augmentation (<code>training/symmetry.py</code>), and weighted curriculum sampling.</li>
 </ul>
-<h3>3. Curriculum &amp; Failure-Driven Upgrades</h3>
+<h3>3. Curriculum &amp; Evaluation Suites</h3>
 <ul>
-<li>Training curriculum covers Tier 1 combat, Tier 2 multi-room exploration, Tier 3 key-and-return progression, and Tier 4 gauntlets using separate train/dev/final map families plus procedural variations.</li>
-<li>Memory challenger branches (<code>telemetry_landmark_v1</code> persistent landmark slots and <code>EgocentricSpatialMap</code> 2D grid) are promoted only when independent evaluation on identical held-out Tier 3–4 dev seeds confirms higher unlocks and exits.</li>
+<li>Training curriculum covers Tier 1 combat, Tier 2 multi-room exploration, Tier 3 key-and-return progression, and Tier 4 gauntlets with broadened procedural verticality, enemy roster, and angled/door variations.</li>
+<li>Held-out verification spans 10 <code>DEV_MAPS</code>, 10 <code>maps/stress/</code> probes (orientation, exit/remote switches, stairs/ledges, grates, key-window), and <code>freedoom2.wad</code> (<code>MAP01–04</code>); <code>FINAL_MAPS</code> stays untouched until final weight freeze.</li>
+<li>Memory upgrades (<code>EgocentricSpatialMap</code> and <code>telemetry_landmark_v1</code>) are promoted only when independent evaluation on identical held-out Tier 3–4 dev seeds confirms higher unlocks and exits.</li>
 </ul>
 <hr />
 <div class="page-break"></div>

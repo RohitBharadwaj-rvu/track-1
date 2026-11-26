@@ -12,6 +12,7 @@ from doom_env.sensors import RAY_DOOR, RAY_LOCKED
 from fixtures import fixture_wad
 from training.brief_tools import markdown_to_two_page_html, update_brief_outcomes_row
 from training.eval import (
+    _resolve_wad_path,
     check_mvp_gate,
     compare_reports,
     diagnose_report,
@@ -308,3 +309,34 @@ def test_wasted_attack_diagnostics_and_eval_mode():
     assert report["metadata"]["eval_mode_applied"] is True
     codes = {d["code"] for d in report["diagnosis"]}
     assert "wasted_ammo" in codes
+
+
+def test_resolve_stress_and_freedoom_suites():
+    stress_specs = resolve_maps(suite="stress")
+    assert len(stress_specs) == 10
+    assert all(s.split == "stress" for s in stress_specs)
+    expected_stress_wads = {
+        "exit_ahead.wad",
+        "exit_behind.wad",
+        "exit_left.wad",
+        "exit_switch.wad",
+        "key_open.wad",
+        "key_window.wad",
+        "junction_return.wad",
+        "stairs_ledge.wad",
+        "remote_door_switch.wad",
+        "grate_combat.wad",
+    }
+    assert expected_stress_wads.issubset({Path(s.wad).name for s in stress_specs})
+
+    freedoom_specs = resolve_maps(suite="freedoom")
+    assert len(freedoom_specs) == 4
+    assert [s.map_name for s in freedoom_specs] == ["MAP01", "MAP02", "MAP03", "MAP04"]
+    assert all(
+        s.wad == "vizdoom/freedoom2.wad"
+        and s.family == "freedoom"
+        and s.tier == 4
+        and s.episode_ticks == 4200
+        for s in freedoom_specs
+    )
+    assert Path(_resolve_wad_path("vizdoom/freedoom2.wad")).exists()
