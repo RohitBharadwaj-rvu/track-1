@@ -81,6 +81,34 @@ def check_lfs_and_submission(repo: Path = ROOT) -> tuple[bool, list[str]]:
     else:
         notes.append("OK: submission/ working tree is clean.")
 
+    branch_res = _run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo)
+    if branch_res.returncode == 0:
+        branch = branch_res.stdout.strip()
+        if branch in ("master", "main"):
+            notes.append(f"OK: On default branch '{branch}'.")
+        else:
+            notes.append(
+                f"WARN: Currently on branch '{branch}'; scorer evaluates the last commit on default branch 'master' (docs/EVALUATION.md)."
+            )
+
+    req_file = repo / "submission" / "requirements.txt"
+    if req_file.is_file():
+        extra_reqs = [
+            ln.strip()
+            for ln in req_file.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        if not extra_reqs:
+            notes.append("OK: submission/requirements.txt has 0 extra packages (uses official base image).")
+        else:
+            notes.append(f"INFO: submission/requirements.txt lists {len(extra_reqs)} extra package(s).")
+
+    docker_diff = _run(["git", "-C", str(repo), "diff", "--quiet", "fcace91", "--", "Dockerfile"], cwd=repo)
+    if docker_diff.returncode == 0:
+        notes.append("OK: Dockerfile matches starter template.")
+    elif docker_diff.returncode == 1:
+        notes.append("WARN: Dockerfile differs from starter template; scorer uses the official image, not repo edits.")
+
     brief_md = repo / "docs" / "BRIEF.md"
     brief_pdf = repo / "docs" / "BRIEF.pdf"
     if brief_md.is_file():

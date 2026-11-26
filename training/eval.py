@@ -49,6 +49,7 @@ _IDX_LEFT = BUTTONS.index("MOVE_LEFT")
 _IDX_RIGHT = BUTTONS.index("MOVE_RIGHT")
 _IDX_TURN_L = BUTTONS.index("TURN_LEFT")
 _IDX_TURN_R = BUTTONS.index("TURN_RIGHT")
+_IDX_ATTACK = BUTTONS.index("ATTACK")
 _IDX_USE = BUTTONS.index("USE")
 
 
@@ -196,6 +197,8 @@ def evaluate_episode(
     use_presses = 0
     consecutive_use_presses = 0
     opposing_button_steps = 0
+    attack_steps = 0
+    wasted_attack_steps = 0
     prev_use = 0
     step_times_ms: list[float] = []
     outcome = "timeout"
@@ -241,6 +244,19 @@ def evaluate_episode(
                 or (action[_IDX_TURN_L] and action[_IDX_TURN_R])
             ):
                 opposing_button_steps += 1
+
+            if action[_IDX_ATTACK]:
+                attack_steps += 1
+                ent = obs.get("visible_entities", {})
+                ent_mask = np.asarray(ent.get("mask", ()), dtype=np.int32)
+                ent_type = np.asarray(ent.get("entity_type", ()), dtype=np.int32)
+                enemy_in_fov = bool(
+                    len(ent_mask) > 0
+                    and len(ent_type) == len(ent_mask)
+                    and np.any((ent_mask == 1) & ((ent_type == 1) | (ent_type == 2) | (ent_type == 3)))
+                )
+                if not enemy_in_fov:
+                    wasted_attack_steps += 1
 
             obs, reward, terminated, truncated, info = env.step(action)
             steps += 1
@@ -291,6 +307,8 @@ def evaluate_episode(
         "use_presses": use_presses,
         "consecutive_use_presses": consecutive_use_presses,
         "opposing_button_steps": opposing_button_steps,
+        "attack_steps": attack_steps,
+        "wasted_attack_steps": wasted_attack_steps,
         "had_key_pickup": had_key_pickup,
         "died_after_pickup": died_after_pickup,
     }
@@ -345,6 +363,8 @@ def _aggregate_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
             "use_presses": 0,
             "consecutive_use_presses": 0,
             "opposing_button_steps": 0,
+            "attack_steps": 0,
+            "wasted_attack_steps": 0,
             "total_agent_time_s": 0.0,
             "max_step_ms": 0.0,
             "all_within_budget": True,
@@ -382,6 +402,8 @@ def _aggregate_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
         "use_presses": sum(int(e.extra.get("use_presses", 0)) for e in episodes),
         "consecutive_use_presses": sum(int(e.extra.get("consecutive_use_presses", 0)) for e in episodes),
         "opposing_button_steps": sum(int(e.extra.get("opposing_button_steps", 0)) for e in episodes),
+        "attack_steps": sum(int(e.extra.get("attack_steps", 0)) for e in episodes),
+        "wasted_attack_steps": sum(int(e.extra.get("wasted_attack_steps", 0)) for e in episodes),
         "total_agent_time_s": round(sum(e.agent_time_s for e in episodes), 4),
         "max_step_ms": round(max((e.extra.get("max_act_ms", 0.0) for e in episodes), default=0.0), 3),
         "all_within_budget": all(bool(e.extra.get("within_budget", False)) for e in episodes),
@@ -471,6 +493,18 @@ def diagnose_report(report: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
 
+    attack_steps = int(overall.get("attack_steps", 0))
+    wasted_attacks = int(overall.get("wasted_attack_steps", 0))
+    if attack_steps >= 10 and (wasted_attacks / attack_steps) >= 0.60:
+        findings.append(
+            {
+                "priority": 7,
+                "code": "wasted_ammo",
+                "evidence": f"wasted_attack_steps={wasted_attacks}/{attack_steps} ({wasted_attacks / attack_steps:.1%})",
+                "recommendation": "Add a small wasted-ammo penalty in training/rewards.py when firing with no enemy in FOV (TRACK1_IMPROVEMENTS.md §5.3).",
+            }
+        )
+
     return findings
 
 
@@ -516,6 +550,18 @@ def _select_and_prune_replays(
     return {"best_success": best_path, "representative_failure": fail_path}
 
 
+def _apply_eval_mode(agent: Any, eval_mode: str) -> bool:
+    """Apply `'deterministic'` or `'stochastic'` eval mode to an agent if it exposes a flag."""
+    if eval_mode == "default":
+        return False
+    det_flag = eval_mode == "deterministic"
+    for attr in ("deterministic", "eval_deterministic", "_deterministic"):
+        if hasattr(agent, attr):
+            setattr(agent, attr, det_flag)
+            return True
+    return False
+
+
 def evaluate_suite(
     specs: list[MapSpec],
     *,
@@ -526,10 +572,13 @@ def evaluate_suite(
     render_buffers: bool = False,
     record_dir: Path | None = None,
     keep_key_replays: bool = False,
+    eval_mode: str = "default",
 ) -> dict[str, Any]:
     """Instantiate an agent once and evaluate all `(spec, seed)` episodes."""
     if not specs:
         raise ValueError("specs must not be empty")
+    if eval_mode not in ("default", "deterministic", "stochastic"):
+        raise ValueError(f"Unknown eval_mode {eval_mode!r}")
     factory = agent_factory or load_agent_factory(agent_spec)
 
     probe_env = make_env(
@@ -547,6 +596,7 @@ def evaluate_suite(
     wall_start = time.perf_counter()
     init_start = time.perf_counter()
     agent = factory(obs_space, act_space, device)
+    eval_mode_applied = _apply_eval_mode(agent, eval_mode)
     init_time_s = round(time.perf_counter() - init_start, 4)
 
     episodes: list[EpisodeMetrics] = []
@@ -577,6 +627,8 @@ def evaluate_suite(
             "weights_sha256": _weights_sha256(),
             "agent_spec": agent_spec,
             "device": device,
+            "eval_mode": eval_mode,
+            "eval_mode_applied": eval_mode_applied,
             "render_buffers": render_buffers,
             "init_time_s": init_time_s,
             "wall_time_s": wall_time_s,
@@ -783,10 +835,10 @@ def format_report_markdown(report: dict[str, Any]) -> str:
 
     lines = [
         f"## Evaluation Summary ({meta.get('git_commit') or 'uncommitted'})",
-        f"- Agent: `{meta['agent_spec']}` | Device: `{meta['device']}` | Init: `{meta['init_time_s']}s` | Wall: `{meta['wall_time_s']}s`",
+        f"- Agent: `{meta['agent_spec']}` | Device: `{meta['device']}` | Eval mode: `{meta.get('eval_mode', 'default')}` | Init: `{meta['init_time_s']}s` | Wall: `{meta['wall_time_s']}s`",
         f"- Episodes: `{overall['episodes']}` | Exits: `{overall['exits']}` | Deaths: `{overall['deaths']}` | Timeouts: `{overall['timeouts']}` | Errors: `{overall['errors']}`",
         f"- Progression: Keys `{overall['keys_picked_up']}` | Doors `{overall['doors_opened']}` | Unlocks `{overall['locked_doors_unlocked']}` | Kills `{overall['kills']}` | Mean cells `{overall['mean_unique_cells']}`",
-        f"- Funnel & Actions: `unlock|pickup={unlock_str}` | `exit|unlock={exit_u_str}` | Deaths after pickup `{overall.get('deaths_after_pickup', 0)}` | Opposing steps `{overall.get('opposing_button_steps', 0)}/{overall.get('total_steps', 0)}` | Consecutive USE `{overall.get('consecutive_use_presses', 0)}`",
+        f"- Funnel & Actions: `unlock|pickup={unlock_str}` | `exit|unlock={exit_u_str}` | Deaths after pickup `{overall.get('deaths_after_pickup', 0)}` | Opposing steps `{overall.get('opposing_button_steps', 0)}/{overall.get('total_steps', 0)}` | Consecutive USE `{overall.get('consecutive_use_presses', 0)}` | Wasted attacks `{overall.get('wasted_attack_steps', 0)}/{overall.get('attack_steps', 0)}`",
         f"- Compute: Total agent `{overall['total_agent_time_s']}s` | Max step `{overall['max_step_ms']} ms` | Within budget: `{overall['all_within_budget']}`",
         "",
         "| Map | Tier | Family | Seed | Outcome | Steps | Keys | Doors | Unlocks | Kills | Cells | Agent(s) | Max(ms) |",
@@ -846,6 +898,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--map", action="append", default=None, help="wad[:map[:family[:tier[:ticks]]]]")
     parser.add_argument("--seeds", nargs="+", type=int, default=None, help="Override seed list for all maps")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
+    parser.add_argument(
+        "--eval-mode",
+        default="default",
+        choices=("default", "deterministic", "stochastic"),
+        help="Override agent determinism flag during evaluation",
+    )
+    parser.add_argument(
+        "--compare-determinism",
+        action="store_true",
+        help="Benchmark stochastic vs deterministic eval modes on the selected specs",
+    )
     parser.add_argument("--agent", default=DEFAULT_AGENT_SPEC, help="Agent entry point module:Class")
     parser.add_argument("--render-buffers", action="store_true", help="Render RGB/depth buffers")
     parser.add_argument("--record-dir", type=Path, default=None, help="Directory to save ViZDoom .lmp replays")
@@ -875,6 +938,31 @@ def main(argv: list[str] | None = None) -> int:
 
     specs = resolve_maps(split=args.split, map_args=args.map, suite=args.suite)
     seeds_override = tuple(args.seeds) if args.seeds is not None else None
+    if args.compare_determinism:
+        stoch = evaluate_suite(
+            specs,
+            agent_spec=args.agent,
+            device=args.device,
+            seeds_override=seeds_override,
+            render_buffers=args.render_buffers,
+            eval_mode="stochastic",
+        )
+        det = evaluate_suite(
+            specs,
+            agent_spec=args.agent,
+            device=args.device,
+            seeds_override=seeds_override,
+            render_buffers=args.render_buffers,
+            eval_mode="deterministic",
+        )
+        print("# Stochastic Mode")
+        print(format_report_markdown(stoch))
+        print("\n# Deterministic Mode")
+        print(format_report_markdown(det))
+        print("\n# Comparison (stochastic -> deterministic)")
+        print(json.dumps(compare_reports(stoch, det), indent=2))
+        return 0 if (stoch["summary"]["overall"]["errors"] == 0 and det["summary"]["overall"]["errors"] == 0) else 1
+
     report = evaluate_suite(
         specs,
         agent_spec=args.agent,
@@ -883,6 +971,7 @@ def main(argv: list[str] | None = None) -> int:
         render_buffers=args.render_buffers,
         record_dir=args.record_dir,
         keep_key_replays=args.keep_key_replays,
+        eval_mode=args.eval_mode,
     )
     if args.check_mvp_gate is not None:
         base_rep = (
