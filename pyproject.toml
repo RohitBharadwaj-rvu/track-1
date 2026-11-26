@@ -16,3 +16,6 @@ dev = ["pytest>=8"]
 
 [tool.uv.sources]
 doom-env = { path = "env", editable = true }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
