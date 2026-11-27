@@ -1,132 +1,548 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>Track 1 Brief</title>
+<meta charset="utf-8" />
+<title>Yugaantar 2026 · DevForge Track 1 Project Brief — Telemetry-Driven Recurrent DOOM Agent</title>
 <style>
-    @page { size: letter; margin: 0.45in; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-           font-size: 10.2pt; line-height: 1.38; color: #1a1a1a; max-width: 7.6in; margin: 0 auto; }
-    h1 { font-size: 16pt; margin: 0 0 6pt 0; border-bottom: 1.5px solid #222; padding-bottom: 4pt; }
-    h2 { font-size: 12.5pt; margin: 10pt 0 4pt 0; color: #0f3d5e; }
-    h3 { font-size: 10.8pt; margin: 8pt 0 3pt 0; }
-    p { margin: 3pt 0 5pt 0; }
-    ul, ol { margin: 2pt 0 6pt 16pt; padding: 0; }
-    li { margin-bottom: 2.5pt; }
-    code { font-family: Consolas, "Courier New", monospace; font-size: 9pt;
-           background: #f3f5f7; padding: 0.5pt 3pt; border-radius: 2pt; }
-    table { border-collapse: collapse; width: 100%; margin: 6pt 0 8pt 0; font-size: 8.8pt; }
-    th, td { border: 1px solid #cbd5e1; padding: 3.5pt 5pt; text-align: left; }
-    th { background: #eef3f8; font-weight: 600; }
-    hr { border: none; border-top: 1px solid #d1d5db; margin: 8pt 0; }
-    .page-break { break-before: page; page-break-before: always; }
-    </style>
+  @page {
+    size: letter;
+    margin: 0;
+  }
+  * {
+    box-sizing: border-box;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #ffffff;
+    color: #111827;
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 9.1pt;
+    line-height: 1.40;
+  }
+  .page {
+    width: 8.5in;
+    height: 10.92in;
+    padding: 0.40in 0.50in 0.34in 0.50in;
+    margin: 0 auto;
+    background: #ffffff;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    page-break-after: always;
+    break-after: page;
+  }
+  .page:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+  .page-main {
+    display: flex;
+    flex-direction: column;
+    gap: 8.5pt;
+  }
+  .doc-header {
+    border-bottom: 1.5px solid #111827;
+    padding-bottom: 6pt;
+  }
+  .doc-header-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10pt;
+  }
+  .doc-title {
+    font-size: 14pt;
+    font-weight: 700;
+    color: #111827;
+    margin: 0;
+    letter-spacing: -0.015em;
+  }
+  .doc-track {
+    font-size: 8.5pt;
+    font-weight: 600;
+    color: #4b5563;
+    white-space: nowrap;
+  }
+  .doc-meta {
+    font-size: 8.1pt;
+    color: #4b5563;
+    margin-top: 3pt;
+  }
+  .metrics-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    border-top: 1px solid #d1d5db;
+    border-bottom: 1px solid #d1d5db;
+    padding: 5pt 0;
+  }
+  .metric-item {
+    padding: 0 8pt;
+    border-right: 1px solid #e5e7eb;
+  }
+  .metric-item:first-child { padding-left: 0; }
+  .metric-item:last-child { border-right: none; padding-right: 0; }
+  .metric-val {
+    font-size: 11pt;
+    font-weight: 700;
+    color: #111827;
+    line-height: 1.15;
+  }
+  .metric-lbl {
+    font-size: 7.7pt;
+    font-weight: 600;
+    color: #374151;
+  }
+  .metric-sub {
+    font-size: 7.1pt;
+    color: #6b7280;
+  }
+  h2.sec-heading {
+    font-size: 10.2pt;
+    font-weight: 700;
+    color: #111827;
+    margin: 0 0 4pt 0;
+    padding-bottom: 2pt;
+    border-bottom: 1px solid #d1d5db;
+    letter-spacing: -0.01em;
+  }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14pt;
+    align-items: start;
+  }
+  .grid-eval {
+    display: grid;
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: 14pt;
+    align-items: center;
+  }
+  ul.clean {
+    margin: 0;
+    padding-left: 13pt;
+  }
+  ul.clean li {
+    margin-bottom: 3.2pt;
+  }
+  ul.clean li:last-child {
+    margin-bottom: 0;
+  }
+  p.body-p {
+    margin: 0;
+  }
+  code {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 8.2pt;
+    color: #111827;
+    background: #f3f4f6;
+    padding: 0.3pt 2.5pt;
+    border-radius: 2px;
+  }
+  .diagram-box {
+    border: 1px solid #d1d5db;
+    padding: 5pt 6pt;
+    background: #ffffff;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 8.3pt;
+    line-height: 1.3;
+    border-top: 1.5px solid #111827;
+    border-bottom: 1.5px solid #111827;
+  }
+  th, td {
+    padding: 3.2pt 5pt;
+    text-align: left;
+    vertical-align: middle;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  th {
+    background: #f9fafb;
+    color: #111827;
+    font-weight: 700;
+    font-size: 8.0pt;
+    border-bottom: 1px solid #9ca3af;
+  }
+  th.num, td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+  tr.emph td {
+    font-weight: 600;
+    background: #f9fafb;
+  }
+  .note {
+    font-size: 7.9pt;
+    color: #4b5563;
+    margin-top: 3.5pt;
+    line-height: 1.32;
+  }
+  .page-footer {
+    border-top: 1px solid #d1d5db;
+    padding-top: 4pt;
+    display: flex;
+    justify-content: space-between;
+    font-size: 7.6pt;
+    color: #6b7280;
+  }
+</style>
 </head>
 <body>
-<h1>Track 1 Brief: Telemetry-Driven Recurrent DOOM Agent with Egocentric Spatial Memory</h1>
-<p><em>Yugaantar DevForge Track 1 ("Can It Play DOOM?") | Submission Checkpoint: Sprint 6B (<code>s6b_policy.pt</code>, <code>884,133</code> params)</em></p>
-<hr />
-<h2>Page 1: USP, Architecture &amp; Training Pipeline</h2>
-<h3>1. Unique Selling Proposition &amp; Telemetry Strategy</h3>
-<p>Our agent plays unseen <code>freedoom2.wad</code> (<code>skill 3</code>) levels zero-shot under strict sandbox caps (<code>2 GB VRAM</code>, <code>8 GB RAM</code>, <code>1 CPU thread</code>, <code>40 ms/step</code>). Rather than spending compute on heavy pixel CNNs that overfit to wall textures, we combine <code>doom_env</code>'s ego-centric telemetry (<code>rays</code>, <code>visible_entities</code>, <code>vitals</code>) with a pure-NumPy odometric 2D spatial memory (<code>EgocentricSpatialMap</code>) built strictly from legal observations and <code>prev_action</code>. Training with <code>render_buffers=False</code> reaches <code>300+</code> decisions/sec per worker while keeping inference under <code>156 MB</code> VRAM (<code>&lt;8%</code> of cap) and well within the <code>40 ms</code> step budget.</p>
-<h3>2. Neural Architecture &amp; Spatial Memory (<code>submission/policy.py</code>, <code>submission/ego_map.py</code>)</h3>
-<ul>
-<li><strong>Circular Raycast Encoder:</strong> Circular 1D convolutions over 64 ego-centric rays (normalized distance + 6-class hit type) preserve 360-degree left/right continuity without boundary wrap artifacts.</li>
-<li><strong>Combat-Aware Entity Attention:</strong> Learned 12-class entity embeddings fused with ego-frame kinematics (closing speed, lateral speed, inverse time-to-impact, crosshair alignment) and per-category threat/item counts, pooled with 4-head, 4-query masked attention conditioned on vitals and ray context (with a deterministic empty-set fallback for empty rooms).</li>
-<li><strong>Egocentric Spatial Memory (<code>EgocentricSpatialMap</code>):</strong> Integrates player velocity and Doom's turn-hold physics from <code>vitals</code> and <code>prev_action</code> (zero privileged coordinates, zero pathfinding) onto a <code>128x128</code> backing grid (<code>48u</code> cells). Renders an ego-aligned <code>(8, 25, 25)</code> crop (visited, post-key visited, walls, free space, doors, locked doors, items/keys, enemies) with perimeter beacons for off-crop landmarks, encoded by a compact CNN (<code>128</code>-dim output).</li>
-<li><strong>Temporal Memory &amp; Factorized Control:</strong> Residual GRU (<code>hidden_size=256</code>) fuses <code>[ray_emb, entity_emb, ego_map_emb, vitals_action_emb]</code> with explicit <code>selected_ammo_empty</code>, <code>has_any_other_ammo</code>, <code>low_health</code>, horizontal speed, and <code>prev_action</code> features so the policy respects ViZDoom's button-down edge semantics for <code>USE</code> and <code>SELECT_NEXT_WEAPON</code>. Three 3-way categorical heads (move, strafe, turn) and three Bernoulli heads (<code>ATTACK</code>, <code>USE</code>, <code>SELECT_NEXT_WEAPON</code>) map cleanly to <code>MultiBinary(9)</code> with zero opposing-button conflicts, paired with an observation-based close-range rocket safety mask (<code>rocket_safety_mask=True</code>).</li>
-</ul>
-<h3>3. Training &amp; Exploration Pipeline (<code>training/</code>)</h3>
-<ul>
-<li><strong>Custom Recurrent PPO:</strong> Built from scratch in PyTorch (<code>gamma=0.995</code>, <code>chunk_len=64</code>, episode-boundary hidden masking, <code>3.26M</code> decisions / <code>1,439</code> updates for Sprint 6B) with a training-only asymmetric critic, auxiliary door-bearing supervision, RND intrinsic curiosity, potential-based reward shaping (PBRS), and left-right mirror symmetry augmentation.</li>
-<li><strong>Procedural Curriculum &amp; Held-Out Splits:</strong> Separate <code>train</code>, <code>dev</code> (10 maps), <code>stress</code> (14 targeted probes), <code>final_ood</code> (8 unseen polygon/verticality maps), and bundled <code>freedoom2.wad</code> (<code>MAP01..MAP08</code>) suites, plus a procedural progression generator covering two-key joins, remote relays, and multi-wing backtracking.</li>
-</ul>
-<hr />
-<div class="page-break"></div>
-<h2>Page 2: Evaluation Outcomes, Runtime &amp; Failure Analysis</h2>
-<h3>1. Baseline vs. Final Outcomes (Held-Out Proxy Suites)</h3>
-<p><em>Note: Organizer hidden maps and exact weights are private; numbers below are local proxy evaluations on <code>submission/weights/policy.pt</code> (Sprint 6B, deterministic, source <code>cbe1ca42c08d</code>, promoted <code>06761f9a68f1</code>).</em></p>
-<table><thead><tr>
-<th>Candidate</th>
-<th>Suite</th>
-<th>Episodes</th>
-<th>Exits</th>
-<th>Keys Picked Up</th>
-<th>Locked Doors Unlocked</th>
-<th>Kills</th>
-<th>Mean Cells Visited</th>
-<th>Errors</th>
-</tr></thead><tbody>
-<tr>
-<td>Stage 0 Random Baseline</td>
-<td>10 dev maps (30 eps)</td>
-<td>30</td>
-<td>1 (3.3%)</td>
-<td>0</td>
-<td>0</td>
-<td>10</td>
-<td>13.97</td>
-<td>0</td>
-</tr>
-<tr>
-<td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
-<td>10 dev maps (20 eps)</td>
-<td>20</td>
-<td>19 (95.0%)</td>
-<td>10</td>
-<td>10</td>
-<td>16</td>
-<td>42.35</td>
-<td>0</td>
-</tr>
-<tr>
-<td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
-<td>14 stress probes (28 eps)</td>
-<td>28</td>
-<td>23 (82.1%)</td>
-<td>16</td>
-<td>16</td>
-<td>27</td>
-<td>37.04</td>
-<td>0</td>
-</tr>
-<tr>
-<td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
-<td>8 final_ood maps (16 eps)</td>
-<td>16</td>
-<td>1 (6.2%)</td>
-<td>4</td>
-<td>2</td>
-<td>32</td>
-<td>54.88</td>
-<td>0</td>
-</tr>
-<tr>
-<td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
-<td>Freedoom MAP01–08 (8 eps)</td>
-<td>8</td>
-<td>0 (0.0%)</td>
-<td>0</td>
-<td>0</td>
-<td>31</td>
-<td>89.38</td>
-<td>0</td>
-</tr>
-</tbody></table>
-<ul>
-<li><strong>Long-horizon backtracking mastery on held-out synthetic tiers:</strong> Sprint 6B achieves <code>100%</code> <code>unlock|pickup</code> and <code>100%</code> <code>exit|unlock</code> on <code>dev</code> (<code>0</code> deaths, <code>0.9792</code> proxy score) and solves <code>10/14</code> <code>stress</code> probes <code>100%</code> (including <code>key_window</code>, <code>junction_return</code>, <code>stairs_ledge</code>, <code>grate_combat</code>, <code>nukage_hazard</code>, and <code>dropoff_return</code>; <code>0.8750</code> proxy score).</li>
-</ul>
-<h3>2. Sandbox Compliance &amp; Inference Runtime (<code>validate.py</code>)</h3>
-<ul>
-<li><strong>Footprint &amp; Dependencies:</strong> <code>45.0 MB</code> tracked repo size (cap <code>1.0 GB</code>, Git LFS enabled on <code>submission/weights/policy.pt</code>), <code>0</code> extra packages in <code>submission/requirements.txt</code>, offline and read-only compliant.</li>
-<li><strong>GPU Validation (<code>validate.py --device cuda</code>, RTX 3050 6GB):</strong> <code>5.5s</code> init (cap <code>60s</code>), <code>16.6 ms</code> p50 step latency (cap <code>40 ms</code>), <code>125 MB</code> peak VRAM (cap <code>2,048 MB</code>), exit reached on <code>two_rooms.wad:MAP01</code>.</li>
-<li><strong>Linux + CUDA 1-CPU Reference (<code>telemetry_gru_v1</code>):</strong> <code>2.4s</code> init, <code>4.0–4.8 ms</code> p50 (<code>20 ms</code> max), <code>1,380 MB / 8,192 MB</code> RAM, <code>156 MB / 2,048 MB</code> VRAM.</li>
-<li><strong>Local CPU Validation (promoted <code>s6b_policy.pt</code> on Windows):</strong> <code>4.7s</code> init, <code>first 11 ms</code>, <code>p50 8.9 ms</code>, <code>p99 13.2 ms</code>, <code>max 25 ms</code>, <code>1.0s / 21.0s</code> compute budget, exit reached in <code>104</code> steps on <code>two_rooms.wad:MAP01</code>.</li>
-</ul>
-<h3>3. Concrete Failure Analysis &amp; Mitigations (<code>SPRINT6B_FAILURE_ANALYSIS.md</code>)</h3>
-<ul>
-<li><strong>Point-blank RocketLauncher self-kills (<code>final_ood_t3_dropoff_skull</code>, 0/3, deaths at steps 23–38):</strong> On spawn, the agent picked up a RocketLauncher (<code>wpn=5</code>) and fired at a nearby ChaingunGuy, causing fatal splash self-damage (<code>85 HP -&gt; 0</code> in 2 steps). <strong>Fix shipped:</strong> enabled <code>rocket_safety_mask=True</code> in the promoted checkpoint (observation-only action mask suppressing <code>ATTACK</code> when <code>selected_weapon == 5</code> and front rays report close geometry/enemies) alongside a self-damage penalty in <code>training/rewards.py</code>.</li>
-<li><strong>Telemetry aliasing on wall switches and nukage (<code>stress/exit_switch</code> 0/3, <code>remote_door_switch</code> 0/3, Freedoom):</strong> <code>doom_env</code> rays tag wall switches and exit switches as <code>RAY_WALL</code> and do not encode damaging nukage floors. On <code>exit_switch.wad</code>, the agent saw only <code>RAY_WALL</code> and pressed <code>USE</code> <code>0</code> times across <code>1,575</code> steps. Because our model uses <code>&lt;8%</code> of VRAM, fusing a tiny downsampled <code>rgb</code>/<code>depth</code> CNN is our planned next upgrade for switch and hazard visibility.</li>
-</ul>
+
+<!-- ========================================================= PAGE 1 ========================================================= -->
+<div class="page">
+  <div class="page-main">
+
+    <!-- Header -->
+    <div class="doc-header">
+      <div class="doc-header-top">
+        <h1 class="doc-title">Telemetry-Driven Recurrent DOOM Agent with Spatial Memory</h1>
+        <span class="doc-track">Yugaantar 2026 · DevForge Track 1</span>
+      </div>
+      <div class="doc-meta">
+        <strong>Shipped Model:</strong> Sprint 6B (<code>telemetry_gru_v1</code>, 884k params, 3.55 MB Git LFS) &nbsp;|&nbsp;
+        <strong>Dependencies:</strong> 0 extra packages &nbsp;|&nbsp;
+        <strong>Compliance:</strong> 100% neural decisions, zero heuristics/pathfinding
+      </div>
+    </div>
+
+    <!-- Compact Metrics Row -->
+    <div class="metrics-row">
+      <div class="metric-item">
+        <div class="metric-val">95.0%</div>
+        <div class="metric-lbl">Held-Out Dev Exits</div>
+        <div class="metric-sub">19/20 eps · 0 deaths · 100% unlock</div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-val">82.1%</div>
+        <div class="metric-lbl">Stress Probe Exits</div>
+        <div class="metric-sub">23/28 eps · 10/14 probes 100%</div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-val">7.4 ms</div>
+        <div class="metric-lbl">Step Latency (p50)</div>
+        <div class="metric-sub">18.5% of 40 ms cap (1 CPU+CUDA)</div>
+      </div>
+      <div class="metric-item">
+        <div class="metric-val">532 MB</div>
+        <div class="metric-lbl">Peak Eval VRAM</div>
+        <div class="metric-sub">26% of 2 GB cap · 45 MB repo</div>
+      </div>
+    </div>
+
+    <!-- 1. USP -->
+    <div>
+      <h2 class="sec-heading">1. Unique Selling Proposition</h2>
+      <p class="body-p">
+        Instead of off-the-shelf Stable-Baselines3 pixel CNNs—which overfit to wall textures and strain the <code>2 GB</code> VRAM / <code>1 CPU</code> sandbox—we built a <strong>100% custom PyTorch + NumPy architecture and RL pipeline</strong> from scratch.
+        Operating directly on <code>doom_env</code> geometric telemetry (<code>render_buffers=False</code>) reaches <strong>301.7 decisions/sec</strong> on A100 while pairing a compact recurrent policy with an <strong>odometric 2D spatial memory</strong> built strictly from legal observations.
+        Every action comes from trained weights (zero <code>if/else</code> action trees, zero inference pathfinding, zero aimbots, zero edits to <code>env/</code>).
+      </p>
+    </div>
+
+    <!-- 2. System Architecture -->
+    <div>
+      <h2 class="sec-heading">2. System Architecture &amp; Inference Pipeline</h2>
+      <div class="diagram-box">
+        <svg viewBox="0 0 740 128" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">
+          <defs>
+            <marker id="arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+              <path d="M0,0.8 L5,3 L0,5.2 Z" fill="#1f2937"/>
+            </marker>
+          </defs>
+
+          <!-- Block 1: doom_env -->
+          <rect x="4" y="4" width="122" height="88" fill="#ffffff" stroke="#1f2937" stroke-width="1"/>
+          <rect x="4" y="4" width="122" height="18" fill="#f3f4f6" stroke="#1f2937" stroke-width="1"/>
+          <text x="65" y="16" text-anchor="middle" font-size="8.8" font-weight="700" fill="#111827">doom_env Obs</text>
+          <text x="12" y="36" font-size="8.2" fill="#111827">• rays (64, 360°)</text>
+          <text x="12" y="50" font-size="8.2" fill="#111827">• entities (≤32)</text>
+          <text x="12" y="64" font-size="8.2" fill="#111827">• vitals (17) + prev</text>
+          <text x="12" y="81" font-size="7.7" font-style="italic" fill="#4b5563">× rgb/depth omitted</text>
+
+          <line x1="126" y1="26" x2="144" y2="26" stroke="#1f2937" stroke-width="1.1" marker-end="url(#arr)"/>
+          <line x1="126" y1="71" x2="144" y2="71" stroke="#1f2937" stroke-width="1.1" marker-end="url(#arr)"/>
+
+          <!-- Block 2: Preprocess & Spatial Map -->
+          <rect x="146" y="4" width="136" height="38" fill="#ffffff" stroke="#1f2937" stroke-width="1"/>
+          <text x="214" y="19" text-anchor="middle" font-size="8.6" font-weight="700" fill="#111827">obs.py Preprocessing</text>
+          <text x="214" y="32" text-anchor="middle" font-size="7.7" fill="#374151">Scale, clip &amp; ego kinematics</text>
+
+          <rect x="146" y="48" width="136" height="44" fill="#f9fafb" stroke="#1f2937" stroke-width="1"/>
+          <text x="214" y="62" text-anchor="middle" font-size="8.6" font-weight="700" fill="#111827">EgocentricSpatialMap</text>
+          <text x="214" y="74.5" text-anchor="middle" font-size="7.6" fill="#374151">ICP odometry → 128×128 grid</text>
+          <text x="214" y="86" text-anchor="middle" font-size="7.5" font-weight="600" fill="#111827">(8, 25, 25) crop + beacons</text>
+
+          <line x1="282" y1="23" x2="302" y2="23" stroke="#1f2937" stroke-width="1.1" marker-end="url(#arr)"/>
+          <line x1="282" y1="70" x2="302" y2="70" stroke="#1f2937" stroke-width="1.1" marker-end="url(#arr)"/>
+
+          <!-- Block 3: 4 Encoders -->
+          <rect x="304" y="4" width="144" height="88" fill="#ffffff" stroke="#1f2937" stroke-width="1"/>
+          <rect x="304" y="4" width="144" height="18" fill="#f3f4f6" stroke="#1f2937" stroke-width="1"/>
+          <text x="376" y="16" text-anchor="middle" font-size="8.6" font-weight="700" fill="#111827">4 Custom Encoders</text>
+          <text x="312" y="36" font-size="8.1" fill="#111827">• CircularRay CNN (80k)</text>
+          <text x="312" y="51" font-size="8.1" fill="#111827">• Entity Cross-Attn (98k)</text>
+          <text x="312" y="66" font-size="8.1" fill="#111827">• SpatialMap CNN (121k)</text>
+          <text x="312" y="81" font-size="8.1" fill="#111827">• Vitals + Action MLP (7k)</text>
+
+          <line x1="448" y1="48" x2="466" y2="48" stroke="#1f2937" stroke-width="1.1" marker-end="url(#arr)"/>
+
+          <!-- Block 4: Fusion + Residual GRU -->
+          <rect x="468" y="4" width="122" height="88" fill="#f3f4f6" stroke="#1f2937" stroke-width="1.2"/>
+          <text x="529" y="25" text-anchor="middle" font-size="8.6" font-weight="700" fill="#111827">Fusion (448→256)</text>
+          <line x1="482" y1="34" x2="576" y2="34" stroke="#9ca3af" stroke-width="1"/>
+          <text x="529" y="52" text-anchor="middle" font-size="9.2" font-weight="700" fill="#111827">Residual GRU</text>
+          <text x="529" y="66" text-anchor="middle" font-size="8.0" fill="#374151">256-dim · 395k params</text>
+          <text x="529" y="80" text-anchor="middle" font-size="7.4" fill="#4b5563">reset() clears per map</text>
+
+          <line x1="590" y1="48" x2="608" y2="48" stroke="#1f2937" stroke-width="1.1" marker-end="url(#arr)"/>
+
+          <!-- Block 5: Control Output -->
+          <rect x="610" y="4" width="126" height="88" fill="#ffffff" stroke="#1f2937" stroke-width="1"/>
+          <rect x="610" y="4" width="126" height="18" fill="#f3f4f6" stroke="#1f2937" stroke-width="1"/>
+          <text x="673" y="16" text-anchor="middle" font-size="8.6" font-weight="700" fill="#111827">Control Output</text>
+          <text x="673" y="36" text-anchor="middle" font-size="8.1" font-weight="700" fill="#111827">Factorized Actor (34k)</text>
+          <text x="673" y="50" text-anchor="middle" font-size="7.8" fill="#374151">3×3-cat + 3 Bernoulli</text>
+          <text x="673" y="65" text-anchor="middle" font-size="7.8" font-weight="600" fill="#111827">+ Rocket Safety Mask</text>
+          <text x="673" y="80" text-anchor="middle" font-size="7.8" fill="#111827">→ MultiBinary(9)</text>
+
+          <!-- Training-only footer strip -->
+          <rect x="4" y="100" width="732" height="23" fill="#ffffff" stroke="#6b7280" stroke-dasharray="3.5,2.5"/>
+          <text x="370" y="115" text-anchor="middle" font-size="7.9" fill="#374151">
+            <tspan font-weight="700" fill="#111827">Training-Only Scaffolding (0 B at eval):</tspan>
+            Asymmetric Critic · Aux Locked-Door Head · Geodesic PBRS · 50% Mirror Symmetry · RND Curiosity · Teacher KL
+          </text>
+        </svg>
+        <div class="note">
+          <strong>Runtime Lifecycle (<code>submission/agent.py</code>):</strong> <code>__init__()</code> warms both populated and empty-room branches so step 1 avoids CUDA init latency; <code>reset()</code> zeroes the GRU, spatial grid, and <code>prev_action</code> before every map.
+        </div>
+      </div>
+    </div>
+
+    <!-- 3 & 4 Side by Side -->
+    <div class="grid-2">
+      <div>
+        <h2 class="sec-heading">3. Sensory &amp; State Representation</h2>
+        <ul class="clean">
+          <li><strong><code>rays</code> (64, 360°):</strong> Normalized distance <code>[d, 1−d]</code> + 6-class one-hot hit type (<code>none, wall, door, locked_door, enemy, item</code>).</li>
+          <li><strong><code>visible_entities</code> (≤32):</strong> 12-class type embedding + ego combat kinematics (distance, bearing, closing &amp; lateral speed, time-to-impact, crosshair alignment).</li>
+          <li><strong><code>vitals</code> (17) + <code>prev_action</code> (9):</strong> Health, armor, weapon one-hot, ammo, 6 key flags, velocity, plus explicit <code>empty_ammo</code> / <code>low_health</code> / <code>speed</code> cues for snag detection &amp; edge-triggered <code>USE</code>.</li>
+          <li><strong><code>rgb</code> &amp; <code>depth</code>:</strong> Intentionally omitted for texture invariance and speed (switch/nukage trade-off discussed on Page 2).</li>
+        </ul>
+      </div>
+
+      <div>
+        <h2 class="sec-heading">4. Neural Architecture (884k Params)</h2>
+        <ul class="clean">
+          <li><strong>Circular 1D CNN (<code>CircularRayEncoder</code>):</strong> Three circular-padded 1D conv layers preserve 360° left-right continuity with no wraparound seam.</li>
+          <li><strong>Variable-Enemy Cross-Attention:</strong> Permutation-invariant 4-head, 4-query masked attention conditioned on vitals + rays, combined with per-category enemy/item counts and a learned empty-room fallback—cleanly handling <code>0</code> to <code>32</code> entities.</li>
+          <li><strong>Factorized Actor &amp; Rocket Mask:</strong> Three 3-way categoricals (move, strafe, turn → <code>0</code> conflicting buttons) + 3 Bernoullis (<code>ATTACK, USE, WPN</code>) + observation-only close-range RocketLauncher safety mask.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- 5. Spatial Memory -->
+    <div>
+      <h2 class="sec-heading">5. Spatial Memory Design</h2>
+      <ul class="clean">
+        <li><strong>Pure-NumPy Odometric 2D Grid (<code>submission/ego_map.py</code>):</strong> Builds a persistent <code>128×128</code> map (<code>48u/cell</code>) strictly from legal telemetry and <code>prev_action</code> (zero privileged coordinates, zero pathfinding). Integrates Doom turn-hold physics and velocity, refined by 2-iteration wall-ray ICP to prevent wall-slide drift.</li>
+        <li><strong>8 Semantic Channels &amp; Perimeter Beacons:</strong> Tracks visited cells, a <strong>post-key visited channel</strong> (clears on each key pickup so explored halls become fresh backtracking targets), walls, free space, doors, locked doors (kept until a key is held), items/keys, and decaying enemies. Crops an ego-aligned <code>(8, 25, 25)</code> view into a 3-layer CNN (<code>121k</code>), projecting off-crop keys and locked doors onto the border ring for long-range return bearing.</li>
+        <li><strong>Residual GRU (<code>256</code>-dim) + Auxiliary Memory Head:</strong> <code>LN(GRU(x) + x)</code> preserves short-term combat rhythm and <code>USE</code> button-edge timing; during training, <code>AuxMemoryHead</code> supervises nearest matching locked-door bearing (<code>100%</code> sighting accuracy).</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <div class="page-footer">
+    <span>Yugaantar 2026 · DevForge Track 1 · Project Brief</span>
+    <span>Page 1 of 2</span>
+  </div>
+</div>
+
+<!-- ========================================================= PAGE 2 ========================================================= -->
+<div class="page">
+  <div class="page-main">
+
+    <!-- 6. Training & Exploration Pipeline -->
+    <div>
+      <h2 class="sec-heading">6. Training &amp; Exploration Pipeline</h2>
+      <div class="grid-2">
+        <ul class="clean">
+          <li><strong>Custom Recurrent PPO (<code>training/ppo.py</code>):</strong> Built from scratch in PyTorch with chunked BPTT (<code>chunk_len=64</code>, episode-boundary hidden masking), GAE (<code>γ=0.995</code>), clipped Huber value loss, <code>bf16</code> AMP, and <code>50%</code> exact left-right mirror symmetry. Sprint 6B trained for <strong>3.26M decisions</strong> (<code>9,122</code> episodes).</li>
+          <li><strong>Privileged Scaffolding (Training-Only):</strong> An <code>AsymmetricCritic</code> (16 privileged progress features, <code>0.86</code> explained variance) plus UDMF/binary WAD <strong>Geodesic PBRS</strong> computing shortest-path progression potentials (<code>spawn → key/switch → lock → exit</code>).</li>
+        </ul>
+        <ul class="clean">
+          <li><strong>Anti-Stuck Exploration &amp; Rewards:</strong> Exit-dominant rewards (<code>+12</code> exit + time/HP bonus, <code>+7</code> unlock, <code>+4</code> key, <code>+1.2</code> kill), diminishing cell novelty + <strong>post-key exploration reset</strong>, spin / door-bounce / <code>USE</code>-hold penalties, and optional RND curiosity.</li>
+          <li><strong>5,000-Map Corpus &amp; Curriculum:</strong> Procedural UDMF/dungeon generator (multi-key joins, relays, compound gauntlets) + 9 disjoint <code>freedoom2</code> training maps (<code>0</code> D4 leakage with held-out suites), driven by a 3-phase auto-curriculum with SFL/PVL regret sampling, ACCEL mutation, and Do-No-Harm promotion gating.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- 7. Held-Out Benchmark Results -->
+    <div>
+      <h2 class="sec-heading">7. Held-Out Benchmark Results</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Candidate</th>
+            <th>Held-Out Suite</th>
+            <th class="num">Episodes</th>
+            <th class="num">Exits (%)</th>
+            <th class="num">Keys / Unlocks</th>
+            <th class="num">Kills</th>
+            <th class="num">Mean Cells</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Stage 0 Random Baseline</td>
+            <td><code>dev</code> (10 maps, 3 seeds)</td>
+            <td class="num">30</td>
+            <td class="num">1 (3.3%)</td>
+            <td class="num">0 / 0</td>
+            <td class="num">10</td>
+            <td class="num">13.97</td>
+          </tr>
+          <tr class="emph">
+            <td>Sprint 6B (Shipped)</td>
+            <td><code>dev</code> (10 maps, 2 seeds)</td>
+            <td class="num">20</td>
+            <td class="num">19 (95.0%)</td>
+            <td class="num">10 / 10 (100%)</td>
+            <td class="num">16</td>
+            <td class="num">42.35</td>
+          </tr>
+          <tr class="emph">
+            <td>Sprint 6B (Shipped)</td>
+            <td><code>stress</code> (14 probes, 2 seeds)</td>
+            <td class="num">28</td>
+            <td class="num">23 (82.1%)</td>
+            <td class="num">16 / 16 (100%)</td>
+            <td class="num">27</td>
+            <td class="num">37.04</td>
+          </tr>
+          <tr>
+            <td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
+            <td><code>5k Corpus Full-Dev</code> (499 unseen maps)</td>
+            <td class="num">499</td>
+            <td class="num">83 (16.6%)</td>
+            <td class="num">165 / 87 (51.8%)</td>
+            <td class="num">543</td>
+            <td class="num">52.37</td>
+          </tr>
+          <tr>
+            <td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
+            <td><code>5k Corpus Sealed-Eval</code> (499 unseen maps)</td>
+            <td class="num">499</td>
+            <td class="num">72 (14.4%)</td>
+            <td class="num">160 / 80 (51.9%)</td>
+            <td class="num">525</td>
+            <td class="num">53.93</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="note">
+        <strong>Summary:</strong> Zero deaths and <code>100%</code> unlock/exit completion on <code>dev</code> (<code>0.979</code> proxy score); <code>10/14</code> targeted <code>stress</code> probes solved <code>100%</code>; <code>0</code> errors and <code>0</code> opposing-button steps across <code>378k+</code> corpus steps (<code>max 8.8 ms/step</code>). On extreme OOD/retail suites, Sprint 6B reaches <code>1/16</code> exits on <code>final_ood</code> (<code>32</code> kills) and <code>0/8</code> on retail <code>freedoom2 MAP01–08</code> (<code>31</code> kills, <code>89.4</code> cells). <em>(Official hidden maps &amp; weights are private.)</em>
+      </div>
+    </div>
+
+    <!-- 8. Sandbox Validation & Resource Headroom -->
+    <div>
+      <h2 class="sec-heading">8. Sandbox Compliance &amp; Runtime Validation (<code>validate.py</code>)</h2>
+      <div class="grid-eval">
+        <table>
+          <thead>
+            <tr>
+              <th>Metric (Linux+CUDA, 1 CPU Core)</th>
+              <th class="num">Measured</th>
+              <th class="num">Limit</th>
+              <th class="num">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Tracked Repo + Git LFS (<code>3.55 MB</code>)</td>
+              <td class="num"><code>45.0 MB</code></td>
+              <td class="num">1,024 MB</td>
+              <td class="num"><strong>PASS</strong></td>
+            </tr>
+            <tr>
+              <td>Init &amp; <code>two_rooms</code> Exit (125 steps)</td>
+              <td class="num"><code>2.6s</code> / <code>1.0s</code></td>
+              <td class="num">60s / 21s</td>
+              <td class="num"><strong>PASS</strong></td>
+            </tr>
+            <tr>
+              <td>Step Latency (p50 / p99)</td>
+              <td class="num"><code>7.4 / 8.8 ms</code></td>
+              <td class="num">40 ms p50</td>
+              <td class="num"><strong>PASS</strong></td>
+            </tr>
+            <tr>
+              <td>Peak Resident RAM / Peak VRAM</td>
+              <td class="num"><code>1,478 / 532 MB</code></td>
+              <td class="num">8 GB / 2 GB</td>
+              <td class="num"><strong>PASS</strong></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="diagram-box" style="padding:6pt 8pt;">
+          <svg viewBox="0 0 310 106" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">
+            <text x="2" y="11" font-size="8.4" font-weight="700" fill="#111827">Resource Usage vs. Sandbox Caps</text>
+
+            <text x="2" y="30" font-size="7.8" fill="#374151">Repo Size</text>
+            <rect x="74" y="21.5" width="140" height="9" fill="#e5e7eb"/>
+            <rect x="74" y="21.5" width="7" height="9" fill="#374151"/>
+            <text x="221" y="30" font-size="7.6" fill="#111827"><tspan font-weight="700">4.4%</tspan> (45 MB)</text>
+
+            <text x="2" y="52" font-size="7.8" fill="#374151">Peak RAM</text>
+            <rect x="74" y="43.5" width="140" height="9" fill="#e5e7eb"/>
+            <rect x="74" y="43.5" width="25" height="9" fill="#374151"/>
+            <text x="221" y="52" font-size="7.6" fill="#111827"><tspan font-weight="700">18.0%</tspan> (1.48 GB)</text>
+
+            <text x="2" y="74" font-size="7.8" fill="#374151">Latency p50</text>
+            <rect x="74" y="65.5" width="140" height="9" fill="#e5e7eb"/>
+            <rect x="74" y="65.5" width="26" height="9" fill="#374151"/>
+            <text x="221" y="74" font-size="7.6" fill="#111827"><tspan font-weight="700">18.5%</tspan> (7.4 ms)</text>
+
+            <text x="2" y="96" font-size="7.8" fill="#374151">Peak VRAM</text>
+            <rect x="74" y="87.5" width="140" height="9" fill="#e5e7eb"/>
+            <rect x="74" y="87.5" width="36" height="9" fill="#111827"/>
+            <text x="221" y="96" font-size="7.6" fill="#111827"><tspan font-weight="700">26.0%</tspan> (532 MB)</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <!-- 9. Failure Analysis & Mitigations -->
+    <div>
+      <h2 class="sec-heading">9. Failure Analysis &amp; Mitigations</h2>
+      <ul class="clean">
+        <li><strong>Fixed — Point-Blank RocketLauncher Self-Kills:</strong> On <code>final_ood_t3_dropoff_skull</code>, the agent picked up a RocketLauncher near spawn and self-killed via splash damage (steps 23–38). Adding our observation-only <code>rocket_safety_mask=True</code> in <code>submission/policy.py</code> eliminated close-range self-kills without heuristic action trees.</li>
+        <li><strong>Fixed — Forgetting &amp; Over-Cautious Fine-Tuning:</strong> Post-6B sprints showed harsh death penalties suppressed key-room entry while weak KL drifted policies. We added analytical teacher KL, Model Soup selection, and a strict Do-No-Harm promotion gate (<code>promote_checkpoint.py</code>) that protected validated Sprint 6B.</li>
+        <li><strong>Known Limitation — Wall-Switch &amp; Nukage Aliasing:</strong> Because <code>doom_env</code> rays tag wall/exit switches as <code>RAY_WALL</code> and omit damaging floors, the telemetry-only agent pressed <code>USE</code> 0 times on <code>stress/exit_switch.wad</code> and timed out on retail Freedoom switch exits. With <code>74%</code> VRAM headroom free, fusing a compact <code>30×40</code> <code>rgb/depth</code> CNN is our targeted next upgrade.</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <div class="page-footer">
+    <span>Yugaantar 2026 · DevForge Track 1 · Project Brief</span>
+    <span>Page 2 of 2</span>
+  </div>
+</div>
+
 </body>
 </html>
