@@ -1,0 +1,26 @@
+{
+  "round": 2,
+  "hypothesis": "Reducing HIGH from 0.45 to 0.35 (resuming from Sprint 6B incumbent, POOL=60, EXTRA=[]) reduces lethal nightmare saturation and prevents CMDP use_waste/post_key_death lambdas from pegging and collapsing unlocks, improving Tier 3-4 exits/unlocks while preserving Tier 1-2 exits and combat survival. Falsifying metric: no lexicographic gain over Sprint 6B or persistent guardrail regression.",
+  "high": 0.35,
+  "pool": 60,
+  "extra": [],
+  "used_oom_fallback": false,
+  "train_wall_s": 1206.21,
+  "cand_policy": "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/round_2/policy.pt",
+  "cand_policy_sha256": "7dffc2feab95263b13ac4b3d5b15a8e61ba19245bd984641c0863bd91b35a693",
+  "cand_state": "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/round_2/latest_train_state.pt",
+  "cand_state_sha256": "93a3c835daf47747e9557a93179537964404ee7ad92e72cd249f6496d7711538",
+  "cand_report": "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/round_2/round_2_panel_s0.json",
+  "incumbent_policy": "/content/doom_track1_a100/track-1/training/checkpoints/s6b_policy.pt",
+  "incumbent_report": "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/s6b_panel_s0.json",
+  "parity": {
+    "ok": true,
+    "num_tensors": 64,
+    "restored_lrs": [
+      5e-05
+    ],
+    "update": null,
+    "total_decisions": null,
+    "has_rnd": false
+  }
+}

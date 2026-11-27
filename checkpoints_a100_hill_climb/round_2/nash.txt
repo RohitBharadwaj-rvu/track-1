@@ -1,0 +1,116 @@
+## Nash Averaging Comparison
+| Candidate | Nash Value | Minimax Regret | Mean Rubric | CVaR-25 | Polytope Min | Nash Weight |
+|---|---|---|---|---|---|---|
+| round_2_panel_s0 | 0.4459 | 0.7750 | 0.1393 | 0.0000 | 0.0683 | 0.225 |
+| s6b_panel_s0 | 0.1918 | 0.5987 | 0.2170 | 0.0000 | 0.1327 | 0.775 |
+
+Top Frontier Maps:
+- `c04125_proc_poly_combat.wad:MAP01` (q*=0.647): {'s6b_panel_s0': 0.0, 'round_2_panel_s0': 0.5987}
+- `c02779_proc_poly_key_return.wad:MAP01` (q*=0.145): {'s6b_panel_s0': 0.775, 'round_2_panel_s0': 0.0}
+- `c02350_dungeon_combat.wad:MAP01` (q*=0.054): {'s6b_panel_s0': 0.22, 'round_2_panel_s0': 0.6995}
+- `c04149_dungeon_key_return.wad:MAP01` (q*=0.050): {'s6b_panel_s0': 0.9, 'round_2_panel_s0': 0.19}
+- `c04680_extreme_poly_grate_window_backtrack.wad:MAP01` (q*=0.008): {'s6b_panel_s0': 0.0, 'round_2_panel_s0': 0.0717}
+
+{
+  "corner": "balanced",
+  "common_maps": 36,
+  "total_maps": 36,
+  "game_value": 0.2488,
+  "minimax_regret_game_value": 0.4147,
+  "agents": [
+    {
+      "name": "round_2_panel_s0",
+      "nash_regret": 0.4009,
+      "nash_value": 0.4459,
+      "nash_weight": 0.2246,
+      "minimax_regret": 0.775,
+      "mean_rubric": 0.1393,
+      "cvar_25": 0.0,
+      "polytope_min": 0.0683
+    },
+    {
+      "name": "s6b_panel_s0",
+      "nash_regret": 0.4187,
+      "nash_value": 0.1918,
+      "nash_weight": 0.7754,
+      "minimax_regret": 0.5987,
+      "mean_rubric": 0.217,
+      "cvar_25": 0.0,
+      "polytope_min": 0.1327
+    }
+  ],
+  "frontier_maps": [
+    {
+      "map": "c04125_proc_poly_combat.wad:MAP01",
+      "tier": 1,
+      "nash_weight": 0.6474,
+      "scores": {
+        "s6b_panel_s0": 0.0,
+        "round_2_panel_s0": 0.5987
+      }
+    },
+    {
+      "map": "c02779_proc_poly_key_return.wad:MAP01",
+      "tier": 3,
+      "nash_weight": 0.1452,
+      "scores": {
+        "s6b_panel_s0": 0.775,
+        "round_2_panel_s0": 0.0
+      }
+    },
+    {
+      "map": "c02350_dungeon_combat.wad:MAP01",
+      "tier": 1,
+      "nash_weight": 0.0545,
+      "scores": {
+        "s6b_panel_s0": 0.22,
+        "round_2_panel_s0": 0.6995
+      }
+    },
+    {
+      "map": "c04149_dungeon_key_return.wad:MAP01",
+      "tier": 3,
+      "nash_weight": 0.05,
+      "scores": {
+        "s6b_panel_s0": 0.9,
+        "round_2_panel_s0": 0.19
+      }
+    },
+    {
+      "map": "c04680_extreme_poly_grate_window_backtrack.wad:MAP01",
+      "tier": 4,
+      "nash_weight": 0.0078,
+      "scores": {
+        "s6b_panel_s0": 0.0,
+        "round_2_panel_s0": 0.0717
+      }
+    },
+    {
+      "map": "c04139_extreme_poly_scarce_crossfire_gauntlet.wad:MAP01",
+      "tier": 4,
+      "nash_weight": 0.0074,
+      "scores": {
+        "s6b_panel_s0": 0.27,
+        "round_2_panel_s0": 0.0
+      }
+    },
+    {
+      "map": "c03336_extreme_poly_decoy_multilock.wad:MAP01",
+      "tier": 4,
+      "nash_weight": 0.0072,
+      "scores": {
+        "s6b_panel_s0": 0.0217,
+        "round_2_panel_s0": 0.09
+      }
+    },
+    {
+      "map": "c01654_dungeon_door_exit.wad:MAP01",
+      "tier": 2,
+      "nash_weight": 0.0061,
+      "scores": {
+        "s6b_panel_s0": 0.7283,
+        "round_2_panel_s0": 0.0983
+      }
+    }
+  ]
+}
