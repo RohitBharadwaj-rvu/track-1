@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from submission.obs import obs_to_torch
-from submission.policy import CHECKPOINT_FORMAT_VERSION, PolicyConfig, build_policy
+from submission.policy import (
+    CHECKPOINT_FORMAT_VERSION,
+    PolicyConfig,
+    build_policy,
+    factorized_kl_divergence,
+)
 from training.aux_heads import AsymmetricCritic, AuxMemoryHead, FeatureCaptureHook
 from training.curiosity import RNDConfig, RNDIntrinsicCuriosity
 from training.rollout import PRIV_FEATURE_DIM, RolloutBuffer
@@ -39,6 +45,8 @@ class PPOConfig:
     aux_coef: float = 0.2
     curiosity_coef: float = 0.0
     detach_asymmetric_critic_feat: bool = False
+    teacher_kl_coef: float = 0.0
+    use_amp_bf16: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -61,6 +69,7 @@ class RecurrentPPOTrainer:
         self.policy = policy
         self.config = config or PPOConfig()
         self._ent_coef = float(self.config.ent_coef)
+        self._teacher_kl_coef = float(self.config.teacher_kl_coef)
         self.device = torch.device(device)
         hidden_dim = int(getattr(getattr(policy, "config", None), "hidden_size", 256))
 
@@ -101,14 +110,26 @@ class RecurrentPPOTrainer:
     def set_ent_coef(self, ent_coef: float) -> None:
         self._ent_coef = float(ent_coef)
 
+    def set_teacher_kl_coef(self, teacher_kl_coef: float) -> None:
+        self._teacher_kl_coef = float(teacher_kl_coef)
+
     def close(self) -> None:
         if self.feature_hook is not None:
             self.feature_hook.remove()
             self.feature_hook = None
 
-    def update(self, buffer: RolloutBuffer, rng: np.random.Generator | None = None) -> dict[str, float]:
+    def update(
+        self,
+        buffer: RolloutBuffer,
+        rng: np.random.Generator | None = None,
+        *,
+        freeze_policy: bool = False,
+    ) -> dict[str, float]:
         cfg = self.config
-        self.policy.train()
+        if freeze_policy:
+            self.policy.eval()
+        else:
+            self.policy.train()
         if self.asymmetric_critic is not None:
             self.asymmetric_critic.train()
         if self.aux_head is not None:
@@ -117,9 +138,10 @@ class RecurrentPPOTrainer:
             rng = np.random.default_rng()
 
         pg_losses, v_losses, entropies, kls, clipfracs, grad_norms = [], [], [], [], [], []
-        aux_losses, aux_accs, rnd_losses = [], [], []
+        aux_losses, aux_accs, rnd_losses, teacher_kls = [], [], [], []
         epochs_run = 0
         early_stopped = False
+        use_amp = (not freeze_policy) and bool(cfg.use_amp_bf16) and self.device.type == "cuda"
 
         for epoch in range(cfg.update_epochs):
             epoch_kls = []
@@ -137,50 +159,124 @@ class RecurrentPPOTrainer:
                 if cfg.normalize_advantages and adv.numel() > 1:
                     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-                new_logprob, entropy, blind_value = self.policy.evaluate_chunks(
-                    obs_seq, prev_action_seq, action_seq, init_hidden, episode_starts
-                )
+                if freeze_policy:
+                    with torch.no_grad():
+                        new_logprob, entropy, blind_value = self.policy.evaluate_chunks(
+                            obs_seq, prev_action_seq, action_seq, init_hidden, episode_starts
+                        )
+                    feat_seq = self.feature_hook.pop().detach() if self.feature_hook is not None else None
+                    head_params = []
+                    if self.asymmetric_critic is not None:
+                        head_params.extend(self.asymmetric_critic.parameters())
+                    if self.aux_head is not None:
+                        head_params.extend(self.aux_head.parameters())
 
-                feat_seq = self.feature_hook.pop() if self.feature_hook is not None else None
-                if self.asymmetric_critic is not None and feat_seq is not None:
-                    priv_seq = torch.as_tensor(mb["priv_features"], dtype=torch.float32, device=self.device)
-                    critic_feat = feat_seq.detach() if cfg.detach_asymmetric_critic_feat else feat_seq
-                    new_value = self.asymmetric_critic(critic_feat, priv_seq)
-                else:
-                    new_value = blind_value
+                    loss = torch.zeros((), dtype=torch.float32, device=self.device)
+                    v_loss_val = 0.0
+                    if self.asymmetric_critic is not None and feat_seq is not None:
+                        priv_seq = torch.as_tensor(mb["priv_features"], dtype=torch.float32, device=self.device)
+                        new_value = self.asymmetric_critic(feat_seq, priv_seq)
+                        if cfg.use_huber_vloss:
+                            v_loss = F.huber_loss(new_value, ret, reduction="mean", delta=cfg.huber_delta)
+                        else:
+                            v_loss = 0.5 * ((new_value - ret) ** 2).mean()
+                        loss = loss + cfg.vf_coef * v_loss
+                        v_loss_val = float(v_loss.item())
 
-                logratio = new_logprob - old_logprob
-                ratio = torch.exp(logratio)
+                    if self.aux_head is not None and cfg.aux_coef > 0.0 and feat_seq is not None:
+                        aux_targets = torch.as_tensor(mb["aux_targets"], dtype=torch.float32, device=self.device)
+                        aux_loss, aux_m = self.aux_head.compute_loss(feat_seq, aux_targets)
+                        loss = loss + cfg.aux_coef * aux_loss
+                        aux_losses.append(float(aux_loss.item()))
+                        aux_accs.append(aux_m["aux_seen_acc"])
 
-                pg_loss1 = -adv * ratio
-                pg_loss2 = -adv * torch.clamp(ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    if self.curiosity is not None:
+                        rnd_losses.append(self.curiosity.update(mb["obs"]))
 
-                if cfg.use_huber_vloss:
-                    if cfg.clip_vloss:
-                        v_loss_unclipped = F.huber_loss(new_value, ret, reduction="none", delta=cfg.huber_delta)
-                        v_clipped = old_value + torch.clamp(new_value - old_value, -cfg.clip_coef, cfg.clip_coef)
-                        v_loss_clipped = F.huber_loss(v_clipped, ret, reduction="none", delta=cfg.huber_delta)
-                        v_loss = torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    grad_norm = 0.0
+                    if head_params and loss.requires_grad:
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        grad_norm = float(nn.utils.clip_grad_norm_(head_params, cfg.max_grad_norm).item())
+                        self.optimizer.step()
+
+                    pg_losses.append(0.0)
+                    v_losses.append(v_loss_val)
+                    entropies.append(float(entropy.mean().item()))
+                    kls.append(0.0)
+                    epoch_kls.append(0.0)
+                    clipfracs.append(0.0)
+                    grad_norms.append(grad_norm)
+                    teacher_kls.append(0.0)
+                    continue
+
+                use_tkl = self._teacher_kl_coef > 0.0 and "teacher_logits" in mb
+                amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
+                with amp_ctx:
+                    if use_tkl:
+                        new_logprob, entropy, blind_value, new_logits = self.policy.evaluate_chunks(
+                            obs_seq, prev_action_seq, action_seq, init_hidden, episode_starts, return_logits=True
+                        )
                     else:
-                        v_loss = F.huber_loss(new_value, ret, reduction="mean", delta=cfg.huber_delta)
-                elif cfg.clip_vloss:
-                    v_loss_unclipped = (new_value - ret) ** 2
-                    v_clipped = old_value + torch.clamp(new_value - old_value, -cfg.clip_coef, cfg.clip_coef)
-                    v_loss_clipped = (v_clipped - ret) ** 2
-                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
-                else:
-                    v_loss = 0.5 * ((new_value - ret) ** 2).mean()
+                        new_logprob, entropy, blind_value = self.policy.evaluate_chunks(
+                            obs_seq, prev_action_seq, action_seq, init_hidden, episode_starts
+                        )
+                        new_logits = None
 
-                entropy_loss = entropy.mean()
-                loss = pg_loss - self._ent_coef * entropy_loss + cfg.vf_coef * v_loss
+                    feat_seq = self.feature_hook.pop() if self.feature_hook is not None else None
+                    if self.asymmetric_critic is not None and feat_seq is not None:
+                        priv_seq = torch.as_tensor(mb["priv_features"], dtype=torch.float32, device=self.device)
+                        critic_feat = feat_seq.detach() if cfg.detach_asymmetric_critic_feat else feat_seq
+                        new_value = self.asymmetric_critic(critic_feat, priv_seq)
+                    else:
+                        new_value = blind_value
 
-                if self.aux_head is not None and cfg.aux_coef > 0.0 and feat_seq is not None:
-                    aux_targets = torch.as_tensor(mb["aux_targets"], dtype=torch.float32, device=self.device)
-                    aux_loss, aux_m = self.aux_head.compute_loss(feat_seq, aux_targets)
-                    loss = loss + cfg.aux_coef * aux_loss
-                    aux_losses.append(float(aux_loss.item()))
-                    aux_accs.append(aux_m["aux_seen_acc"])
+                    new_logprob_f = new_logprob.float()
+                    new_value_f = new_value.float()
+                    entropy_f = entropy.float()
+
+                    logratio = new_logprob_f - old_logprob
+                    ratio = torch.exp(logratio)
+
+                    pg_loss1 = -adv * ratio
+                    pg_loss2 = -adv * torch.clamp(ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    if cfg.use_huber_vloss:
+                        if cfg.clip_vloss:
+                            v_loss_unclipped = F.huber_loss(new_value_f, ret, reduction="none", delta=cfg.huber_delta)
+                            v_clipped = old_value + torch.clamp(new_value_f - old_value, -cfg.clip_coef, cfg.clip_coef)
+                            v_loss_clipped = F.huber_loss(v_clipped, ret, reduction="none", delta=cfg.huber_delta)
+                            v_loss = torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                        else:
+                            v_loss = F.huber_loss(new_value_f, ret, reduction="mean", delta=cfg.huber_delta)
+                    elif cfg.clip_vloss:
+                        v_loss_unclipped = (new_value_f - ret) ** 2
+                        v_clipped = old_value + torch.clamp(new_value_f - old_value, -cfg.clip_coef, cfg.clip_coef)
+                        v_loss_clipped = (v_clipped - ret) ** 2
+                        v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    else:
+                        v_loss = 0.5 * ((new_value_f - ret) ** 2).mean()
+
+                    entropy_loss = entropy_f.mean()
+                    loss = pg_loss - self._ent_coef * entropy_loss + cfg.vf_coef * v_loss
+
+                    if self.aux_head is not None and cfg.aux_coef > 0.0 and feat_seq is not None:
+                        aux_targets = torch.as_tensor(mb["aux_targets"], dtype=torch.float32, device=self.device)
+                        aux_loss, aux_m = self.aux_head.compute_loss(feat_seq.float(), aux_targets)
+                        loss = loss + cfg.aux_coef * aux_loss
+                        aux_losses.append(float(aux_loss.item()))
+                        aux_accs.append(aux_m["aux_seen_acc"])
+
+                    if use_tkl and new_logits is not None:
+                        teacher_logits = torch.as_tensor(mb["teacher_logits"], dtype=torch.float32, device=self.device)
+                        t_kl = factorized_kl_divergence(
+                            teacher_logits,
+                            new_logits,
+                            action_head=getattr(self.policy, "action_head", "factorized"),
+                        ).mean()
+                        loss = loss + self._teacher_kl_coef * t_kl
+                        teacher_kls.append(float(t_kl.item()))
 
                 if self.curiosity is not None:
                     rnd_losses.append(self.curiosity.update(mb["obs"]))
@@ -209,7 +305,7 @@ class RecurrentPPOTrainer:
                 grad_norms.append(grad_norm)
 
             epochs_run = epoch + 1
-            if cfg.target_kl is not None and epoch_kls and float(np.mean(epoch_kls)) > cfg.target_kl:
+            if (not freeze_policy) and cfg.target_kl is not None and epoch_kls and float(np.mean(epoch_kls)) > cfg.target_kl:
                 early_stopped = True
                 break
 
@@ -233,6 +329,7 @@ class RecurrentPPOTrainer:
             "aux_seen_acc": float(np.mean(aux_accs)) if aux_accs else 0.0,
             "rnd_loss": float(np.mean(rnd_losses)) if rnd_losses else 0.0,
             "mean_intrinsic_reward": float(getattr(buffer, "last_mean_intrinsic_reward", 0.0)),
+            "teacher_kl": float(np.mean(teacher_kls)) if teacher_kls else 0.0,
         }
 
 

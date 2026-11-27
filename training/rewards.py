@@ -47,8 +47,10 @@ class RewardConfig:
     use_waste_penalty: float = -0.004
     use_hold_penalty: float = -0.08
     wasted_ammo_penalty: float = -0.02
+    grate_wasted_shot_penalty: float = -0.025
     weapon_switch_waste_penalty: float = -0.02
     weapon_pickup_reward: float = 0.6
+    weapon_upgrade_bonus: float = 1.5
     max_pickup_bonus: float = 3.5
     pbrs_scale: float = 3.0
     pbrs_gamma: float = 1.0
@@ -85,6 +87,30 @@ def _has_visible_enemy(obs: dict[str, Any] | None) -> bool:
         return False
     etypes = np.asarray(ve["entity_type"], dtype=np.int64)[mask]
     return bool(np.isin(etypes, _ENEMY_ENTITY_TYPES).any())
+
+
+def _center_wall_blocks_nearest_enemy(obs: dict[str, Any] | None) -> bool:
+    if obs is None or "visible_entities" not in obs or "rays" not in obs:
+        return False
+    ve = obs["visible_entities"]
+    mask = np.asarray(ve["mask"], dtype=bool)
+    if not np.any(mask):
+        return False
+    etypes = np.asarray(ve["entity_type"], dtype=np.int64)[mask]
+    feats = np.asarray(ve["features"], dtype=np.float32)[mask]
+    is_front_enemy = np.isin(etypes, _ENEMY_ENTITY_TYPES) & (feats[:, 2] > 0.85)
+    if not np.any(is_front_enemy):
+        return False
+    nearest_enemy_dist = float(np.min(feats[is_front_enemy, 0]))
+    rays = obs["rays"]
+    ray_dist = np.asarray(rays["distance"], dtype=np.float32)
+    ray_type = np.asarray(rays["hit_type"], dtype=np.int64)
+    n_rays = len(ray_dist)
+    if n_rays < 3:
+        return False
+    center_idx = [0, 1, n_rays - 1]
+    # RAY_WALL == 1 in doom_env.spaces.RAY_HIT_TYPES
+    return bool(np.all(ray_type[center_idx] == 1) and float(np.max(ray_dist[center_idx])) < nearest_enemy_dist - 0.03)
 
 
 class RewardShaper:
@@ -263,14 +289,32 @@ class RewardShaper:
         )
         attack_pressed = action is not None and int(action[_ATTACK_IDX]) == 1
         ammo_waste = 0.0
-        if (ammo_dropped or attack_pressed) and events.kills == 0 and not _has_visible_enemy(obs):
-            ammo_waste = cfg.wasted_ammo_penalty
+        if (ammo_dropped or attack_pressed) and events.kills == 0:
+            if not _has_visible_enemy(obs):
+                ammo_waste = cfg.wasted_ammo_penalty
+            elif _center_wall_blocks_nearest_enemy(obs):
+                ammo_waste = cfg.grate_wasted_shot_penalty
 
         weapon_switch_penalty = 0.0
         if action is not None and int(action[_WEAPON_SWITCH_IDX]) == 1 and obs is not None and "vitals" in obs:
-            sel_wpn = int(round(float(obs["vitals"][2])))
-            sel_ammo = float(obs["vitals"][3])
-            if sel_wpn >= 2 and sel_ammo > 0.5:
+            vitals_raw = obs["vitals"]
+            sel_wpn = int(round(float(vitals_raw[2])))
+            sel_ammo = float(vitals_raw[3])
+            has_heavy_ammo = bool(
+                len(vitals_raw) >= 8
+                and (float(vitals_raw[5]) > 0.5 or float(vitals_raw[6]) > 0.5 or float(vitals_raw[7]) > 0.5)
+            )
+            front_near = False
+            if "rays" in obs:
+                rd = np.asarray(obs["rays"]["distance"], dtype=np.float32)
+                n_r = len(rd)
+                if n_r >= 7:
+                    front_near = float(np.min(rd[[i % n_r for i in (-3, -2, -1, 0, 1, 2, 3)]])) < 0.16
+            if sel_wpn in (3, 4, 6, 7) and sel_ammo > 0.5:
+                weapon_switch_penalty = cfg.weapon_switch_waste_penalty
+            elif sel_wpn == 5 and sel_ammo > 0.5 and not front_near:
+                weapon_switch_penalty = cfg.weapon_switch_waste_penalty
+            elif sel_wpn == 2 and sel_ammo > 0.5 and not has_heavy_ammo:
                 weapon_switch_penalty = cfg.weapon_switch_waste_penalty
 
         pickup = 0.0
@@ -284,7 +328,7 @@ class RewardShaper:
                 cur_wpn = int(round(float(obs["vitals"][2])))
                 if cur_wpn >= 3 and cur_wpn not in self._owned_weapons:
                     self._owned_weapons.add(cur_wpn)
-                    raw_pickup += cfg.weapon_pickup_reward
+                    raw_pickup += cfg.weapon_upgrade_bonus if cur_wpn in (3, 4, 6, 7) else cfg.weapon_pickup_reward
             if raw_pickup > 0.0:
                 pickup = min(raw_pickup, cfg.max_pickup_bonus - self._pickup_bonus_earned)
                 self._pickup_bonus_earned += pickup

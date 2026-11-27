@@ -200,7 +200,9 @@ class _DoomWorkerSlot:
         self._damage_taken = 0.0
         self._use_waste_steps = 0
         self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
-        self._locked_doors_xy: list[tuple[float, float]] = []
+        self._locked_doors_xy: list[tuple[float, float, int]] = []
+        self._mapinfo_locks: dict[tuple[str, str], list[tuple[float, float, int]]] = {}
+        self._active_door_locks: list[tuple[float, float, int]] = []
         self._last_priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
         self._last_aux_targets = np.zeros(AUX_TARGET_DIM, dtype=np.float32)
 
@@ -244,6 +246,8 @@ class _DoomWorkerSlot:
         live_wads = {_resolve_wad_path(s.wad) for s in self.map_specs}
         for pk in [k for k in self._pbrs_cache if k[0] not in live_wads]:
             del self._pbrs_cache[pk]
+        for mk in [k for k in self._mapinfo_locks if k[0] not in live_wads]:
+            del self._mapinfo_locks[mk]
         for ek in [k for k, env in self._envs.items() if k[0] not in live_wads and env is not self._active_env]:
             evicted = self._envs.pop(ek)
             try:
@@ -271,6 +275,28 @@ class _DoomWorkerSlot:
         self._envs[key] = env
         return env
 
+    def _get_door_locks(self, spec: MapSpec, env: Any) -> list[tuple[float, float, int]]:
+        wad_path = _resolve_wad_path(spec.wad)
+        key = (wad_path, spec.map_name.upper())
+        if key not in self._mapinfo_locks:
+            entries: list[tuple[float, float, int]] = []
+            try:
+                mi = getattr(env, "mapinfo", None)
+                if mi is not None and getattr(mi, "door_sectors", None):
+                    sec_lines = mi.sector_lines()
+                    for sid, lock_num in mi.door_sectors.items():
+                        if int(lock_num) <= 0:
+                            continue
+                        segs = sec_lines.get(int(sid))
+                        if segs is None or len(segs) == 0:
+                            continue
+                        pts = np.concatenate([segs[:, :2], segs[:, 2:]], axis=0)
+                        entries.append((float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])), int(lock_num)))
+            except Exception:
+                entries = []
+            self._mapinfo_locks[key] = entries
+        return self._mapinfo_locks[key]
+
     def _update_door_sighting_and_features(
         self,
         raw_obs: dict[str, Any],
@@ -280,12 +306,32 @@ class _DoomWorkerSlot:
         px = float(priv["x"])
         py = float(priv["y"])
         heading = math.radians(float(priv["angle"]))
+        keys_arr = np.asarray(priv["keys"], dtype=np.float32)
+        # sensors.KEY_NAMES order: BlueCard, YellowCard, RedCard, BlueSkull, YellowSkull, RedSkull
+        has_blue = bool(len(keys_arr) >= 4 and (keys_arr[0] > 0.5 or keys_arr[3] > 0.5))
+        has_yellow = bool(len(keys_arr) >= 5 and (keys_arr[1] > 0.5 or keys_arr[4] > 0.5))
+        has_red = bool(len(keys_arr) >= 6 and (keys_arr[2] > 0.5 or keys_arr[5] > 0.5))
+
+        def _is_unlockable(lock_num: int) -> bool:
+            if lock_num == 1:
+                return has_red
+            if lock_num == 2:
+                return has_blue
+            if lock_num == 3:
+                return has_yellow
+            if lock_num == 100:
+                return has_red or has_blue or has_yellow
+            if lock_num == 101:
+                return has_red and has_blue and has_yellow
+            return False
 
         if unlocked_this_step > 0 and self._locked_doors_xy:
-            # Remove nearest unlocked door(s) while preserving remaining sighted locks on Tier 4 maps
+            # Prefer removing nearest sighted door whose lock matches a held key
             for _ in range(min(unlocked_this_step, len(self._locked_doors_xy))):
+                unlockable_idx = [i for i, pt in enumerate(self._locked_doors_xy) if _is_unlockable(pt[2])]
+                pool_idx = unlockable_idx if unlockable_idx else list(range(len(self._locked_doors_xy)))
                 nearest_idx = min(
-                    range(len(self._locked_doors_xy)),
+                    pool_idx,
                     key=lambda i: math.hypot(self._locked_doors_xy[i][0] - px, self._locked_doors_xy[i][1] - py),
                 )
                 self._locked_doors_xy.pop(nearest_idx)
@@ -298,23 +344,33 @@ class _DoomWorkerSlot:
             best_ray = int(locked_indices[int(np.argmin(dists))])
             d = float(rays["distance"][best_ray]) * _RAY_RANGE
             ray_angle = heading + best_ray * (2.0 * math.pi / float(NUM_RAYS))
-            cand_xy = (px + d * math.cos(ray_angle), py + d * math.sin(ray_angle))
+            cx = px + d * math.cos(ray_angle)
+            cy = py + d * math.sin(ray_angle)
+            cand_lock = 0
+            best_lock_dist = 160.0
+            for lx, ly, lck in self._active_door_locks:
+                ld = math.hypot(cx - lx, cy - ly)
+                if ld < best_lock_dist:
+                    best_lock_dist = ld
+                    cand_lock = lck
             merged = False
-            for i, (lx, ly) in enumerate(self._locked_doors_xy):
-                if math.hypot(cand_xy[0] - lx, cand_xy[1] - ly) < 96.0:
-                    self._locked_doors_xy[i] = cand_xy
+            for i, (lx, ly, old_lck) in enumerate(self._locked_doors_xy):
+                if math.hypot(cx - lx, cy - ly) < 96.0:
+                    self._locked_doors_xy[i] = (cx, cy, cand_lock or old_lck)
                     merged = True
                     break
             if not merged:
-                self._locked_doors_xy.append(cand_xy)
+                self._locked_doors_xy.append((cx, cy, cand_lock))
 
         seen_locked = 0.0
         door_sin = 0.0
         door_cos = 0.0
         door_dist_norm = 0.0
         if self._locked_doors_xy:
+            unlockable_pts = [pt for pt in self._locked_doors_xy if _is_unlockable(pt[2])]
+            pool_pts = unlockable_pts if unlockable_pts else self._locked_doors_xy
             target_xy = min(
-                self._locked_doors_xy,
+                pool_pts,
                 key=lambda pt: math.hypot(pt[0] - px, pt[1] - py),
             )
             dx = target_xy[0] - px
@@ -330,7 +386,6 @@ class _DoomWorkerSlot:
 
         ep_ticks = max(1, int(priv.get("episode_ticks", 1)))
         rem_frac = max(0.0, 1.0 - float(priv.get("tic", 0)) / float(ep_ticks))
-        keys_arr = np.asarray(priv["keys"], dtype=np.float32)
         priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
         priv_features[0] = min(float(self.shaper.unique_cells_visited) / 200.0, 2.0)
         priv_features[1] = min(float(self.shaper.post_key_cells_visited) / 60.0, 2.0)
@@ -377,6 +432,7 @@ class _DoomWorkerSlot:
         if self._ego_map is not None:
             self._ego_map.reset()
         self._locked_doors_xy = []
+        self._active_door_locks = self._get_door_locks(spec, env)
         priv_f, aux_t = self._update_door_sighting_and_features(raw_obs, priv)
         obs_for_policy = mirror_raw_obs(raw_obs) if self._mirror_ep else raw_obs
         if self._mirror_ep:
@@ -797,6 +853,7 @@ class RolloutBuffer:
         hidden_shape: tuple[int, ...],
         *,
         use_ego_map: bool = False,
+        teacher_logit_dim: int = 0,
     ):
         self.num_steps = int(num_steps)
         self.num_envs = int(num_envs)
@@ -827,6 +884,9 @@ class RolloutBuffer:
         self.hiddens = np.zeros((T, *self.hidden_shape), dtype=np.float32)
         self.priv_features = np.zeros((T, N, PRIV_FEATURE_DIM), dtype=np.float32)
         self.aux_targets = np.zeros((T, N, AUX_TARGET_DIM), dtype=np.float32)
+        self.teacher_logits = (
+            np.zeros((T, N, int(teacher_logit_dim)), dtype=np.float32) if int(teacher_logit_dim) > 0 else None
+        )
 
         self.advantages = np.zeros((T, N), dtype=np.float32)
         self.returns = np.zeros((T, N), dtype=np.float32)
@@ -863,6 +923,7 @@ class RolloutBuffer:
         hidden: np.ndarray,
         priv_features: np.ndarray | None = None,
         aux_targets: np.ndarray | None = None,
+        teacher_logits: np.ndarray | None = None,
     ) -> None:
         for k, arr in self.obs.items():
             arr[step] = obs_batch[k]
@@ -880,6 +941,8 @@ class RolloutBuffer:
             self.priv_features[step] = priv_features
         if aux_targets is not None:
             self.aux_targets[step] = aux_targets
+        if self.teacher_logits is not None and teacher_logits is not None:
+            self.teacher_logits[step] = teacher_logits
 
     def compute_returns_and_advantages(
         self,
@@ -934,7 +997,7 @@ class RolloutBuffer:
                 axis=1,
             )
 
-            yield {
+            batch_out = {
                 "obs": {k: _slice_seq(v) for k, v in self.obs.items()},
                 "prev_actions": _slice_seq(self.prev_actions),
                 "actions": _slice_seq(self.actions),
@@ -947,6 +1010,9 @@ class RolloutBuffer:
                 "aux_targets": _slice_seq(self.aux_targets),
                 "init_hidden": init_hidden,
             }
+            if self.teacher_logits is not None:
+                batch_out["teacher_logits"] = _slice_seq(self.teacher_logits)
+            yield batch_out
 
 
 def _policy_step(
@@ -997,6 +1063,8 @@ def collect_rollout(
     asymmetric_critic: Any = None,
     feature_hook: Any = None,
     curiosity: Any = None,
+    teacher_policy: Any = None,
+    teacher_hidden_state: list[Any] | None = None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, Any, np.ndarray, list[EpisodeMetrics], np.ndarray]:
     """Collect `buffer.num_steps` transitions, returning `(obs, prev_action, hidden, starts, eps, last_values)`."""
     import torch
@@ -1008,6 +1076,8 @@ def collect_rollout(
     policy.eval()
     if asymmetric_critic is not None:
         asymmetric_critic.eval()
+    if teacher_policy is not None:
+        teacher_policy.eval()
 
     with torch.no_grad():
         priv_batch, aux_batch = vec_env.get_privileged_batch()
@@ -1017,6 +1087,12 @@ def collect_rollout(
             obs_t = obs_to_torch(obs, device)
             prev_t = torch.as_tensor(prev_action, dtype=torch.float32, device=device)
             priv_t = torch.as_tensor(priv_batch, dtype=torch.float32, device=device)
+
+            teacher_logits_np = None
+            next_th = None
+            if teacher_policy is not None and teacher_hidden_state is not None:
+                t_logits_t, _, next_th = teacher_policy.act_step(obs_t, prev_t, teacher_hidden_state[0])
+                teacher_logits_np = t_logits_t.cpu().numpy().astype(np.float32)
 
             act_t, log_prob_t, value, next_hidden = _policy_step(
                 policy,
@@ -1086,6 +1162,7 @@ def collect_rollout(
                 hidden=hidden_before,
                 priv_features=priv_batch,
                 aux_targets=aux_batch,
+                teacher_logits=teacher_logits_np,
             )
 
             if np.any(done):
@@ -1093,8 +1170,12 @@ def collect_rollout(
                 keep_t = torch.as_tensor(keep_np, device=device).view(1, -1, 1)
                 next_hidden = next_hidden * keep_t
                 next_prev_action = action_np * keep_np[:, None]
+                if next_th is not None and teacher_hidden_state is not None:
+                    teacher_hidden_state[0] = next_th * keep_t
             else:
                 next_prev_action = action_np
+                if next_th is not None and teacher_hidden_state is not None:
+                    teacher_hidden_state[0] = next_th
 
             obs = next_obs
             prev_action = next_prev_action

@@ -81,6 +81,8 @@ class PolicyConfig:
     eval_deterministic: bool = False
     eval_temperature: float = 1.0
     action_threshold: float = 0.5
+    rocket_safety_mask: bool = False
+    eval_mirror_ensemble: bool = False
     use_ego_map: bool = False
     ego_map_out_dim: int = 128
     ego_map_channels: int = EGO_MAP_CHANNELS
@@ -225,6 +227,91 @@ def action_logprob_and_entropy(logits, action_9d, *, action_head: str = "factori
     return cat_lp + bern_lp, cat_ent + bern_ent
 
 
+def _apply_rocket_safety_mask(
+    logits,
+    obs: dict[str, Any],
+    *,
+    action_head: str = "factorized",
+):
+    """Mask ATTACK when RocketLauncher (weapon 5) is selected at point-blank wall or enemy range."""
+    import torch
+
+    vitals = obs.get("vitals")
+    ray_dist = obs.get("ray_dist")
+    if vitals is None or ray_dist is None or vitals.shape[-1] < 3:
+        return logits
+
+    is_rocket = torch.round(vitals[..., 2].float() * 7.0).long() == 5
+    if not bool(torch.any(is_rocket)):
+        return logits
+
+    n_rays = ray_dist.shape[-1]
+    front_idx = [i % n_rays for i in (-3, -2, -1, 0, 1, 2, 3)]
+    front_wall_near = ray_dist[..., front_idx].float().min(dim=-1).values < 0.14
+
+    ent_type = obs.get("ent_type")
+    ent_mask = obs.get("ent_mask")
+    ent_feat = obs.get("ent_feat")
+    if ent_type is not None and ent_mask is not None and ent_feat is not None and ent_feat.shape[-1] >= 3:
+        et = ent_type.long()
+        is_enemy = (et >= 1) & (et <= 3) & (ent_mask > 0.5)
+        front_enemy_near = (
+            is_enemy & (ent_feat[..., 2].float() > 0.7) & (ent_feat[..., 0].float() < 0.15)
+        ).any(dim=-1)
+    else:
+        front_enemy_near = torch.zeros_like(front_wall_near)
+
+    block_attack = is_rocket & (front_wall_near | front_enemy_near)
+    if not bool(torch.any(block_attack)):
+        return logits
+
+    atk_idx = 9 if action_head == "factorized" else 6
+    masked = logits.clone()
+    masked[..., atk_idx] = torch.where(
+        block_attack,
+        torch.full_like(masked[..., atk_idx], -20.0),
+        masked[..., atk_idx],
+    )
+    return masked
+
+
+def factorized_kl_divergence(
+    teacher_logits,
+    student_logits,
+    *,
+    action_head: str = "factorized",
+):
+    """Exact forward KL divergence D_KL(pi_teacher || pi_student) summed over action heads."""
+    import torch
+    import torch.nn.functional as F
+
+    if action_head == "bernoulli":
+        t_l = teacher_logits.float()
+        s_l = student_logits.float()
+        p_t = torch.sigmoid(t_l)
+        kl = (
+            p_t * (F.logsigmoid(t_l) - F.logsigmoid(s_l))
+            + (1.0 - p_t) * (F.logsigmoid(-t_l) - F.logsigmoid(-s_l))
+        ).sum(dim=-1)
+        return torch.clamp(kl, min=0.0)
+
+    lead_shape = teacher_logits.shape[:-1]
+    t_cat = teacher_logits[..., :9].float().reshape(*lead_shape, 3, 3)
+    s_cat = student_logits[..., :9].float().reshape(*lead_shape, 3, 3)
+    t_lp = F.log_softmax(t_cat, dim=-1)
+    s_lp = F.log_softmax(s_cat, dim=-1)
+    cat_kl = (t_lp.exp() * (t_lp - s_lp)).sum(dim=-1).sum(dim=-1)
+
+    t_b = teacher_logits[..., 9:12].float()
+    s_b = student_logits[..., 9:12].float()
+    p_b = torch.sigmoid(t_b)
+    bern_kl = (
+        p_b * (F.logsigmoid(t_b) - F.logsigmoid(s_b))
+        + (1.0 - p_b) * (F.logsigmoid(-t_b) - F.logsigmoid(-s_b))
+    ).sum(dim=-1)
+    return torch.clamp(cat_kl + bern_kl, min=0.0)
+
+
 def build_policy(config: PolicyConfig):
     """Factory that builds the PyTorch policy matching `config.arch`.
 
@@ -334,7 +421,9 @@ def build_policy(config: PolicyConfig):
             action_seq: torch.Tensor,
             init_hidden: torch.Tensor,
             episode_starts: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            *,
+            return_logits: bool = False,
+        ):
             emb = self._encode(obs_seq, prev_action_seq)
             t_steps = emb.shape[0]
             h = init_hidden
@@ -349,6 +438,8 @@ def build_policy(config: PolicyConfig):
             logits = self.actor(seq_h)
             value = self.critic(seq_h).squeeze(-1)
             log_prob, entropy = self.logprob_and_entropy(logits, action_seq)
+            if return_logits:
+                return log_prob, entropy, value, logits
             return log_prob, entropy, value
 
     class CircularRayEncoder(nn.Module):
@@ -733,6 +824,8 @@ def build_policy(config: PolicyConfig):
             fused = self._encode(obs_batch, prev_action)
             out, next_hidden = self.gru(fused.unsqueeze(0), hidden)
             logits, value = self._heads(out.squeeze(0), fused)
+            if self.config.rocket_safety_mask:
+                logits = _apply_rocket_safety_mask(logits, obs_batch, action_head=self.action_head)
             return logits, value, next_hidden
 
         def sample_from_logits(
@@ -786,7 +879,9 @@ def build_policy(config: PolicyConfig):
             action_seq: torch.Tensor,
             init_hidden: torch.Tensor,
             episode_starts: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            *,
+            return_logits: bool = False,
+        ):
             """Evaluate contiguous (T, B, ...) rollout chunks with exact episode-boundary resets."""
             t_steps, batch_size = obs_seq["vitals"].shape[:2]
             obs_flat = {k: v.reshape(t_steps * batch_size, *v.shape[2:]) for k, v in obs_seq.items()}
@@ -815,7 +910,11 @@ def build_policy(config: PolicyConfig):
                 gru_out = torch.cat(outs, dim=0)
 
             logits, value = self._heads(gru_out, fused_seq)
+            if self.config.rocket_safety_mask:
+                logits = _apply_rocket_safety_mask(logits, obs_seq, action_head=self.action_head)
             log_prob, entropy = self.logprob_and_entropy(logits, action_seq)
+            if return_logits:
+                return log_prob, entropy, value, logits
             return log_prob, entropy, value
 
     if config.arch == "stub":

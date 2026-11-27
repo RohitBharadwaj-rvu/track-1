@@ -934,6 +934,7 @@ class CorpusPoolSampler:
         rng: Any = None,
         scores_by_wad: dict[str, float] | None = None,
         elite_keep_frac: float = 0.20,
+        freedoom_per_pool: int = 2,
     ) -> list[MapSpec]:
         """Return a stratified working pool (retaining top SFL+PVL elites + unseen rotation)."""
         if rng is None:
@@ -952,10 +953,10 @@ class CorpusPoolSampler:
                     chosen_specs.append(s)
                     used_keys.add(key)
 
-        # 2. Optionally include up to 2 rotating disjoint Freedoom2 maps for real-WAD grounding
+        # 2. Optionally include rotating disjoint Freedoom2 maps for real-WAD grounding
         rem = k_total - len(chosen_specs)
-        if self._freedoom_indices and rem >= 12:
-            n_fd = min(2, len(self._freedoom_indices))
+        if self._freedoom_indices and freedoom_per_pool > 0 and rem >= 12:
+            n_fd = min(int(freedoom_per_pool), len(self._freedoom_indices), max(0, rem // 2))
             perm_fd = rng.permutation(len(self._freedoom_indices)) if hasattr(rng, "permutation") else list(range(len(self._freedoom_indices)))
             for pi in perm_fd[:n_fd]:
                 rec = self.records[self._freedoom_indices[int(pi)]]

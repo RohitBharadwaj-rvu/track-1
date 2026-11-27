@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import shutil
 import os
@@ -14,7 +14,13 @@ from typing import Any
 import numpy as np
 
 from submission.obs import NUM_ACTIONS
-from submission.policy import PolicyConfig, build_policy, save_checkpoint
+from submission.policy import (
+    FACTORIZED_LOGIT_DIM,
+    PolicyConfig,
+    build_policy,
+    load_checkpoint,
+    save_checkpoint,
+)
 from training.curriculum import CurriculumConfig, CurriculumScheduler
 from training.game_theory import AccelLevelArchive, PrimalDualController, load_champion_baselines
 from training.generate_corpus import CorpusPoolSampler
@@ -49,6 +55,8 @@ class TrainConfig:
     use_ego_map: bool = True
     ego_map_out_dim: int = 128
     eval_deterministic: bool = False
+    rocket_safety_mask: bool = False
+    eval_mirror_ensemble: bool = False
     split: str = "train"
     stage: str | None = None
     procedural_per_family: int = 4
@@ -65,6 +73,7 @@ class TrainConfig:
     corpus_pool_size: int = 60
     corpus_high_diff_frac: float = 0.45
     corpus_include_freedoom: bool = True
+    corpus_freedoom_per_pool: int = 2
     tier12_promote_threshold: float = 0.65
     tier3_promote_threshold: float = 0.50
     min_promote_episodes: int = 32
@@ -99,10 +108,19 @@ class TrainConfig:
     aux_coef: float = 0.2
     curiosity_coef: float = 0.0
     pbrs_scale: float = 3.0
+    death_penalty: float = -7.0
+    damage_penalty: float = -0.050
+    post_key_death_penalty: float = 0.0
     anneal_lr: bool = True
     checkpoint_dir: str = "training/runs/default"
     export_path: str = "submission/weights/policy.pt"
     resume: str | None = None
+    init_weights: str | None = None
+    teacher_checkpoint: str | None = None
+    teacher_kl_coef: float = 0.0
+    teacher_kl_coef_end: float = 0.005
+    critic_warmup_updates: int = 0
+    use_amp_bf16: bool = False
     save_interval: int = 10
     save_every_seconds: float = 0.0
     max_train_seconds: float = 0.0
@@ -299,6 +317,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
             pool_size=cfg.corpus_pool_size,
             high_diff_frac=cfg.corpus_high_diff_frac,
             rng=rng,
+            freedoom_per_pool=cfg.corpus_freedoom_per_pool,
         )
         map_specs = [*base_map_specs, *sampled]
     else:
@@ -327,7 +346,13 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
     base_reward_cfg = (
         reward_config
         if reward_config is not None
-        else RewardConfig(pbrs_scale=cfg.pbrs_scale, pbrs_gamma=1.0)
+        else RewardConfig(
+            pbrs_scale=cfg.pbrs_scale,
+            pbrs_gamma=1.0,
+            death_penalty=cfg.death_penalty,
+            damage_penalty=cfg.damage_penalty,
+            post_key_death_penalty=cfg.post_key_death_penalty,
+        )
     )
     effective_reward_cfg = base_reward_cfg
     cmdp = PrimalDualController() if cfg.use_primal_dual else None
@@ -365,6 +390,8 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
         use_asymmetric_critic=cfg.use_asymmetric_critic,
         aux_coef=cfg.aux_coef,
         curiosity_coef=cfg.curiosity_coef,
+        teacher_kl_coef=cfg.teacher_kl_coef,
+        use_amp_bf16=cfg.use_amp_bf16,
     )
 
     start_update = 0
@@ -387,6 +414,17 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
             aux_head=extras.get("aux_head"),
             curiosity=extras.get("curiosity"),
         )
+    elif cfg.init_weights:
+        policy, loaded_cfg, _ = load_checkpoint(cfg.init_weights, device=device)
+        policy_cfg = replace(
+            loaded_cfg,
+            eval_deterministic=bool(cfg.eval_deterministic),
+            rocket_safety_mask=bool(cfg.rocket_safety_mask),
+            eval_mirror_ensemble=bool(cfg.eval_mirror_ensemble),
+        )
+        policy.config = policy_cfg
+        policy.to(device)
+        trainer = RecurrentPPOTrainer(policy, ppo_cfg, device=device)
     else:
         policy_cfg = PolicyConfig(
             arch=cfg.arch,
@@ -399,9 +437,26 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
             use_ego_map=cfg.use_ego_map,
             ego_map_out_dim=cfg.ego_map_out_dim,
             eval_deterministic=cfg.eval_deterministic,
+            rocket_safety_mask=cfg.rocket_safety_mask,
+            eval_mirror_ensemble=cfg.eval_mirror_ensemble,
         )
         policy = build_policy(policy_cfg).to(device)
         trainer = RecurrentPPOTrainer(policy, ppo_cfg, device=device)
+
+    teacher_policy = None
+    teacher_hidden_state = None
+    teacher_logit_dim = 0
+    if cfg.teacher_checkpoint and cfg.teacher_kl_coef > 0.0:
+        teacher_policy, t_cfg, _ = load_checkpoint(cfg.teacher_checkpoint, device=device)
+        t_cfg = replace(t_cfg, rocket_safety_mask=bool(policy_cfg.rocket_safety_mask))
+        teacher_policy.config = t_cfg
+        teacher_policy.eval()
+        for p in teacher_policy.parameters():
+            p.requires_grad_(False)
+        teacher_logit_dim = (
+            FACTORIZED_LOGIT_DIM if teacher_policy.action_head == "factorized" else int(t_cfg.num_actions)
+        )
+        teacher_hidden_state = [teacher_policy.init_hidden(cfg.num_envs, device)]
 
     initial_weights = scheduler.compute_map_weights(map_specs)
 
@@ -444,17 +499,33 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                 cfg.num_envs,
                 hidden_shape=hidden_shape,
                 use_ego_map=use_ego_map,
+                teacher_logit_dim=teacher_logit_dim,
             )
 
+            warmup = max(0, int(cfg.critic_warmup_updates))
+            post_warmup_total = max(1, target_updates - warmup)
             for local_idx in range(target_updates):
                 update_idx = start_update + local_idx + 1
-                frac_done = float(local_idx) / float(max(1, target_updates - 1)) if target_updates > 1 else 0.0
-                if cfg.anneal_lr and target_updates > 1:
-                    lr_frac = max(cfg.min_lr_frac, 1.0 - (1.0 - cfg.min_lr_frac) * frac_done)
-                    trainer.set_lr(cfg.lr * lr_frac)
-                if target_updates > 1:
-                    cur_ent = cfg.ent_coef + (cfg.ent_coef_end - cfg.ent_coef) * frac_done
-                    trainer.set_ent_coef(cur_ent)
+                freeze_policy = local_idx < warmup
+                if freeze_policy:
+                    trainer.set_lr(max(cfg.lr, 3e-4))
+                    trainer.set_teacher_kl_coef(0.0)
+                else:
+                    eff_idx = local_idx - warmup
+                    frac_done = (
+                        float(eff_idx) / float(max(1, post_warmup_total - 1)) if post_warmup_total > 1 else 0.0
+                    )
+                    if cfg.anneal_lr and post_warmup_total > 1:
+                        lr_frac = max(cfg.min_lr_frac, 1.0 - (1.0 - cfg.min_lr_frac) * frac_done)
+                        trainer.set_lr(cfg.lr * lr_frac)
+                    elif cfg.anneal_lr:
+                        trainer.set_lr(cfg.lr)
+                    if post_warmup_total > 1:
+                        cur_ent = cfg.ent_coef + (cfg.ent_coef_end - cfg.ent_coef) * frac_done
+                        trainer.set_ent_coef(cur_ent)
+                    if cfg.teacher_kl_coef > 0.0:
+                        cur_tkl = cfg.teacher_kl_coef + (cfg.teacher_kl_coef_end - cfg.teacher_kl_coef) * frac_done
+                        trainer.set_teacher_kl_coef(cur_tkl)
 
                 t_iter = time.perf_counter()
                 obs, prev_action, hidden, episode_starts, ep_list, last_values = collect_rollout(
@@ -469,13 +540,15 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                     asymmetric_critic=trainer.asymmetric_critic,
                     feature_hook=trainer.feature_hook,
                     curiosity=trainer.curiosity,
+                    teacher_policy=teacher_policy,
+                    teacher_hidden_state=teacher_hidden_state,
                 )
                 buffer.compute_returns_and_advantages(
                     last_values=last_values,
                     gamma=cfg.gamma,
                     gae_lambda=cfg.gae_lambda,
                 )
-                ppo_metrics = trainer.update(buffer, rng=rng)
+                ppo_metrics = trainer.update(buffer, rng=rng, freeze_policy=freeze_policy)
                 iter_s = max(1e-6, time.perf_counter() - t_iter)
 
                 scheduler.observe_pvl(buffer.compute_per_wad_pvl())
@@ -508,6 +581,7 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                             high_diff_frac=cfg.corpus_high_diff_frac,
                             rng=rng,
                             scores_by_wad=scheduler.get_map_scores(map_specs),
+                            freedoom_per_pool=cfg.corpus_freedoom_per_pool,
                         )
                         map_specs = [*base_map_specs, *sampled]
                     elif archive is not None:
@@ -576,10 +650,11 @@ def run_training(cfg: TrainConfig, reward_config: RewardConfig | None = None) ->
                         f"[update {update_idx}/{start_update + target_updates}] "
                         f"steps={total_decisions} sps={sps:.0f} p={scheduler.phase} "
                         f"eps={episodes_completed} exit={ep_summary['exit_rate']:.2f} "
+                        f"death={ep_summary['death_rate']:.2f} "
                         f"door={ep_summary['door_open_rate']:.2f} key={ep_summary['key_rate']:.2f} "
                         f"unlock={ep_summary['unlock_rate']:.2f} rew={ep_summary['mean_reward']:.2f} "
-                        f"aux={ppo_metrics['aux_loss']:.3f} rnd={ppo_metrics['rnd_loss']:.3f} "
-                        f"kl={ppo_metrics['approx_kl']:.4f}",
+                        f"aux={ppo_metrics['aux_loss']:.3f} kl={ppo_metrics['approx_kl']:.4f} "
+                        f"tkl={ppo_metrics.get('teacher_kl', 0.0):.4f}",
                         flush=True,
                     )
 
@@ -843,7 +918,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--use-ego-map", dest="use_ego_map", action="store_true", default=True)
     p.add_argument("--no-use-ego-map", dest="use_ego_map", action="store_false")
     p.add_argument("--ego-map-out-dim", type=int, default=128)
-    p.add_argument("--eval-deterministic", action="store_true", default=False)
+    p.add_argument("--eval-deterministic", dest="eval_deterministic", action="store_true", default=False)
+    p.add_argument("--no-eval-deterministic", dest="eval_deterministic", action="store_false")
+    p.add_argument("--rocket-safety-mask", dest="rocket_safety_mask", action="store_true", default=False)
+    p.add_argument("--no-rocket-safety-mask", dest="rocket_safety_mask", action="store_false")
+    p.add_argument("--eval-mirror-ensemble", dest="eval_mirror_ensemble", action="store_true", default=False)
+    p.add_argument("--no-eval-mirror-ensemble", dest="eval_mirror_ensemble", action="store_false")
     p.add_argument("--map", dest="maps", action="append", default=[])
     p.add_argument("--split", default="train")
     p.add_argument("--stage", default=None)
@@ -866,6 +946,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--corpus-high-diff-frac", type=float, default=0.45)
     p.add_argument("--corpus-include-freedoom", dest="corpus_include_freedoom", action="store_true", default=True)
     p.add_argument("--no-corpus-include-freedoom", dest="corpus_include_freedoom", action="store_false")
+    p.add_argument("--corpus-freedoom-per-pool", type=int, default=2)
     p.add_argument("--tier12-promote-threshold", type=float, default=0.65)
     p.add_argument("--tier3-promote-threshold", type=float, default=0.50)
     p.add_argument("--min-promote-episodes", type=int, default=32)
@@ -875,6 +956,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--aux-coef", type=float, default=0.2)
     p.add_argument("--curiosity-coef", type=float, default=0.0)
     p.add_argument("--pbrs-scale", type=float, default=3.0)
+    p.add_argument("--death-penalty", type=float, default=-7.0)
+    p.add_argument("--damage-penalty", type=float, default=-0.050)
+    p.add_argument("--post-key-death-penalty", type=float, default=0.0)
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--vec-mode", choices=("subproc", "sync"), default="subproc")
     p.add_argument("--max-cached-envs", type=int, default=48)
@@ -901,6 +985,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint-dir", default="training/runs/default")
     p.add_argument("--export-path", default="submission/weights/policy.pt")
     p.add_argument("--resume", default=None)
+    p.add_argument("--init-weights", default=None)
+    p.add_argument("--teacher-checkpoint", default=None)
+    p.add_argument("--teacher-kl-coef", type=float, default=0.0)
+    p.add_argument("--teacher-kl-coef-end", type=float, default=0.005)
+    p.add_argument("--critic-warmup-updates", type=int, default=0)
+    p.add_argument("--use-amp-bf16", action="store_true", default=False)
     p.add_argument("--save-interval", type=int, default=10)
     p.add_argument("--save-every-seconds", type=float, default=0.0,
                    help="Archive policy and training state at the next completed PPO update")
@@ -949,6 +1039,8 @@ def main(argv: list[str] | None = None) -> None:
         use_ego_map=args.use_ego_map,
         ego_map_out_dim=args.ego_map_out_dim,
         eval_deterministic=args.eval_deterministic,
+        rocket_safety_mask=args.rocket_safety_mask,
+        eval_mirror_ensemble=args.eval_mirror_ensemble,
         split=args.split,
         stage=args.stage,
         procedural_per_family=args.procedural_per_family,
@@ -965,6 +1057,7 @@ def main(argv: list[str] | None = None) -> None:
         corpus_pool_size=args.corpus_pool_size,
         corpus_high_diff_frac=args.corpus_high_diff_frac,
         corpus_include_freedoom=args.corpus_include_freedoom,
+        corpus_freedoom_per_pool=args.corpus_freedoom_per_pool,
         tier12_promote_threshold=args.tier12_promote_threshold,
         tier3_promote_threshold=args.tier3_promote_threshold,
         min_promote_episodes=args.min_promote_episodes,
@@ -994,10 +1087,19 @@ def main(argv: list[str] | None = None) -> None:
         aux_coef=args.aux_coef,
         curiosity_coef=args.curiosity_coef,
         pbrs_scale=args.pbrs_scale,
+        death_penalty=args.death_penalty,
+        damage_penalty=args.damage_penalty,
+        post_key_death_penalty=args.post_key_death_penalty,
         anneal_lr=not args.no_anneal_lr,
         checkpoint_dir=args.checkpoint_dir,
         export_path=args.export_path,
         resume=args.resume,
+        init_weights=args.init_weights,
+        teacher_checkpoint=args.teacher_checkpoint,
+        teacher_kl_coef=args.teacher_kl_coef,
+        teacher_kl_coef_end=args.teacher_kl_coef_end,
+        critic_warmup_updates=args.critic_warmup_updates,
+        use_amp_bf16=args.use_amp_bf16,
         save_interval=args.save_interval,
         save_every_seconds=args.save_every_seconds,
         max_train_seconds=args.max_train_seconds,
