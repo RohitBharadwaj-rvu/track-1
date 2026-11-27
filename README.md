@@ -1,145 +1,111 @@
-# devforge-doom-template
+# Track 1: Telemetry-Driven Recurrent DOOM Agent
 
-Starter template for **Yugaantar 2026 · DevForge — Track 1: "Can It Play DOOM?"**
+Submission for **Yugaantar 2026 · DevForge — Track 1: "Can It Play DOOM?"**
 
-> For decades, *"Can it run DOOM?"* was the ultimate hardware test. Now: **can your neural network
-> actually play DOOM?** Train an agent that plays unseen levels **zero-shot**: survive ambushes,
-> navigate multi-room layouts, find keycards, unlock doors and reach the exit.
+Our agent plays unseen `freedoom2.wad` (`skill 3`) levels zero-shot using `doom_env`'s ego-centric telemetry (`rays`, `visible_entities`, `vitals`) paired with a pure-NumPy odometric 2D spatial memory (`EgocentricSpatialMap`) and a custom Recurrent PPO pipeline.
 
-No dataset is provided. Your agent learns by interacting with the engine.
+- **2-Page Project Brief:** [docs/BRIEF.pdf](docs/BRIEF.pdf) (source: [docs/BRIEF.md](docs/BRIEF.md))
+- **Checkpoint Promotion Playbook:** [docs/CHECKPOINT_PROMOTION.md](docs/CHECKPOINT_PROMOTION.md)
+- **Failure Analysis:** [improvements/2026-11-27_04-48/SPRINT6B_FAILURE_ANALYSIS.md](improvements/2026-11-27_04-48/SPRINT6B_FAILURE_ANALYSIS.md)
 
-## Quickstart
+---
 
-1. Click **"Use this template"** on GitHub to create your team's (public) repository.
-2. Set up the environment (Python 3.13, [uv](https://docs.astral.sh/uv/)):
+## Current Submission Checkpoint
 
-   ```bash
-   uv sync                 # installs vizdoom, gymnasium and the official wrapper (env/) in editable mode
-   uv run python validate.py
-   ```
+- **Checkpoint:** `Sprint 6B` (`training/checkpoints/s6b_policy.pt` -> `submission/weights/policy.pt`, tracked via Git LFS)
+- **Architecture:** `telemetry_gru_v1` + `EgocentricSpatialMap` (`884,133` parameters, `3.55 MB`)
+- **Inference config:** `eval_deterministic=True`, `rocket_safety_mask=True`, `eval_mirror_ensemble=False`
+- **Checksums:** source `cbe1ca42c08dd378`, promoted `06761f9a68f11ea8`
 
-   Or use the official image, which is exactly what the scorer runs:
+### Held-Out Proxy Benchmarks (Sprint 6B, Deterministic)
 
-   ```bash
-   docker build -t devforge-doom .            # or: docker pull <official image tag, announced>
-   python validate.py --docker --image devforge-doom   # installs requirements.txt, then runs sandboxed like the scorer
-   ```
+| Suite | Episodes | Exits | Keys / Unlocks | Kills | Mean Cells | Proxy Score | Report |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `dev` (10 maps) | 20 | 19 (95.0%) | 10 / 10 | 16 | 42.35 | 0.9792 | [eval_s6b_dev_det.json](training/results/sprint6b-2026-11-27/eval_s6b_dev_det.json) |
+| `stress` (14 probes) | 28 | 23 (82.1%) | 16 / 16 | 27 | 37.04 | 0.8750 | [eval_s6b_stress.json](training/results/sprint6b-2026-11-27/eval_s6b_stress.json) |
+| `final_ood` (8 maps) | 16 | 1 (6.2%) | 4 / 2 | 32 | 54.88 | 0.0312 | [eval_s6b_final_ood.json](training/results/sprint6b-2026-11-27/eval_s6b_final_ood.json) |
+| `freedoom` (`MAP01–08`) | 8 | 0 (0.0%) | 0 / 0 | 31 | 89.38 | 0.0000 | [eval_s6b_freedoom.json](training/results/sprint6b-2026-11-27/eval_s6b_freedoom.json) |
 
-3. Replace the random baseline in `submission/agent.py` with your trained agent.
-4. Put weights in `submission/weights/` (Git LFS) and training code in `training/`.
-5. Run `python validate.py --docker` and submit your repo URL.
+---
 
-**Platforms:** Linux (x86-64/ARM), macOS on Apple Silicon (macOS 15+) and Windows (x86-64) all
-work with `uv sync` and `validate.py`. Intel Macs have no `vizdoom` 1.3.3 wheel: use Docker or a
-Linux machine. Evaluation runs on Linux, so `validate.py --docker` is the closest check.
+## Architecture Overview
 
-## Repository layout
+1. **Circular Raycast Encoder (`submission/policy.py`):** Circular 1D convolutions over 64 ego-centric rays (normalized distance + 6-class hit type) preserving 360-degree directional structure.
+2. **Combat-Aware Entity Attention (`submission/policy.py`, `submission/obs.py`):** 12-class entity embeddings + ego-frame kinematics (closing/lateral speed, inverse TTI, crosshair alignment) + category counts, pooled via 4-head / 4-query masked attention with deterministic empty-set fallback.
+3. **Odometric 2D Spatial Memory (`submission/ego_map.py`):** Pure-NumPy `128x128` backing grid updated strictly from legal observations (`rays`, `visible_entities`, `vitals`) and `prev_action` (zero privileged state, zero pathfinding). Renders an ego-aligned `(8, 25, 25)` map crop with off-crop landmark beacons into a compact CNN.
+4. **Residual GRU & Factorized Actor (`submission/policy.py`, `submission/agent.py`):** 256-dim residual GRU with explicit ammo/health/speed and `prev_action` inputs, outputting 3x3-way categorical movement/turn heads + 3 Bernoulli heads (`ATTACK`, `USE`, `SELECT_NEXT_WEAPON`) mapped to `MultiBinary(9)` with an observation-based close-range rocket safety mask.
 
-```
-env/                  official ViZDoom Gymnasium wrapper (doom_env): spaces, sensors, protocol, limits
-maps/                 one small test map (NOT an evaluation map); bring your own for training
-submission/agent.py   your DoomAgent: the evaluation entry point
-submission/weights/   model weights (Git LFS)
-training/             your training pipeline
-validate.py           run before submitting
-tests/                tests for the wrapper and validator (uv run pytest)
-docs/                 contract, rules, submission guide, evaluation details
-```
+---
 
-## Using the environment
+## Quickstart & Validation
 
-```python
-from doom_env import make_env
-
-env = make_env("maps/two_rooms.wad")     # test map; use your own maps for training
-obs, info = env.reset(seed=0)
-obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+```bash
+uv sync
+uv run pytest
+uv run python validate.py
 ```
 
-Observations are a dict of `rgb`, `depth`, `vitals`, `rays` and `visible_entities`, all
-ego-centric and partially observable. See [docs/CONTRACT.md](docs/CONTRACT.md).
-The wrapper's `reward` is a basic default for convenience. Shape your own reward for training.
+Official Linux sandbox validation (matches evaluation 1-CPU, RAM, read-only, offline constraints):
 
-**Compute tip:** training only on raw pixels is expensive. The `rays`, `visible_entities` and
-`vitals` signals run thousands of steps per second on a CPU. Hybrid pixel + spatial models are welcome.
+```bash
+docker build -t devforge-doom .
+uv run python validate.py --docker --image devforge-doom
+```
 
-## Hardware at evaluation
+Fresh-clone LFS & release pre-flight check:
 
-One NVIDIA **RTX 3090 (24 GB)** shared between evaluation workers. Each agent gets **2 GB VRAM,
-8 GB RAM and 1 CPU thread**, so keep models compact and inference fast
-(see [hardware](docs/EVALUATION.md#hardware) and [timeouts](docs/EVALUATION.md#timeouts)).
-`validate.py` runs your agent under the same CPU/RAM limits and reports GPU memory.
+```bash
+uv run python -m training.release_check --fresh-clone
+```
+
+---
+
+## Training, Evaluation & Promoting New Checkpoints
+
+Generate the procedural progression corpus and split into train/dev/eval:
+
+```bash
+uv run python -m training.generate_corpus --count 5000 --out training/runs/corpus_5k_progression --workers 12 --engine-spotcheck 30
+uv run python -m training.split_corpus training/runs/corpus_5k_progression/manifest.jsonl
+```
+
+Evaluate the current submission weights on held-out suites:
+
+```bash
+uv run python -m training.eval --suite dev       --eval-mode default --out eval_dev.json
+uv run python -m training.eval --suite stress    --eval-mode default --out eval_stress.json
+uv run python -m training.eval --suite final_ood --eval-mode default --out eval_final_ood.json
+uv run python -m training.eval --suite freedoom  --eval-mode default --out eval_freedoom.json
+```
+
+When a newer checkpoint or model soup beats the incumbent, follow [docs/CHECKPOINT_PROMOTION.md](docs/CHECKPOINT_PROMOTION.md):
+
+```bash
+uv run python -m training.promote_checkpoint training/checkpoints/<new_policy>.pt --label "<Run Name>"
+uv run python -m training.brief_tools --export-html docs/BRIEF.html --export-pdf docs/BRIEF.pdf
+```
+
+---
+
+## Repository Layout
+
+```text
+submission/           DoomAgent entry point, TelemetryPolicy, EgocentricSpatialMap, LFS weights
+training/             Custom Recurrent PPO, PBRS rewards, curiosity, procedural WAD generator, eval, promotion tools
+env/                  Official ViZDoom Gymnasium wrapper (doom_env, unmodified)
+maps/                 Synthetic train, dev, stress, final, and final_ood WAD suites
+tests/                Unit, contract, env, eval, PPO, and validator test suites
+docs/                 2-page brief (BRIEF.md/html/pdf), promotion guide, official contract/rules/submission docs
+validate.py           Official local & Docker submission validator
+```
 
 ## Documentation
 
-| Doc | What's inside |
+| Doc | Contents |
 | --- | --- |
-| [docs/CONTRACT.md](docs/CONTRACT.md) | Observation/action spaces and the `DoomAgent` interface |
-| [docs/RULES.md](docs/RULES.md) | Ground rules: what's allowed, what gets you disqualified |
-| [docs/SUBMISSION.md](docs/SUBMISSION.md) | Submission checklist, Git LFS, 1 GB limit, `requirements.txt` |
-| [docs/EVALUATION.md](docs/EVALUATION.md) | Map tiers, scoring categories, timeouts, replays |
-| [track_1_strategy_telemetry_world_model.md](track_1_strategy_telemetry_world_model.md) | Our Track 1 strategy & implementation plan |
-
-## Long-horizon training maps
-
-Generate the mixed corpus from the repository root:
-
-```shell
-uv run python -m training.generate_corpus --count 5000 --out training/runs/corpus_5k_progression --workers 12 --engine-spotcheck 30
-```
-
-Run `uv run python -m training.split_corpus training/runs/corpus_5k_progression/manifest.jsonl`
-to assign maps to Train, Dev, and Eval with every difficulty band represented. Pass `train.jsonl`
-to the trainer's `--corpus-manifest`. The evaluator accepts `dev_panel.jsonl`, `dev.jsonl`, and
-`eval.jsonl` through its own `--corpus-manifest` option. The full
-[A100 CLI prompt](training/A100_PROGRESSION_PROMPT.md) includes timed checkpoints, adaptive sampling,
-and checkpoint selection. The progression maps vary wing assignment, distances, bends, spawn
-heading, and key colours across seeds.
-
-- **Two-key join.** Collect keys from two separate wings in either order. Both are needed to
-  reach the switch that opens the exit wing.
-- **Remote relay.** One wing's switch exposes a key in another. The key opens a third wing
-  containing the switch for the final gate.
-- **Revisit a wing.** Collect the near key, use it to reach a remote switch, then return to
-  the first wing for the newly accessible second key. That key unlocks the final switch.
-
-The generator checks reachability with all objectives present and again with each required key
-or switch individually disabled. Scripted playthroughs test one generated example of each pattern
-in ViZDoom. Corpus difficulty bands use map features; policy success rates require separate evaluation.
-
-## Navigation stress, OOD & Freedoom evaluation
-
-Run the submission checkpoint on the 14 held-out navigation/combat stress probes, the 8 untouched
-out-of-distribution `final_ood` test maps, or bundled Freedoom2 MAP01 through MAP08. Run each suite
-separately so its scores can be compared across checkpoints.
-
-```shell
-uv run python -m training.eval --suite stress --seeds 0 1 2 --out eval_stress.json
-uv run python -m training.eval --suite final_ood --seeds 0 1 --out eval_final_ood.json
-uv run python -m training.eval --suite freedoom --seeds 0 --out eval_freedoom.json
-uv run python -m training.maps --split stress --generate --verify
-uv run python -m training.maps --split final_ood --generate --verify
-uv run python -m training.data_audit
-```
-
-The stress suite varies the spawn heading in one hall, replaces its walk-over exit with a
-wall switch, compares a direct skull pickup with a low-window detour, tests a long
-key return through repeated junctions, climbs a 3-step staircase to bypass a 48-unit cliff,
-activates a remote switch to raise a tagged door, flanks diverse monsters behind an
-impassable mid-grate, traverses damaging nukage (`RadSuit`), jumps a one-way 64-unit drop-off,
-fights in a wide `>1024u` open horde arena, and unlocks a 3-lock citadel. The existing Dev suite,
-Final suite, and 38-map `all` suite retain their original membership. `final_ood` provides 8
-untouched polygon/verticality test maps (2 per Tier 1-4, balanced spawn bearings). The Freedoom
-suite covers `MAP01..MAP08` under Tier 4 reporting with a 4,200-tick cap.
-
-The repository's Stage 1 Connect smoke checkpoint used stochastic actions for these
-initial runs. Seeds select the engine episode. The reports include the weight hash and
-per-episode outcomes. [Stress results](docs/eval_stress.json) and [Freedoom results](docs/eval_freedoom.json)
-
-## Rules in one minute
-
-- Actions must come from **trained neural parameters**: no rule trees, no `A*`/Dijkstra, no `atan2` aimbots,
-  no unmodified off-the-shelf SB3.
-- Change anything you want **during training**. Evaluation uses the **vanilla engine**, the
-  official wrapper and **unseen maps**.
-- Create the repo during the hackathon. Libraries are fine; the core architecture and training must be yours.
+| [docs/BRIEF.pdf](docs/BRIEF.pdf) | 2-page Project Brief (architecture, USP, training, benchmarks, failure analysis) |
+| [docs/CHECKPOINT_PROMOTION.md](docs/CHECKPOINT_PROMOTION.md) | Step-by-step guide to swap submission checkpoints and refresh brief/README |
+| [docs/CONTRACT.md](docs/CONTRACT.md) | Official observation/action contract and `DoomAgent` interface |
+| [docs/RULES.md](docs/RULES.md) | Official ground rules and fair-play requirements |
+| [docs/SUBMISSION.md](docs/SUBMISSION.md) | Official submission checklist, Git LFS, 1 GB limit, `requirements.txt` |
+| [docs/EVALUATION.md](docs/EVALUATION.md) | Hidden map tiers, scoring categories, hardware limits, timeouts |

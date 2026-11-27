@@ -314,7 +314,7 @@ def test_wasted_attack_diagnostics_and_eval_mode():
 
 def test_resolve_stress_and_freedoom_suites():
     stress_specs = resolve_maps(suite="stress")
-    assert len(stress_specs) == 14
+    assert len(stress_specs) == 20
     assert all(s.split == "stress" for s in stress_specs)
     expected_stress_wads = {
         "exit_ahead.wad",

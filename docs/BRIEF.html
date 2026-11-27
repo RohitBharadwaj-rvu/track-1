@@ -23,29 +23,29 @@
     </style>
 </head>
 <body>
-<h1>Track 1 Brief: Telemetry-Driven Recurrent DOOM Agent</h1>
-<p><em>(Draft working brief — updated by Role 4 across Stage 1 -&gt; Stage 4 milestones)</em></p>
+<h1>Track 1 Brief: Telemetry-Driven Recurrent DOOM Agent with Egocentric Spatial Memory</h1>
+<p><em>Yugaantar DevForge Track 1 ("Can It Play DOOM?") | Submission Checkpoint: Sprint 6B (<code>s6b_policy.pt</code>, <code>884,133</code> params)</em></p>
 <hr />
-<h2>Page 1: Architecture &amp; Memory Design</h2>
-<h3>1. Problem &amp; Telemetry Choice</h3>
-<p>Our agent plays unseen <code>freedoom2.wad</code> (<code>skill 3</code>) levels zero-shot under strict inference limits (<code>2 GB VRAM</code>, <code>8 GB RAM</code>, <code>1 CPU thread</code>, <code>40 ms/step</code>). Rather than spending compute on raw pixel CNNs, we operate directly on <code>doom_env</code>'s ego-centric telemetry signals (<code>rays</code>, <code>visible_entities</code>, <code>vitals</code>) with <code>render_buffers=False</code> during training.</p>
-<h3>2. Policy &amp; Recurrent Memory (<code>submission/policy.py</code>, <code>telemetry_gru_v1</code>, <code>730,109</code> base params)</h3>
+<h2>Page 1: USP, Architecture &amp; Training Pipeline</h2>
+<h3>1. Unique Selling Proposition &amp; Telemetry Strategy</h3>
+<p>Our agent plays unseen <code>freedoom2.wad</code> (<code>skill 3</code>) levels zero-shot under strict sandbox caps (<code>2 GB VRAM</code>, <code>8 GB RAM</code>, <code>1 CPU thread</code>, <code>40 ms/step</code>). Rather than spending compute on heavy pixel CNNs that overfit to wall textures, we combine <code>doom_env</code>'s ego-centric telemetry (<code>rays</code>, <code>visible_entities</code>, <code>vitals</code>) with a pure-NumPy odometric 2D spatial memory (<code>EgocentricSpatialMap</code>) built strictly from legal observations and <code>prev_action</code>. Training with <code>render_buffers=False</code> reaches <code>300+</code> decisions/sec per worker while keeping inference under <code>156 MB</code> VRAM (<code>&lt;8%</code> of cap) and well within the <code>40 ms</code> step budget.</p>
+<h3>2. Neural Architecture &amp; Spatial Memory (<code>submission/policy.py</code>, <code>submission/ego_map.py</code>)</h3>
 <ul>
-<li><strong>Raycast &amp; Entity Encoders:</strong> Circular 1D convolutions over 64 ego-centric rays (distance + hit type) paired with learned entity class embeddings, derived combat kinematics (closing/lateral speed, inverse TTI, crosshair alignment), and masked multi-query attention conditioned on vitals and ray context.</li>
-<li><strong>Vitals, Temporal &amp; Spatial Memory:</strong> GRU fusing <code>[ray_emb, entity_emb, vitals_action_emb]</code> with explicit ammo/health/speed and <code>prev_action</code> features (detecting wall-snags and <code>USE</code> / <code>SELECT_NEXT_WEAPON</code> edge semantics), optionally augmented with <code>EgocentricSpatialMap</code> 2D spatial memory (<code>submission/ego_map.py</code>, with off-crop objective beacons).</li>
-<li><strong>Factorized Action Heads &amp; Training Pipeline:</strong> Three 3-way categorical heads (move, strafe, turn) + three Bernoulli heads (<code>ATTACK</code>, <code>USE</code>, <code>SELECT_NEXT_WEAPON</code>) mapped deterministically to <code>MultiBinary(9)</code>, trained via Recurrent PPO (<code>gamma=0.995</code>, <code>chunk_len=64</code>) with a training-only asymmetric critic, non-negative PBRS (<code>training/pbrs.py</code>) supporting window/ledge/switch routing, L/R mirror symmetry augmentation (<code>training/symmetry.py</code>), and weighted curriculum sampling.</li>
+<li><strong>Circular Raycast Encoder:</strong> Circular 1D convolutions over 64 ego-centric rays (normalized distance + 6-class hit type) preserve 360-degree left/right continuity without boundary wrap artifacts.</li>
+<li><strong>Combat-Aware Entity Attention:</strong> Learned 12-class entity embeddings fused with ego-frame kinematics (closing speed, lateral speed, inverse time-to-impact, crosshair alignment) and per-category threat/item counts, pooled with 4-head, 4-query masked attention conditioned on vitals and ray context (with a deterministic empty-set fallback for empty rooms).</li>
+<li><strong>Egocentric Spatial Memory (<code>EgocentricSpatialMap</code>):</strong> Integrates player velocity and Doom's turn-hold physics from <code>vitals</code> and <code>prev_action</code> (zero privileged coordinates, zero pathfinding) onto a <code>128x128</code> backing grid (<code>48u</code> cells). Renders an ego-aligned <code>(8, 25, 25)</code> crop (visited, post-key visited, walls, free space, doors, locked doors, items/keys, enemies) with perimeter beacons for off-crop landmarks, encoded by a compact CNN (<code>128</code>-dim output).</li>
+<li><strong>Temporal Memory &amp; Factorized Control:</strong> Residual GRU (<code>hidden_size=256</code>) fuses <code>[ray_emb, entity_emb, ego_map_emb, vitals_action_emb]</code> with explicit <code>selected_ammo_empty</code>, <code>has_any_other_ammo</code>, <code>low_health</code>, horizontal speed, and <code>prev_action</code> features so the policy respects ViZDoom's button-down edge semantics for <code>USE</code> and <code>SELECT_NEXT_WEAPON</code>. Three 3-way categorical heads (move, strafe, turn) and three Bernoulli heads (<code>ATTACK</code>, <code>USE</code>, <code>SELECT_NEXT_WEAPON</code>) map cleanly to <code>MultiBinary(9)</code> with zero opposing-button conflicts, paired with an observation-based close-range rocket safety mask (<code>rocket_safety_mask=True</code>).</li>
 </ul>
-<h3>3. Curriculum &amp; Evaluation Suites</h3>
+<h3>3. Training &amp; Exploration Pipeline (<code>training/</code>)</h3>
 <ul>
-<li>Training curriculum covers Tier 1 combat, Tier 2 multi-room exploration, Tier 3 key-and-return progression, and Tier 4 gauntlets with broadened procedural verticality, enemy roster, and angled/door variations.</li>
-<li>Held-out verification spans 10 <code>DEV_MAPS</code>, 10 <code>maps/stress/</code> probes (orientation, exit/remote switches, stairs/ledges, grates, key-window), and <code>freedoom2.wad</code> (<code>MAP01–04</code>); <code>FINAL_MAPS</code> stays untouched until final weight freeze.</li>
-<li>Memory upgrades (<code>EgocentricSpatialMap</code> and <code>telemetry_landmark_v1</code>) are promoted only when independent evaluation on identical held-out Tier 3–4 dev seeds confirms higher unlocks and exits.</li>
+<li><strong>Custom Recurrent PPO:</strong> Built from scratch in PyTorch (<code>gamma=0.995</code>, <code>chunk_len=64</code>, episode-boundary hidden masking, <code>3.26M</code> decisions / <code>1,439</code> updates for Sprint 6B) with a training-only asymmetric critic, auxiliary door-bearing supervision, RND intrinsic curiosity, potential-based reward shaping (PBRS), and left-right mirror symmetry augmentation.</li>
+<li><strong>Procedural Curriculum &amp; Held-Out Splits:</strong> Separate <code>train</code>, <code>dev</code> (10 maps), <code>stress</code> (14 targeted probes), <code>final_ood</code> (8 unseen polygon/verticality maps), and bundled <code>freedoom2.wad</code> (<code>MAP01..MAP08</code>) suites, plus a procedural progression generator covering two-key joins, remote relays, and multi-wing backtracking.</li>
 </ul>
 <hr />
 <div class="page-break"></div>
 <h2>Page 2: Evaluation Outcomes, Runtime &amp; Failure Analysis</h2>
-<h3>1. Baseline vs. Final Outcomes (Local Dev Proxy Suite)</h3>
-<p><em>Note: Organizer evaluation weights and hidden maps are private; local metrics below are proxy measurements.</em></p>
+<h3>1. Baseline vs. Final Outcomes (Held-Out Proxy Suites)</h3>
+<p><em>Note: Organizer hidden maps and exact weights are private; numbers below are local proxy evaluations on <code>submission/weights/policy.pt</code> (Sprint 6B, deterministic, source <code>cbe1ca42c08d</code>, promoted <code>06761f9a68f1</code>).</em></p>
 <table><thead><tr>
 <th>Candidate</th>
 <th>Suite</th>
@@ -58,10 +58,10 @@
 <th>Errors</th>
 </tr></thead><tbody>
 <tr>
-<td>Stage 0 Random (<code>submission/agent.py</code>)</td>
+<td>Stage 0 Random Baseline</td>
 <td>10 dev maps (30 eps)</td>
 <td>30</td>
-<td>1</td>
+<td>1 (3.3%)</td>
 <td>0</td>
 <td>0</td>
 <td>10</td>
@@ -69,38 +69,64 @@
 <td>0</td>
 </tr>
 <tr>
-<td>Stage 2 MVP Recurrent PPO</td>
-<td><em>TBD</em></td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
+<td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
+<td>10 dev maps (20 eps)</td>
+<td>20</td>
+<td>19 (95.0%)</td>
+<td>10</td>
+<td>10</td>
+<td>16</td>
+<td>42.35</td>
+<td>0</td>
 </tr>
 <tr>
-<td>Final Shipped Agent</td>
-<td><em>TBD</em></td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
-<td>—</td>
+<td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
+<td>14 stress probes (28 eps)</td>
+<td>28</td>
+<td>23 (82.1%)</td>
+<td>16</td>
+<td>16</td>
+<td>27</td>
+<td>37.04</td>
+<td>0</td>
+</tr>
+<tr>
+<td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
+<td>8 final_ood maps (16 eps)</td>
+<td>16</td>
+<td>1 (6.2%)</td>
+<td>4</td>
+<td>2</td>
+<td>32</td>
+<td>54.88</td>
+<td>0</td>
+</tr>
+<tr>
+<td>Sprint 6B (<code>s6b_policy.pt</code>)</td>
+<td>Freedoom MAP01–08 (8 eps)</td>
+<td>8</td>
+<td>0 (0.0%)</td>
+<td>0</td>
+<td>0</td>
+<td>31</td>
+<td>89.38</td>
+<td>0</td>
 </tr>
 </tbody></table>
+<ul>
+<li><strong>Long-horizon backtracking mastery on held-out synthetic tiers:</strong> Sprint 6B achieves <code>100%</code> <code>unlock|pickup</code> and <code>100%</code> <code>exit|unlock</code> on <code>dev</code> (<code>0</code> deaths, <code>0.9792</code> proxy score) and solves <code>10/14</code> <code>stress</code> probes <code>100%</code> (including <code>key_window</code>, <code>junction_return</code>, <code>stairs_ledge</code>, <code>grate_combat</code>, <code>nukage_hazard</code>, and <code>dropoff_return</code>; <code>0.8750</code> proxy score).</li>
+</ul>
 <h3>2. Sandbox Compliance &amp; Inference Runtime (<code>validate.py</code>)</h3>
 <ul>
-<li><strong>Hardware target:</strong> RTX 3090 (2 GB VRAM cap), 8 GB RAM, 1 CPU thread (<code>OMP_NUM_THREADS=1</code>), offline read-only repo.</li>
-<li><strong>Stage 0 Random Baseline (<code>validate.py</code> on Windows local):</strong> <code>init 0.0s</code>, <code>first 2 ms</code>, <code>p50 0.9 ms</code>, <code>p99 1.6 ms</code>, <code>max 2 ms</code>, <code>0.5s / 21.0s</code> per-map compute budget.</li>
-<li><strong>Stage 1 Connect <code>telemetry_gru_v1</code> (<code>validate.py</code> on Linux + CUDA, pinned to 1 CPU):</strong> <code>init 2.4s</code>, <code>p50 4.0–4.8 ms</code>, <code>p99 6.9–10.8 ms</code>, <code>max 20 ms</code>, <code>2.2–2.5s / 21.0s</code> compute budget, <code>1,380 MB / 8,192 MB</code> RAM, <code>156 MB / 2,048 MB</code> VRAM. Solvable door/exit proof (<code>#P..D...E#</code>): <code>100%</code> exit rate (<code>24</code> steps on two consecutive maps with <code>agent.reset()</code>).</li>
-<li><strong>Final Agent (<code>validate.py --docker</code>):</strong> <em>TBD after weight freeze.</em></li>
+<li><strong>Footprint &amp; Dependencies:</strong> <code>45.0 MB</code> tracked repo size (cap <code>1.0 GB</code>, Git LFS enabled on <code>submission/weights/policy.pt</code>), <code>0</code> extra packages in <code>submission/requirements.txt</code>, offline and read-only compliant.</li>
+<li><strong>GPU Validation (<code>validate.py --device cuda</code>, RTX 3050 6GB):</strong> <code>5.5s</code> init (cap <code>60s</code>), <code>16.6 ms</code> p50 step latency (cap <code>40 ms</code>), <code>125 MB</code> peak VRAM (cap <code>2,048 MB</code>), exit reached on <code>two_rooms.wad:MAP01</code>.</li>
+<li><strong>Linux + CUDA 1-CPU Reference (<code>telemetry_gru_v1</code>):</strong> <code>2.4s</code> init, <code>4.0–4.8 ms</code> p50 (<code>20 ms</code> max), <code>1,380 MB / 8,192 MB</code> RAM, <code>156 MB / 2,048 MB</code> VRAM.</li>
+<li><strong>Local CPU Validation (promoted <code>s6b_policy.pt</code> on Windows):</strong> <code>4.7s</code> init, <code>first 11 ms</code>, <code>p50 8.9 ms</code>, <code>p99 13.2 ms</code>, <code>max 25 ms</code>, <code>1.0s / 21.0s</code> compute budget, exit reached in <code>104</code> steps on <code>two_rooms.wad:MAP01</code>.</li>
 </ul>
-<h3>3. Informative Failure Case</h3>
+<h3>3. Concrete Failure Analysis &amp; Mitigations (<code>SPRINT6B_FAILURE_ANALYSIS.md</code>)</h3>
 <ul>
-<li><em>TBD: Document one concrete dev-map failure replay from <code>training/eval.py --record-dir</code> (e.g., key pickup without return unlock, or <code>USE</code> door-bounce) and how curriculum/architecture addressed it.</em></li>
+<li><strong>Point-blank RocketLauncher self-kills (<code>final_ood_t3_dropoff_skull</code>, 0/3, deaths at steps 23–38):</strong> On spawn, the agent picked up a RocketLauncher (<code>wpn=5</code>) and fired at a nearby ChaingunGuy, causing fatal splash self-damage (<code>85 HP -&gt; 0</code> in 2 steps). <strong>Fix shipped:</strong> enabled <code>rocket_safety_mask=True</code> in the promoted checkpoint (observation-only action mask suppressing <code>ATTACK</code> when <code>selected_weapon == 5</code> and front rays report close geometry/enemies) alongside a self-damage penalty in <code>training/rewards.py</code>.</li>
+<li><strong>Telemetry aliasing on wall switches and nukage (<code>stress/exit_switch</code> 0/3, <code>remote_door_switch</code> 0/3, Freedoom):</strong> <code>doom_env</code> rays tag wall switches and exit switches as <code>RAY_WALL</code> and do not encode damaging nukage floors. On <code>exit_switch.wad</code>, the agent saw only <code>RAY_WALL</code> and pressed <code>USE</code> <code>0</code> times across <code>1,575</code> steps. Because our model uses <code>&lt;8%</code> of VRAM, fusing a tiny downsampled <code>rgb</code>/<code>depth</code> CNN is our planned next upgrade for switch and hazard visibility.</li>
 </ul>
 </body>
 </html>
