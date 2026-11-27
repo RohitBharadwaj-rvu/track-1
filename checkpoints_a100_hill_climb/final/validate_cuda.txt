@@ -1,0 +1,14 @@
+Validating /content/isolated_release_check  (contract 1.0.0-draft)
+
+ [32m✓[0m Repository size (tracked files): 45.0 MB of 1.0 GB
+ [33m![0m Uncommitted changes in submission/: submission/weights/policy.pt (the scorer uses your last pushed commit)
+ [32m✓[0m requirements.txt: no extra packages
+ [32m✓[0m DoomAgent interface: __init__, reset, act
+ [32m✓[0m CPU limit: agent pinned to 1 CPU (core 11), like the evaluation sandbox
+ [32m✓[0m Initialization: 2.6s (limit 60s) on device 'cuda'
+ [32m✓[0m Episode on 'two_rooms.wad:MAP01': 125 steps, exit reached, agent time 1.0s of 21.0s budget, 1.1s wall-clock
+ [32m✓[0m Step latency 'two_rooms.wad:MAP01': first 68 ms, p50 7.4 ms, p99 8.8 ms, max 68 ms
+ [32m✓[0m Peak RAM: 1478 MB resident (limit 8192 MB, including files written to /tmp)
+ [32m✓[0m Peak GPU memory: 532 MB (limit 2048 MB)
+
+[32mPASSED[0m with 1 warning(s).
