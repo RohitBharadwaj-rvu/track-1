@@ -39,6 +39,22 @@
 
 ---
 
-## Round 4 — PLANNED (Single Change: `--curiosity-coef 0.005` RND Bonus)
-- **Hypothesis:** Because Rounds 1–3 all showed severe exploration/discovery contraction (`mean_unique_cells` `53.61 -> 40.97..45.86`, `episodes_with_pickup` `15 -> 11..13`), adding a small RND curiosity bonus (`--curiosity-coef 0.005`, resuming from pretrial incumbent `s6b_train_state.pt` with `HIGH=0.45`, `POOL=60`) restores useful exploration and first-milestone discovery (`episodes_with_pickup >= 15`, `mean_unique_cells >= 53.6`) and increases Tier 3–4 unlocks and exits on `dev_panel.jsonl` seed 0 while preserving Tier 1–2 exits and combat survival. Verify `mean_intrinsic_reward > 0` in `train.log`.
-- **Falsifying Metric:** No lexicographic gain over Sprint 6B (`tier34_exits <= 2` and `locked_doors_unlocked <= 9`) or persistent guardrail regression (on rejection, retain pretrial Sprint 6B so no RND module is carried forward).
+## Round 4 — REJECTED (`keep_incumbent`)
+- **Config:** `--curiosity-coef 0.005` (RND intrinsic reward active: `rnd_loss=0.0017`, `mean_intrinsic_reward=0.00122`), restored `HIGH=0.45`, `POOL=60`, `seed=202604`, `1,200s` (`1,203.5s` train wall, `195.3 dec/s`, `459` updates `1440->1898`, `~755` eps `9123->9878`, `235,008` decisions).
+- **Export:** `round_4/policy.pt` (`5a513ecd...`), `round_4/latest_train_state.pt` (`f9077ac8...`), actor-tensor parity verified (`64` tensors, LR `5e-5`).
+- **Dev Panel (36 maps, seed 0):** `3/36` exits (`0` T3–4 [`-2`], `3` T1–2 [`0`]; `combat` `0->1`, `door_exit` `1->1`, `key_return` `2->0`, `multi_room` `2->1`), `4` unlocks [`-5`] (`key_return` `4->3`, `gauntlet` `5->1`), `16` keys (`14` eps; `key_return` keys `7->9`, `unlock|pickup=0.2857`, `exit|unlock=0.0`), `24` deaths [`+3`] (`deaths_after_pickup` `9->11`), `9` timeouts [`-1`], `0` errors, `mean_unique_cells` `53.61 -> 47.03`, `1,201` USE (`608` consec), `3,167` attacks (`986` wasted).
+- **Game Theory:** Nash value `0.2388` vs `0.3351` (Nash weight `0.297` vs `0.703`), minimax regret `0.8867` vs `0.6250`, mean rubric `0.1607` vs `0.2170` (`-0.0624`), polytope min `0.0786` vs `0.1327` (`-0.0541`), CVaR-25 `0.0007` (`+0.0007`).
+- **Diagnosis:** RND curiosity partially restored exploration (`mean_unique_cells 47.03` vs `40.97` in R3, `episodes_with_pickup 14` vs `11` in R3, `key_return` keys `9`), **but** raised post-pickup deaths (`9->11`) and total deaths (`21->24`) and failed to beat Sprint 6B on Tier 3–4 exits (`-2`) or unlocks (`-5`).
+- **Action:** Rejected and retained pretrial Sprint 6B incumbent (`s6b_policy.pt`, `s6b_train_state.pt`) so no RND module is carried forward.
+
+---
+
+## Final Selection (Frozen Before Opening Sealed Eval)
+- **Selected Policy:** Original **Sprint 6B** (`s6b_policy.pt`, `sha256=cbe1ca42c08dd37827a2571cbfb5bac97f28584d7e588f5ce67ecd5278ce8e7d`; `s6b_train_state.pt`, `sha256=4eaea1247606e9b7a111c770e58bf4e06a3c1212eb6d9ab647f7ea6a76fa23b8`).
+- **Measured Hill-Climb Gain:** **`0`** (all 4 challengers rejected on paired Dev panel evidence).
+- **Optional Methods Summary:**
+  - `HIGH=0.35` (Round 2): Ran; triggered by Round 1 `key_return` survival regression and pegged CMDP lambdas; cut deaths (`21->16`) but spiked timeouts (`10->17`) and collapsed exploration (`41.47`) -> Rejected.
+  - `--champion-report` (Round 3): Ran on verified train-only Sprint 6B anchor (`40` eps, `20` train WADs); triggered by repeatable `key_return`/`multi_room` regression in R1–R2; best challenger (`5/36` exits, `1` T3–4, `3` unlocks, lower minimax regret `0.775`) but still `-1` T3–4 exit / `-6` unlocks vs S6B -> Rejected.
+  - `--curiosity-coef 0.005` RND (Round 4): Ran (`mean_intrinsic_reward=0.00122`); triggered by exploration/pickup contraction in R1–R3; lifted pickups (`14`) and cells (`47.03`) but raised deaths (`24`) and regressed T3–4 exits (`-2`) -> Rejected.
+  - `POOL=48`: Not triggered (unlocks did not rise into timeouts).
+  - ACCEL adversarial level mutation: **Deferred** (no training-family saturation observed; corpus-manifest path bypasses online ACCEL).
