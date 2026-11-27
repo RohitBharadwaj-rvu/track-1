@@ -29,6 +29,16 @@
 
 ---
 
-## Round 3 — PLANNED (Single Change: `--champion-report` Train Anchor)
-- **Hypothesis:** Because both Round 1 and Round 2 showed repeatable regression on `key_return` and `multi_room` progression when resuming Sprint 6B on the 5k corpus, evaluating Sprint 6B on `--split train --seeds 0,1` (training-only anchor, never Dev) and passing `--champion-report` (with restored incumbent `HIGH=0.45`, `POOL=60`) anchors matched training-map competence against forgetting while preserving combat survivability gains, improving Tier 3–4 unlocks/exits on `dev_panel.jsonl` seed 0 without regressing Tier 1–2 exits or deaths.
-- **Falsifying Metric:** No lexicographic gain over Sprint 6B (`tier34_exits <= 2` and `locked_doors_unlocked <= 9`) or persistent guardrail regression.
+## Round 3 — REJECTED (`keep_incumbent`)
+- **Config:** `--champion-report` (`s6b_train_anchor_s01.json`, verified train-only: `40` eps across `20` train WADs, `35/40` exits), restored `HIGH=0.45`, `POOL=60`, `seed=202603`, `1,200s` (`1,202.3s` train wall, `190.8 dec/s`, `448` updates `1440->1887`, `~759` eps `9122->9881`, `229,376` decisions).
+- **Export:** `round_3/policy.pt` (`236ef469...`), `round_3/latest_train_state.pt` (`6e26654e...`), actor-tensor parity verified (`64` tensors, LR `5e-5`).
+- **Dev Panel (36 maps, seed 0):** `5/36` exits (`1` T3–4 [`-1`], `4` T1–2 [`+1`]; `combat` `0->2`, `door_exit` `1->1`, `key_return` `2->1`, `multi_room` `2->1`), `3` unlocks [`-6`] (`key_return` `4->3`, `gauntlet` `5->0`), `13` keys (`11` eps, `unlock|pickup=0.2727`, `exit|unlock=0.3333`), `21` deaths (`0`), `10` timeouts (`0`), `0` errors, `mean_unique_cells` `53.61 -> 40.97`, `477` USE (`141` consec), `3,788` attacks (`1,027` wasted).
+- **Game Theory:** Nash value `0.3896` vs `0.3910` (Nash weight `0.509` vs `0.490`), minimax regret `0.7750` vs `0.8213`, mean rubric `0.1819` vs `0.2170`, polytope min `0.1022` vs `0.1327`, CVaR-25 `0.0000`.
+- **Diagnosis:** `--champion-report` recovered `key_return` unlocks (`3`) and exits (`1`) and matched total exits (`5/36`) with lower minimax regret, **but** still fell short on `tier34_exits` (`-1`) and `locked_doors_unlocked` (`-6`) because exploration (`mean_unique_cells` `53.61 -> 40.97`) and first-milestone discovery (`episodes_with_pickup` `15 -> 11`, `gauntlet` keys `11 -> 7`) collapsed across all 3 rounds under pegged CMDP penalties (`2.0`).
+- **Action:** Restored Sprint 6B incumbent (`s6b_policy.pt`, `s6b_train_state.pt`, `s6b_panel_s0.json`, `HIGH=0.45`, `POOL=60`, `EXTRA=[]`).
+
+---
+
+## Round 4 — PLANNED (Single Change: `--curiosity-coef 0.005` RND Bonus)
+- **Hypothesis:** Because Rounds 1–3 all showed severe exploration/discovery contraction (`mean_unique_cells` `53.61 -> 40.97..45.86`, `episodes_with_pickup` `15 -> 11..13`), adding a small RND curiosity bonus (`--curiosity-coef 0.005`, resuming from pretrial incumbent `s6b_train_state.pt` with `HIGH=0.45`, `POOL=60`) restores useful exploration and first-milestone discovery (`episodes_with_pickup >= 15`, `mean_unique_cells >= 53.6`) and increases Tier 3–4 unlocks and exits on `dev_panel.jsonl` seed 0 while preserving Tier 1–2 exits and combat survival. Verify `mean_intrinsic_reward > 0` in `train.log`.
+- **Falsifying Metric:** No lexicographic gain over Sprint 6B (`tier34_exits <= 2` and `locked_doors_unlocked <= 9`) or persistent guardrail regression (on rejection, retain pretrial Sprint 6B so no RND module is carried forward).

@@ -1,0 +1,29 @@
+{
+  "round": 3,
+  "hypothesis": "Adding training-only --champion-report anchor (Sprint 6B on --split train seeds 0,1) with restored HIGH=0.45, POOL=60 prevents repeatable key_return/multi_room regression while retaining combat gains, improving Tier 3-4 exits/unlocks on dev_panel seed 0. Falsifying metric: no lexicographic gain over Sprint 6B or persistent guardrail regression.",
+  "high": 0.45,
+  "pool": 60,
+  "extra": [
+    "--champion-report",
+    "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/s6b_train_anchor_s01.json"
+  ],
+  "used_oom_fallback": false,
+  "train_wall_s": 1206.71,
+  "cand_policy": "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/round_3/policy.pt",
+  "cand_policy_sha256": "236ef4691cfd71e2d7ace102514a699c8b41ad54f6fdaf5cad8beaa9b6f15b65",
+  "cand_state": "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/round_3/latest_train_state.pt",
+  "cand_state_sha256": "6e26654e595ca66e2ce85c37d20df2ee648b94f4146698b440537ca8b5e1cead",
+  "cand_report": "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/round_3/round_3_panel_s0.json",
+  "incumbent_policy": "/content/doom_track1_a100/track-1/training/checkpoints/s6b_policy.pt",
+  "incumbent_report": "/content/doom_track1_a100/track-1/training/runs/a100_progression/20261126T230932Z/s6b_panel_s0.json",
+  "parity": {
+    "ok": true,
+    "num_tensors": 64,
+    "restored_lrs": [
+      5e-05
+    ],
+    "update": null,
+    "total_decisions": null,
+    "has_rnd": false
+  }
+}
