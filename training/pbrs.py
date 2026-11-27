@@ -8,14 +8,16 @@ Lives strictly under `training/` and is NEVER imported by `submission/`.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
+import struct
 from typing import Any
 
 import numpy as np
 
 from doom_env.mapinfo import (
+    DOOM_MANUAL_DOORS,
     LOCK_ALL,
     LOCK_ANY,
     LOCK_BLUE,
@@ -28,16 +30,6 @@ from doom_env.mapinfo import (
 from doom_env.sensors import MAX_STEP_UP, PLAYER_HEIGHT
 from doom_env.wad import map_lumps, read_wad
 
-# ZDoom UDMF lock numbers + binary lock numbers -> canonical color index {0: blue, 1: yellow, 2: red}
-_LOCK_TO_COLOR: dict[int, int] = {
-    LOCK_BLUE: 0,
-    130: 0,
-    LOCK_YELLOW: 1,
-    131: 1,
-    LOCK_RED: 2,
-    129: 2,
-}
-
 # DoomEdNums for key items -> color index {0: blue, 1: yellow, 2: red}
 _KEY_THING_TO_COLOR: dict[int, int] = {
     5: 0,   # BlueCard
@@ -48,9 +40,27 @@ _KEY_THING_TO_COLOR: dict[int, int] = {
     38: 2,  # RedSkull
 }
 
-_EXIT_SPECIALS = {11, 52, 243, 244}
+_UDMF_EXIT_SPECIALS = {243, 244}
+_DOOM_EXIT_SPECIALS = {11, 51, 52, 124, 197, 198}
+_REMOTE_DOOR_LOCK = -99
+_UDMF_DAMAGING_SPECIALS = {69, 71, 75, 80, 105, 115, 196}
+_DOOM_DAMAGING_SPECIALS = {4, 5, 7, 11, 16}
+_DOOM_REMOTE_DOOR_SPECIALS = {2, 29, 61, 63, 86, 90, 103, 105, 106, 108, 109, 111, 112, 114, 115}
 _INF = 1e9
 _MAX_POTENTIAL_DIST = 6.0
+
+# ZDoom UDMF lock numbers + binary lock numbers -> canonical color index {0: blue, 1: yellow, 2: red}
+_LOCK_TO_COLOR: dict[int, int] = {
+    LOCK_BLUE: 0,
+    5: 0,    # BlueSkull
+    130: 0,
+    LOCK_YELLOW: 1,
+    6: 1,    # YellowSkull
+    131: 1,
+    LOCK_RED: 2,
+    4: 2,    # RedSkull
+    129: 2,
+}
 
 
 def _segments_intersect_batch(
@@ -108,17 +118,26 @@ class _WadNavigationGraph:
     # neighbor[cell_idx] -> list of (neighbor_idx, edge_cost, lock_requirements)
     # where lock_requirements is a tuple of (sector_id, lock_code) crossed on this edge
     adj: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]]
+    rev_adj: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]]
     exit_cells: tuple[int, ...]
     key_spawns: tuple[tuple[int, int], ...]  # (cell_idx, color_idx)
     locked_door_cells: dict[int, tuple[int, list[int]]]  # sector_id -> (lock_code, [cell_indices])
+    switch_waypoints: dict[int, int] = field(default_factory=dict)  # remote door sid -> switch cell_idx
+    player_start: tuple[float, float] | None = None
 
 
-_NAV_CACHE: dict[tuple[str, str, float], _WadNavigationGraph | None] = {}
+_NAV_CACHE: dict[tuple[str, int, int, str, float], _WadNavigationGraph | None] = {}
 
 
 def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: float = 32.0) -> _WadNavigationGraph | None:
-    resolved = str(Path(wad_path).resolve())
-    cache_key = (resolved, map_name.upper(), float(cell_size))
+    path_obj = Path(wad_path).resolve()
+    resolved = str(path_obj)
+    try:
+        st = path_obj.stat()
+        mtime_ns, fsize = int(st.st_mtime_ns), int(st.st_size)
+    except OSError:
+        mtime_ns, fsize = 0, 0
+    cache_key = (resolved, mtime_ns, fsize, map_name.upper(), float(cell_size))
     if cache_key in _NAV_CACHE:
         return _NAV_CACHE[cache_key]
 
@@ -142,8 +161,20 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
     one_sided = (front < 0) | (back < 0)
     solid_mask = (one_sided | imp).copy()
 
-    exit_pts: list[tuple[float, float]] = []
+    n_sec = max(0, int(info.num_sectors))
+    sec_hf = np.zeros(n_sec, dtype=np.float64)
+    sec_hc = np.full(n_sec, 128.0, dtype=np.float64)
+    sec_damaging = np.zeros(n_sec, dtype=bool)
+    sec_tag = np.zeros(n_sec, dtype=np.int64)
+    has_sec_geom = False
+
+    exit_raw: list[tuple[float, float, float, float, bool]] = []  # (x1, y1, x2, y2, has_back)
+    exit_centers: list[tuple[float, float]] = []
     key_pts: list[tuple[float, float, int]] = []
+    player_start: tuple[float, float] | None = None
+    remote_switch_raw_by_tag: dict[int, list[tuple[float, float, float, float, bool]]] = {}
+    manual_door_secs: set[int] = set()
+
     if "TEXTMAP" in lumps:
         text = lumps["TEXTMAP"].decode("utf-8", "replace")
         blocks = parse_udmf(text)
@@ -151,44 +182,42 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
         sides = blocks.get("sidedef", [])
         sectors = blocks.get("sector", [])
 
-        # Block two-sided non-door linedefs whose opening < PLAYER_HEIGHT (windows) or |step| > MAX_STEP_UP (ledges)
-        # (matches doom_env.sensors.LevelGeometry.update).
-        if len(sectors) == info.num_sectors and len(sectors) > 0:
+        if len(sectors) == n_sec and n_sec > 0:
+            has_sec_geom = True
             sec_hf = np.array([float(s.get("heightfloor", 0.0)) for s in sectors], dtype=np.float64)
             sec_hc = np.array([float(s.get("heightceiling", 128.0)) for s in sectors], dtype=np.float64)
-            is_door_sec = np.zeros(len(sectors), dtype=bool)
-            for sid in info.door_sectors:
-                if 0 <= sid < len(sectors):
-                    is_door_sec[sid] = True
-            two_sided_idx = np.flatnonzero((~solid_mask) & (front >= 0) & (back >= 0) & (front < len(sectors)) & (back < len(sectors)))
-            if len(two_sided_idx) > 0:
-                sa_v, sb_v = front[two_sided_idx], back[two_sided_idx]
-                non_door = ~(is_door_sec[sa_v] | is_door_sec[sb_v])
-                opening = np.minimum(sec_hc[sa_v], sec_hc[sb_v]) - np.maximum(sec_hf[sa_v], sec_hf[sb_v])
-                step = np.abs(sec_hf[sa_v] - sec_hf[sb_v])
-                height_blocked = non_door & ((opening < PLAYER_HEIGHT) | (step > MAX_STEP_UP))
-                solid_mask[two_sided_idx[height_blocked]] = True
+            for idx, sec in enumerate(sectors):
+                sec_tag[idx] = int(sec.get("id", 0) or 0)
+                if int(sec.get("special", 0) or 0) in _UDMF_DAMAGING_SPECIALS:
+                    sec_damaging[idx] = True
 
-        # Exits via exit linedef special or GATE3 floor sector
-        inward_nudge = min(16.0, float(cell_size) * 0.5)
         for ld in blocks.get("linedef", []):
             spec = int(ld.get("special", 0) or 0)
-            if spec in _EXIT_SPECIALS:
-                v1, v2 = int(ld.get("v1", -1)), int(ld.get("v2", -1))
-                if 0 <= v1 < len(verts) and 0 <= v2 < len(verts):
-                    x1, y1 = verts[v1]
-                    x2, y2 = verts[v2]
-                    mx, my = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-                    # One-sided wall switch: nudge inward along Doom's right-hand front normal
-                    # so the exit target cell always lands inside the playable room.
-                    has_back = isinstance(ld.get("sideback", -1), int) and int(ld.get("sideback", -1)) >= 0
-                    if not has_back:
-                        dx, dy = x2 - x1, y2 - y1
-                        seg_len = math.hypot(dx, dy)
-                        if seg_len > 1e-6:
-                            mx += (dy / seg_len) * inward_nudge
-                            my += (-dx / seg_len) * inward_nudge
-                    exit_pts.append((mx, my))
+            arg0 = int(ld.get("arg0", 0) or 0)
+            v1, v2 = int(ld.get("v1", -1)), int(ld.get("v2", -1))
+            sb = ld.get("sideback", -1)
+            sf = ld.get("sidefront", -1)
+            has_back = isinstance(sb, int) and int(sb) >= 0
+
+            # Track sectors bounded by manual doors so remote-only doors can be identified cleanly.
+            if spec in (11, 12, 13, 202) and arg0 == 0 and has_back and isinstance(sb, int) and 0 <= sb < len(sides):
+                bsec = int(sides[sb].get("sector", -1))
+                if 0 <= bsec < n_sec:
+                    manual_door_secs.add(bsec)
+                if isinstance(sf, int) and 0 <= sf < len(sides):
+                    fsec = int(sides[sf].get("sector", -1))
+                    if 0 <= fsec < n_sec:
+                        manual_door_secs.add(fsec)
+
+            if not (0 <= v1 < len(verts) and 0 <= v2 < len(verts)):
+                continue
+            x1, y1 = verts[v1]
+            x2, y2 = verts[v2]
+
+            if spec in _UDMF_EXIT_SPECIALS:
+                exit_raw.append((x1, y1, x2, y2, has_back))
+            elif spec in (11, 12) and arg0 > 0:
+                remote_switch_raw_by_tag.setdefault(arg0, []).append((x1, y1, x2, y2, has_back))
 
         exit_sec_ids = {
             i for i, sec in enumerate(sectors) if str(sec.get("texturefloor", "")).upper() == "GATE3"
@@ -209,74 +238,238 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
                 if pts:
                     cx = sum(pt[0] for pt in pts) / len(pts)
                     cy = sum(pt[1] for pt in pts) / len(pts)
-                    exit_pts.append((cx, cy))
+                    exit_centers.append((cx, cy))
 
         for th in blocks.get("thing", []):
             t_id = int(th.get("type", 0) or 0)
-            if t_id in _KEY_THING_TO_COLOR:
+            if t_id == 1:
+                player_start = (float(th.get("x", 0.0)), float(th.get("y", 0.0)))
+            elif t_id in _KEY_THING_TO_COLOR:
                 key_pts.append((float(th.get("x", 0.0)), float(th.get("y", 0.0)), _KEY_THING_TO_COLOR[t_id]))
+    elif {"VERTEXES", "LINEDEFS", "SIDEDEFS", "SECTORS"}.issubset(lumps):
+        # Standard Doom binary WAD lumps (e.g., freedoom2.wad MAP01..MAP32).
+        v_raw = lumps["VERTEXES"]
+        l_raw = lumps["LINEDEFS"]
+        sd_raw = lumps["SIDEDEFS"]
+        sc_raw = lumps["SECTORS"]
+        t_raw = lumps.get("THINGS", b"")
+
+        n_v = len(v_raw) // 4
+        verts = [
+            (float(x), float(y))
+            for x, y in (struct.unpack_from("<hh", v_raw, i * 4) for i in range(n_v))
+        ]
+        n_sd = len(sd_raw) // 30
+        side_secs = [
+            int(struct.unpack_from("<hh8s8s8sh", sd_raw, i * 30)[5])
+            for i in range(n_sd)
+        ]
+        n_sc = len(sc_raw) // 26
+        if n_sc == n_sec and n_sec > 0:
+            has_sec_geom = True
+            for i in range(n_sc):
+                hf, hc, _ft, _ct, _lt, sp, tag = struct.unpack_from("<hh8s8shhh", sc_raw, i * 26)
+                sec_hf[i] = float(hf)
+                sec_hc[i] = float(hc)
+                sec_tag[i] = int(tag)
+                if int(sp) in _DOOM_DAMAGING_SPECIALS:
+                    sec_damaging[i] = True
+
+        n_l = len(l_raw) // 14
+        for i in range(n_l):
+            v1, v2, _flags, spec, tag, sf_u, sb_u = struct.unpack_from("<HHHHHHH", l_raw, i * 14)
+            sf = -1 if sf_u == 0xFFFF else int(sf_u)
+            sb = -1 if sb_u == 0xFFFF else int(sb_u)
+            has_back = 0 <= sb < n_sd
+            if spec in DOOM_MANUAL_DOORS and tag == 0 and has_back:
+                bsec = side_secs[sb]
+                if 0 <= bsec < n_sec:
+                    manual_door_secs.add(bsec)
+                if 0 <= sf < n_sd and 0 <= side_secs[sf] < n_sec:
+                    manual_door_secs.add(side_secs[sf])
+            if not (0 <= v1 < n_v and 0 <= v2 < n_v):
+                continue
+            x1, y1 = verts[v1]
+            x2, y2 = verts[v2]
+            if spec in _DOOM_EXIT_SPECIALS:
+                exit_raw.append((x1, y1, x2, y2, has_back))
+            elif spec in _DOOM_REMOTE_DOOR_SPECIALS and tag > 0:
+                remote_switch_raw_by_tag.setdefault(int(tag), []).append((x1, y1, x2, y2, has_back))
+
+        n_t = len(t_raw) // 10
+        for i in range(n_t):
+            tx, ty, _ang, t_id, _tflags = struct.unpack_from("<hhhhh", t_raw, i * 10)
+            if t_id == 1:
+                player_start = (float(tx), float(ty))
+            elif t_id in _KEY_THING_TO_COLOR:
+                key_pts.append((float(tx), float(ty), _KEY_THING_TO_COLOR[t_id]))
+
+    # Track directed cliff segments (allow downhill drop-offs, block uphill > MAX_STEP_UP).
+    cliff_indices: list[int] = []
+    cliff_low_is_front: list[bool] = []
+    if has_sec_geom:
+        is_door_sec = np.zeros(n_sec, dtype=bool)
+        for sid in info.door_sectors:
+            if 0 <= sid < n_sec:
+                is_door_sec[sid] = True
+        two_sided_idx = np.flatnonzero(
+            (~solid_mask) & (front >= 0) & (back >= 0) & (front < n_sec) & (back < n_sec)
+        )
+        if len(two_sided_idx) > 0:
+            sa_v, sb_v = front[two_sided_idx], back[two_sided_idx]
+            non_door = ~(is_door_sec[sa_v] | is_door_sec[sb_v])
+            opening = np.minimum(sec_hc[sa_v], sec_hc[sb_v]) - np.maximum(sec_hf[sa_v], sec_hf[sb_v])
+            # Narrow openings (windows, grates, low ceilings) are impassable in both directions.
+            too_low = two_sided_idx[non_door & (opening < PLAYER_HEIGHT)]
+            solid_mask[too_low] = True
+            # Vertical step-ups/drop-offs: traversable only from higher sector to lower sector.
+            passable_non_door = non_door & (opening >= PLAYER_HEIGHT)
+            diff_v = sec_hf[sb_v] - sec_hf[sa_v]
+            for li, sa_i, sb_i, dv, nd in zip(
+                two_sided_idx.tolist(), sa_v.tolist(), sb_v.tolist(), diff_v.tolist(), passable_non_door.tolist()
+            ):
+                if nd and abs(dv) > MAX_STEP_UP:
+                    cliff_indices.append(li)
+                    cliff_low_is_front.append(dv > 0.0)
 
     solid_p1 = p1[solid_mask]
     solid_p2 = p2[solid_mask]
+    cliff_p1 = p1[cliff_indices] if cliff_indices else np.zeros((0, 2), dtype=np.float64)
+    cliff_p2 = p2[cliff_indices] if cliff_indices else np.zeros((0, 2), dtype=np.float64)
 
-    # Locked door boundary segments
-    locked_sectors = {sid: lock for sid, lock in info.door_sectors.items() if lock > 0}
+    if not exit_raw and not exit_centers:
+        _NAV_CACHE[cache_key] = None
+        return None
+
+    all_pts = np.vstack([p1, p2])
+    # Coarsen cell grid multiplicatively when large maps (e.g., freedoom2 MAP03..08) exceed 12,000 cells.
+    eff_cell = float(cell_size)
+    while True:
+        # Offset origin by a non-rational fraction of eff_cell so grid centers never sit on walls
+        min_x = float(all_pts[:, 0].min()) - eff_cell * 0.371
+        min_y = float(all_pts[:, 1].min()) - eff_cell * 0.371
+        max_x = float(all_pts[:, 0].max()) + eff_cell * 0.5
+        max_y = float(all_pts[:, 1].max()) + eff_cell * 0.5
+        nx = max(1, int(math.ceil((max_x - min_x) / eff_cell)))
+        ny = max(1, int(math.ceil((max_y - min_y) / eff_cell)))
+        if nx * ny <= 12000 or eff_cell >= 256.0:
+            break
+        eff_cell *= 1.5
+
+    if nx * ny > 12000:
+        _NAV_CACHE[cache_key] = None
+        return None
+
+    def to_cell(x: float, y: float) -> int:
+        gx = min(nx - 1, max(0, int(math.floor((x - min_x) / eff_cell))))
+        gy = min(ny - 1, max(0, int(math.floor((y - min_y) / eff_cell))))
+        return gy * nx + gx
+
+    def cell_center(idx: int) -> tuple[float, float]:
+        gy, gx = divmod(idx, nx)
+        return min_x + (gx + 0.5) * eff_cell, min_y + (gy + 0.5) * eff_cell
+
+    def _safe_wall_cell(x1: float, y1: float, x2: float, y2: float, has_back: bool) -> int:
+        mx, my = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        if has_back:
+            return to_cell(mx, my)
+        dx, dy = x2 - x1, y2 - y1
+        seg_len = math.hypot(dx, dy)
+        if seg_len <= 1e-6:
+            return to_cell(mx, my)
+        nx_w, ny_w = dy / seg_len, -dx / seg_len
+        anchor_x, anchor_y = mx + nx_w * 2.0, my + ny_w * 2.0
+        for mult in (0.78, 0.55, 0.35, 1.05):
+            cand = to_cell(mx + nx_w * (eff_cell * mult), my + ny_w * (eff_cell * mult))
+            cx, cy = cell_center(cand)
+            if not np.any(_segments_intersect_batch(anchor_x, anchor_y, cx, cy, solid_p1, solid_p2)):
+                return cand
+        return to_cell(mx + nx_w * (eff_cell * 0.5), my + ny_w * (eff_cell * 0.5))
+
+    # Identify remote doors (tag > 0 matching a switch linedef, no local manual door linedefs)
+    remote_doors: dict[int, int] = {}
+    for sid, lock in info.door_sectors.items():
+        if lock == 0 and 0 <= sid < n_sec and sid not in manual_door_secs:
+            tag = int(sec_tag[sid])
+            if tag > 0 and tag in remote_switch_raw_by_tag:
+                sx1, sy1, sx2, sy2, shb = remote_switch_raw_by_tag[tag][0]
+                remote_doors[sid] = _safe_wall_cell(sx1, sy1, sx2, sy2, shb)
+
+    # Locked door + remote door boundary segments
+    locked_sectors: dict[int, int] = {sid: lock for sid, lock in info.door_sectors.items() if lock > 0}
+    for sid in remote_doors:
+        locked_sectors[sid] = _REMOTE_DOOR_LOCK
+
     lock_line_idx: list[tuple[int, int, int]] = []  # (line_idx, sid, lock)
     for sid, lock in locked_sectors.items():
         m = ((front == sid) | (back == sid)) & (~solid_mask)
         for li in np.flatnonzero(m).tolist():
             lock_line_idx.append((li, sid, lock))
 
-    if not exit_pts:
-        _NAV_CACHE[cache_key] = None
-        return None
-
-    all_pts = np.vstack([p1, p2])
-    # Offset origin by a non-rational fraction of cell_size so grid centers never sit on 64/80-unit walls
-    min_x = float(all_pts[:, 0].min()) - cell_size * 0.371
-    min_y = float(all_pts[:, 1].min()) - cell_size * 0.371
-    max_x = float(all_pts[:, 0].max()) + cell_size * 0.5
-    max_y = float(all_pts[:, 1].max()) + cell_size * 0.5
-
-    nx = max(1, int(math.ceil((max_x - min_x) / cell_size)))
-    ny = max(1, int(math.ceil((max_y - min_y) / cell_size)))
-    if nx * ny > 12000:
-        _NAV_CACHE[cache_key] = None
-        return None
-
-    def to_cell(x: float, y: float) -> int:
-        gx = min(nx - 1, max(0, int(math.floor((x - min_x) / cell_size))))
-        gy = min(ny - 1, max(0, int(math.floor((y - min_y) / cell_size))))
-        return gy * nx + gx
-
-    def cell_center(idx: int) -> tuple[float, float]:
-        gy, gx = divmod(idx, nx)
-        return min_x + (gx + 0.5) * cell_size, min_y + (gy + 0.5) * cell_size
+    n_cells = nx * ny
+    cell_damaging = np.zeros(n_cells, dtype=bool)
+    if has_sec_geom and np.any(sec_damaging):
+        f_dmg = np.where((front >= 0) & (front < n_sec), sec_damaging[np.clip(front, 0, n_sec - 1)], False)
+        b_dmg = np.where((back >= 0) & (back < n_sec), sec_damaging[np.clip(back, 0, n_sec - 1)], False)
+        dmg_edge_mask = f_dmg != b_dmg
+        if np.any(dmg_edge_mask):
+            ep1 = p1[dmg_edge_mask]
+            ep2 = p2[dmg_edge_mask]
+            ep1_x, ep1_y = ep1[:, 0], ep1[:, 1]
+            ep2_x, ep2_y = ep2[:, 0], ep2[:, 1]
+            dx_e = ep2_x - ep1_x
+            dy_e = ep2_y - ep1_y
+            safe_dy = np.where(np.abs(dy_e) > 1e-9, dy_e, 1.0)
+            gy_idx, gx_idx = np.divmod(np.arange(n_cells), nx)
+            cx_arr = min_x + (gx_idx.astype(np.float64) + 0.5) * eff_cell
+            cy_arr = min_y + (gy_idx.astype(np.float64) + 0.5) * eff_cell
+            for start in range(0, n_cells, 1024):
+                end = min(n_cells, start + 1024)
+                cx_c = cx_arr[start:end, None]
+                cy_c = cy_arr[start:end, None]
+                cond_y = (ep1_y[None, :] > cy_c) != (ep2_y[None, :] > cy_c)
+                x_int = ep1_x[None, :] + (cy_c - ep1_y[None, :]) * dx_e[None, :] / safe_dy[None, :]
+                crossings = np.sum(cond_y & (cx_c < x_int), axis=1)
+                cell_damaging[start:end] = (crossings % 2) == 1
 
     lock_p1 = p1[[x[0] for x in lock_line_idx]] if lock_line_idx else np.zeros((0, 2), dtype=np.float64)
     lock_p2 = p2[[x[0] for x in lock_line_idx]] if lock_line_idx else np.zeros((0, 2), dtype=np.float64)
 
-    n_cells = nx * ny
     adj: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]] = [[] for _ in range(n_cells)]
-    card_dirs = ((1, 0, cell_size), (-1, 0, cell_size), (0, 1, cell_size), (0, -1, cell_size))
 
     locked_door_cells: dict[int, tuple[int, list[int]]] = {
         sid: (lock, []) for sid, lock in locked_sectors.items()
     }
 
-    # Build cardinal edges first, then allow diagonals only when both intermediate cardinal edges exist (no corner-clipping!)
+    def _crosses_uphill_cliff(ux: float, uy: float, vx: float, vy: float) -> bool:
+        if len(cliff_p1) == 0:
+            return False
+        hits = np.flatnonzero(_segments_intersect_batch(ux, uy, vx, vy, cliff_p1, cliff_p2))
+        for hi in hits.tolist():
+            x1, y1 = cliff_p1[hi]
+            x2, y2 = cliff_p2[hi]
+            dx, dy = x2 - x1, y2 - y1
+            cross_u = (ux - x1) * dy - (uy - y1) * dx
+            cross_v = (vx - x1) * dy - (vy - y1) * dx
+            if cliff_low_is_front[hi]:
+                if cross_u >= 0.0 and cross_v <= 0.0:
+                    return True
+            else:
+                if cross_u <= 0.0 and cross_v >= 0.0:
+                    return True
+        return False
+
+    # Build cardinal edges once per undirected pair (+X, +Y), checking uphill cliff direction separately.
     card_map: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
     for gy in range(ny):
         for gx in range(nx):
             u = gy * nx + gx
             ux, uy = cell_center(u)
-            for dx_i, dy_i, cost in card_dirs:
+            for dx_i, dy_i in ((1, 0), (0, 1)):
                 ng_x, ng_y = gx + dx_i, gy + dy_i
                 if not (0 <= ng_x < nx and 0 <= ng_y < ny):
                     continue
                 v = ng_y * nx + ng_x
-                if v < u:
-                    continue
                 vx, vy = cell_center(v)
                 if np.any(_segments_intersect_batch(ux, uy, vx, vy, solid_p1, solid_p2)):
                     continue
@@ -291,43 +484,167 @@ def _build_nav_graph(wad_path: str | Path, map_name: str = "MAP01", cell_size: f
                         if v not in locked_door_cells[sid][1]:
                             locked_door_cells[sid][1].append(v)
                 req_tuple = tuple(sorted(set(reqs)))
-                card_map[(u, v)] = req_tuple
-                card_map[(v, u)] = req_tuple
-                adj[u].append((v, cost, req_tuple))
-                adj[v].append((u, cost, req_tuple))
+                cost = eff_cell * (3.0 if (cell_damaging[u] or cell_damaging[v]) else 1.0)
+                if not _crosses_uphill_cliff(ux, uy, vx, vy):
+                    card_map[(u, v)] = req_tuple
+                    adj[u].append((v, cost, req_tuple))
+                if not _crosses_uphill_cliff(vx, vy, ux, uy):
+                    card_map[(v, u)] = req_tuple
+                    adj[v].append((u, cost, req_tuple))
 
-    diag_cost = cell_size * 1.41421356
+    diag_base = eff_cell * 1.41421356
     for gy in range(ny - 1):
         for gx in range(nx - 1):
-            # (gx, gy) <-> (gx+1, gy+1) via (gx+1, gy) or (gx, gy+1)
             u00 = gy * nx + gx
             u10 = gy * nx + (gx + 1)
             u01 = (gy + 1) * nx + gx
             u11 = (gy + 1) * nx + (gx + 1)
-            if (u00, u10) in card_map and (u10, u11) in card_map and (u00, u01) in card_map and (u01, u11) in card_map:
-                reqs = tuple(sorted(set(card_map[(u00, u10)]) | set(card_map[(u10, u11)]) | set(card_map[(u00, u01)]) | set(card_map[(u01, u11)])))
-                adj[u00].append((u11, diag_cost, reqs))
-                adj[u11].append((u00, diag_cost, reqs))
-            if (u10, u00) in card_map and (u00, u01) in card_map and (u10, u11) in card_map and (u11, u01) in card_map:
-                reqs = tuple(sorted(set(card_map[(u10, u00)]) | set(card_map[(u00, u01)]) | set(card_map[(u10, u11)]) | set(card_map[(u11, u01)])))
-                adj[u10].append((u01, diag_cost, reqs))
-                adj[u01].append((u10, diag_cost, reqs))
+            diag_pairs = (
+                (u00, u11, (u00, u10), (u10, u11), (u00, u01), (u01, u11)),
+                (u11, u00, (u11, u10), (u10, u00), (u11, u01), (u01, u00)),
+                (u10, u01, (u10, u00), (u00, u01), (u10, u11), (u11, u01)),
+                (u01, u10, (u01, u00), (u00, u10), (u01, u11), (u11, u10)),
+            )
+            for src, dst, e1a, e1b, e2a, e2b in diag_pairs:
+                if e1a in card_map and e1b in card_map and e2a in card_map and e2b in card_map:
+                    reqs = tuple(sorted(set(card_map[e1a]) | set(card_map[e1b]) | set(card_map[e2a]) | set(card_map[e2b])))
+                    cost = diag_base * (3.0 if (cell_damaging[src] or cell_damaging[dst]) else 1.0)
+                    adj[src].append((dst, cost, reqs))
 
-    exit_cells = tuple(sorted({to_cell(ex, ey) for ex, ey in exit_pts}))
+    exit_cells = tuple(
+        sorted(
+            {_safe_wall_cell(x1, y1, x2, y2, hb) for x1, y1, x2, y2, hb in exit_raw}
+            | {to_cell(ex, ey) for ex, ey in exit_centers}
+        )
+    )
     key_spawns = tuple((to_cell(kx, ky), col) for kx, ky, col in key_pts)
+    switch_waypoints = dict(remote_doors)
+    rev_adj: list[list[tuple[int, float, tuple[tuple[int, int], ...]]]] = [[] for _ in range(n_cells)]
+    for u, edges in enumerate(adj):
+        for v, cost, reqs in edges:
+            rev_adj[v].append((u, cost, reqs))
     graph = _WadNavigationGraph(
         min_x=min_x,
         min_y=min_y,
-        cell_size=cell_size,
+        cell_size=eff_cell,
         nx=nx,
         ny=ny,
         adj=adj,
+        rev_adj=rev_adj,
         exit_cells=exit_cells,
         key_spawns=key_spawns,
         locked_door_cells=locked_door_cells,
+        switch_waypoints=switch_waypoints,
+        player_start=player_start,
     )
     _NAV_CACHE[cache_key] = graph
+    if len(_NAV_CACHE) > 256:
+        _NAV_CACHE.pop(next(iter(_NAV_CACHE)))
     return graph
+
+
+def compute_pbrs_geodesic_summary(
+    wad_path: str | Path,
+    map_name: str = "MAP01",
+    cell_size: float = 32.0,
+) -> dict[str, Any]:
+    """Simulate static greedy progression over `_build_nav_graph` and report PBRS validity + geodesic horizon."""
+    import heapq
+
+    graph = _build_nav_graph(wad_path, map_name=map_name, cell_size=cell_size)
+    if graph is None or not graph.exit_cells or graph.player_start is None:
+        return {
+            "pbrs_valid": False,
+            "geodesic_horizon_u": 0.0,
+            "has_oneway_dropoff": False,
+            "nav_cells": 0,
+        }
+
+    edge_pairs: set[tuple[int, int]] = set()
+    for u, edges in enumerate(graph.adj):
+        for v, _, _ in edges:
+            edge_pairs.add((u, v))
+    has_oneway = any((v, u) not in edge_pairs for (u, v) in edge_pairs)
+
+    gx = min(graph.nx - 1, max(0, int(math.floor((graph.player_start[0] - graph.min_x) / graph.cell_size))))
+    gy = min(graph.ny - 1, max(0, int(math.floor((graph.player_start[1] - graph.min_y) / graph.cell_size))))
+    cur_cell = gy * graph.nx + gx
+    held_colors: set[int] = set()
+    collected_keys: set[int] = set()
+    unlocked_secs: set[int] = set()
+    n_cells = graph.nx * graph.ny
+    total_horizon = 0.0
+
+    def _can_pass(sid: int, lock: int) -> bool:
+        if sid in unlocked_secs:
+            return True
+        if lock == _REMOTE_DOOR_LOCK:
+            return False
+        if lock in _LOCK_TO_COLOR:
+            return _LOCK_TO_COLOR[lock] in held_colors
+        if lock == LOCK_ANY:
+            return len(held_colors) > 0
+        if lock == LOCK_ALL:
+            return len(held_colors) >= 3
+        if lock > 0:
+            return False
+        return True
+
+    def _fwd_dist(start: int) -> np.ndarray:
+        dist = np.full(n_cells, _INF, dtype=np.float64)
+        dist[start] = 0.0
+        pq: list[tuple[float, int]] = [(0.0, start)]
+        adj = graph.adj
+        while pq:
+            d, u = heapq.heappop(pq)
+            if d > dist[u]:
+                continue
+            for v, cost, reqs in adj[u]:
+                if reqs and not all(_can_pass(sid, lk) for sid, lk in reqs):
+                    continue
+                nd = d + cost
+                if nd < dist[v]:
+                    dist[v] = nd
+                    heapq.heappush(pq, (nd, v))
+        return dist
+
+    for _ in range(len(graph.key_spawns) + len(graph.switch_waypoints) + 2):
+        dist = _fwd_dist(cur_cell)
+        exit_dists = [(float(dist[c]), c) for c in graph.exit_cells if dist[c] < _INF * 0.5]
+        if exit_dists:
+            d_ex, _ = min(exit_dists)
+            total_horizon += d_ex
+            return {
+                "pbrs_valid": True,
+                "geodesic_horizon_u": round(total_horizon, 1),
+                "has_oneway_dropoff": has_oneway,
+                "nav_cells": n_cells,
+            }
+
+        subgoals: list[tuple[float, str, int, int]] = []
+        for idx, (k_cell, col) in enumerate(graph.key_spawns):
+            if idx not in collected_keys and dist[k_cell] < _INF * 0.5:
+                subgoals.append((float(dist[k_cell]), "key", idx, k_cell))
+        for sid, sw_cell in graph.switch_waypoints.items():
+            if sid not in unlocked_secs and dist[sw_cell] < _INF * 0.5:
+                subgoals.append((float(dist[sw_cell]), "switch", sid, sw_cell))
+        if not subgoals:
+            break
+        d_sub, kind, item_id, target_cell = min(subgoals)
+        total_horizon += d_sub
+        cur_cell = target_cell
+        if kind == "key":
+            collected_keys.add(item_id)
+            held_colors.add(graph.key_spawns[item_id][1])
+        else:
+            unlocked_secs.add(item_id)
+
+    return {
+        "pbrs_valid": False,
+        "geodesic_horizon_u": round(total_horizon, 1),
+        "has_oneway_dropoff": has_oneway,
+        "nav_cells": n_cells,
+    }
 
 
 class GeodesicPBRS:
@@ -348,8 +665,11 @@ class GeodesicPBRS:
         self._init_ceil: np.ndarray | None = None
         self._unlocked_sectors: set[int] = set()
         self._collected_key_indices: set[int] = set()
+        self._activated_switches: set[int] = set()
+        self._exit_best_phi: float = 0.0
         self._prev_stage_key: tuple[Any, ...] | None = None
         self._prev_phi: float = 0.0
+        self._rev_dist_cache: dict[tuple[Any, ...], np.ndarray] = {}
 
     def _cell_of(self, x: float, y: float) -> int:
         assert self.graph is not None
@@ -374,12 +694,16 @@ class GeodesicPBRS:
     def _can_pass_lock(self, sid: int, lock: int, held_colors: set[int]) -> bool:
         if sid in self._unlocked_sectors:
             return True
+        if lock == _REMOTE_DOOR_LOCK:
+            return False
         if lock in _LOCK_TO_COLOR:
             return _LOCK_TO_COLOR[lock] in held_colors
         if lock == LOCK_ANY:
             return len(held_colors) > 0
         if lock == LOCK_ALL:
             return len(held_colors) >= 3
+        if lock > 0:
+            return False
         return True
 
     def _dijkstra(self, start_cell: int, held_colors: set[int]) -> np.ndarray:
@@ -404,17 +728,59 @@ class GeodesicPBRS:
                     heapq.heappush(pq, (nd, v))
         return dist
 
+    def _rev_dijkstra(
+        self,
+        cache_key: tuple[Any, ...],
+        targets: tuple[int, ...] | list[int],
+        held_colors: set[int],
+    ) -> np.ndarray:
+        assert self.graph is not None
+        if cache_key in self._rev_dist_cache:
+            return self._rev_dist_cache[cache_key]
+        import heapq
+
+        n = self.graph.nx * self.graph.ny
+        dist = np.full(n, _INF, dtype=np.float64)
+        pq: list[tuple[float, int]] = []
+        for t in targets:
+            ti = int(t)
+            if 0 <= ti < n and dist[ti] > 0.0:
+                dist[ti] = 0.0
+                pq.append((0.0, ti))
+        heapq.heapify(pq)
+        rev_adj = self.graph.rev_adj
+        while pq:
+            d, v = heapq.heappop(pq)
+            if d > dist[v]:
+                continue
+            for u, cost, reqs in rev_adj[v]:
+                if reqs and not all(self._can_pass_lock(sid, lk, held_colors) for sid, lk in reqs):
+                    continue
+                nd = d + cost
+                if nd < dist[u]:
+                    dist[u] = nd
+                    heapq.heappush(pq, (nd, u))
+        if len(self._rev_dist_cache) >= 128:
+            self._rev_dist_cache.pop(next(iter(self._rev_dist_cache)))
+        self._rev_dist_cache[cache_key] = dist
+        return dist
+
     def _compute_stage_potential(self, priv_state: dict[str, Any]) -> tuple[tuple[Any, ...], float]:
         if self.graph is None or self.scale <= 0.0:
             return ("none",), 0.0
 
-        # Track physically opened locked doors
+        # Track physically opened locked & remote doors (remote doors can re-close after door_close_delay).
         ceil = priv_state.get("sector_ceiling")
         if ceil is not None and self._init_ceil is not None and len(ceil) == len(self._init_ceil):
-            raised = np.flatnonzero(np.asarray(ceil, dtype=np.float64) - self._init_ceil >= 8.0)
-            for sid in raised.tolist():
-                if sid in self.graph.locked_door_cells:
-                    self._unlocked_sectors.add(sid)
+            diff = np.asarray(ceil, dtype=np.float64) - self._init_ceil
+            for sid, (lk, _) in self.graph.locked_door_cells.items():
+                if 0 <= sid < len(diff):
+                    if diff[sid] >= 8.0:
+                        self._unlocked_sectors.add(sid)
+                        if lk == _REMOTE_DOOR_LOCK:
+                            self._activated_switches.add(sid)
+                    elif lk == _REMOTE_DOOR_LOCK:
+                        self._unlocked_sectors.discard(sid)
 
         held_colors = self._held_colors(priv_state)
         for idx, (_cell, col) in enumerate(self.graph.key_spawns):
@@ -422,28 +788,59 @@ class GeodesicPBRS:
                 self._collected_key_indices.add(idx)
 
         cur_cell = self._cell_of(float(priv_state["x"]), float(priv_state["y"]))
-        dist = self._dijkstra(cur_cell, held_colors)
+        held_fs = frozenset(held_colors)
+        unlocked_fs = frozenset(self._unlocked_sectors)
 
-        # Priority 1: Exit reachable using currently unlocked + held-key doors
-        exit_dists = [float(dist[c]) for c in self.graph.exit_cells if dist[c] < _INF * 0.5]
-        if exit_dists:
-            d_min = min(exit_dists)
-            return ("exit",), max(0.0, _MAX_POTENTIAL_DIST - d_min / 1024.0)
+        # Priority 1: Exit reachable using currently open + held-key doors (cached reverse-Dijkstra)
+        exit_dist_map = self._rev_dijkstra(("exit", held_fs, unlocked_fs), self.graph.exit_cells, held_colors)
+        d_exit = float(exit_dist_map[cur_cell])
+        if d_exit < _INF * 0.5:
+            return ("exit",), max(0.0, _MAX_POTENTIAL_DIST - d_exit / 1024.0)
 
-        # Priority 2: Nearest reachable uncollected key whose color is still needed
-        key_dists: list[tuple[float, int]] = []
-        for idx, (k_cell, col) in enumerate(self.graph.key_spawns):
-            if idx not in self._collected_key_indices and dist[k_cell] < _INF * 0.5:
-                key_dists.append((float(dist[k_cell]), idx))
-        if key_dists:
-            d_min, k_idx = min(key_dists)
-            return ("key", tuple(sorted(held_colors))), max(0.0, _MAX_POTENTIAL_DIST - d_min / 1024.0)
+        # Priority 2: Nearest reachable prerequisite (uncollected key or closed remote door switch)
+        key_targets = tuple(
+            k_cell
+            for idx, (k_cell, _col) in enumerate(self.graph.key_spawns)
+            if idx not in self._collected_key_indices
+        )
+        best_key: float | None = None
+        if key_targets:
+            col_fs = frozenset(self._collected_key_indices)
+            key_dist_map = self._rev_dijkstra(("key", held_fs, unlocked_fs, col_fs), key_targets, held_colors)
+            dk = float(key_dist_map[cur_cell])
+            if dk < _INF * 0.5:
+                best_key = dk
+
+        sw_cands: list[tuple[float, int]] = []
+        for sid, sw_cell in self.graph.switch_waypoints.items():
+            if sid not in self._unlocked_sectors:
+                sw_dist_map = self._rev_dijkstra(("sw", sid, held_fs, unlocked_fs), (sw_cell,), held_colors)
+                ds = float(sw_dist_map[cur_cell])
+                if ds < _INF * 0.5:
+                    sw_cands.append((ds, sid))
+        best_sw = min(sw_cands) if sw_cands else None
+
+        if best_key is not None and (best_sw is None or best_key <= best_sw[0]):
+            if self.graph.switch_waypoints:
+                return (
+                    ("key", tuple(sorted(held_colors)), tuple(sorted(self._unlocked_sectors))),
+                    max(0.0, _MAX_POTENTIAL_DIST - best_key / 1024.0),
+                )
+            return ("key", tuple(sorted(held_colors))), max(0.0, _MAX_POTENTIAL_DIST - best_key / 1024.0)
+        if best_sw is not None:
+            sw_dist, sw_sid = best_sw
+            return (
+                ("switch", sw_sid, tuple(sorted(held_colors)), tuple(sorted(self._unlocked_sectors))),
+                max(0.0, _MAX_POTENTIAL_DIST - sw_dist / 1024.0),
+            )
 
         return ("none",), 0.0
 
     def reset(self, priv_state: dict[str, Any]) -> None:
         self._unlocked_sectors.clear()
         self._collected_key_indices.clear()
+        self._activated_switches.clear()
+        self._exit_best_phi = 0.0
         ceil = priv_state.get("sector_ceiling")
         self._init_ceil = None if ceil is None else np.array(ceil, dtype=np.float64, copy=True)
         if self.graph is None or self.scale <= 0.0:
@@ -451,16 +848,20 @@ class GeodesicPBRS:
             self._prev_phi = 0.0
             return
         self._prev_stage_key, self._prev_phi = self._compute_stage_potential(priv_state)
+        if self._prev_stage_key == ("exit",):
+            self._exit_best_phi = self._prev_phi
 
     def step(self, priv_state: dict[str, Any]) -> float:
         if self.graph is None or self.scale <= 0.0:
             return 0.0
         if bool(priv_state.get("exit_reached")):
-            # Potential at exit (d=0) is _MAX_POTENTIAL_DIST
-            raw = self.scale * (self.gamma * _MAX_POTENTIAL_DIST - self._prev_phi)
+            # Potential at exit (d=0) is _MAX_POTENTIAL_DIST; never penalize stepping onto the exit pad.
+            raw = max(0.0, self.scale * (_MAX_POTENTIAL_DIST - self._prev_phi))
             self._prev_phi = _MAX_POTENTIAL_DIST
+            self._exit_best_phi = max(self._exit_best_phi, _MAX_POTENTIAL_DIST)
             return float(np.clip(raw, -0.5, 0.5))
         if bool(priv_state.get("dead")):
+            self._prev_phi = 0.0
             return 0.0
 
         stage_key, phi = self._compute_stage_potential(priv_state)
@@ -469,11 +870,23 @@ class GeodesicPBRS:
             self._prev_phi = 0.0
             return 0.0
 
-        # Reset potential cleanly when progression target switches (e.g. key -> exit)
+        # Reset potential cleanly when progression target switches; high-water-mark exit potential
+        # prevents re-farming if a timed remote door closes and reopens.
         if self._prev_stage_key != stage_key:
             self._prev_stage_key = stage_key
+            if stage_key == ("exit",):
+                self._prev_phi = max(phi, self._exit_best_phi)
+                self._exit_best_phi = self._prev_phi
+            else:
+                self._prev_phi = phi
+            return 0.0
+
+        if stage_key[0] == "switch" and stage_key[1] in self._activated_switches:
             self._prev_phi = phi
             return 0.0
+
+        if stage_key == ("exit",):
+            self._exit_best_phi = max(self._exit_best_phi, phi)
 
         raw = self.scale * (self.gamma * phi - self._prev_phi)
         self._prev_phi = phi

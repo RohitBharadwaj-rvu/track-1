@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import subprocess
@@ -27,6 +28,12 @@ import numpy as np
 from doom_env import make_env
 from doom_env.limits import agent_budget_s
 from doom_env.spaces import BUTTONS, FRAME_SKIP
+from training.game_theory import (
+    compare_reports_nash,
+    compute_cvar,
+    compute_episode_rubric_score,
+    compute_polytope_scores,
+)
 from training.interfaces import EpisodeMetrics, MapSpec, PrivilegedEventTracker
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -96,12 +103,16 @@ def resolve_maps(
         return [
             MapSpec("vizdoom/freedoom2.wad", map_name=f"MAP{i:02d}", family="freedoom", tier=4,
                     split="stress", episode_ticks=4200)
-            for i in range(1, 5)
+            for i in range(1, 9)
         ]
     if target == "stress":
         from training.maps import STRESS_MAPS
 
         return list(STRESS_MAPS)
+    if target == "final_ood":
+        from training.maps import FINAL_OOD_MAPS
+
+        return list(FINAL_OOD_MAPS)
 
     try:
         maps_mod = importlib.import_module("training.maps")
@@ -166,17 +177,18 @@ def _git_commit() -> str | None:
 
 def _weights_sha256() -> dict[str, str]:
     weights_dir = ROOT / "submission" / "weights"
-    if not weights_dir.is_dir():
-        return {}
+    override = os.environ.get("DOOM_AGENT_WEIGHTS")
+    weights = [Path(override).resolve()] if override else sorted(weights_dir.rglob("*"))
     hashes: dict[str, str] = {}
-    for p in sorted(weights_dir.rglob("*")):
+    for p in weights:
         if not p.is_file() or p.name == ".gitkeep":
             continue
         h = hashlib.sha256()
         with p.open("rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
-        hashes[str(p.relative_to(ROOT)).replace("\\", "/")] = h.hexdigest()
+        label = p.relative_to(ROOT) if p.is_relative_to(ROOT) else p
+        hashes[label.as_posix()] = h.hexdigest()
     return hashes
 
 
@@ -326,6 +338,7 @@ def evaluate_episode(
         "wasted_attack_steps": wasted_attack_steps,
         "had_key_pickup": had_key_pickup,
         "died_after_pickup": died_after_pickup,
+        "episode_ticks": int(spec.episode_ticks),
     }
     if replay_path is not None:
         extra["replay_path"] = str(replay_path)
@@ -364,6 +377,7 @@ def _aggregate_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
             "timeouts": 0,
             "errors": 0,
             "exit_rate": 0.0,
+            "exit_rate_se": 0.0,
             "keys_picked_up": 0,
             "doors_opened": 0,
             "locked_doors_unlocked": 0,
@@ -390,13 +404,17 @@ def _aggregate_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
         1 for e in episodes if e.locked_doors_unlocked > 0 and e.outcome == "exit"
     )
     deaths_after_pickup = sum(1 for e in episodes if bool(e.extra.get("died_after_pickup", False)))
+    exits = sum(1 for e in episodes if e.outcome == "exit")
+    p_exit = exits / n
+    exit_se = math.sqrt(p_exit * (1.0 - p_exit) / n)
     return {
         "episodes": n,
-        "exits": sum(1 for e in episodes if e.outcome == "exit"),
+        "exits": exits,
         "deaths": sum(1 for e in episodes if e.outcome == "death"),
         "timeouts": sum(1 for e in episodes if e.outcome == "timeout"),
         "errors": sum(1 for e in episodes if e.outcome == "error"),
-        "exit_rate": round(sum(1 for e in episodes if e.outcome == "exit") / n, 4),
+        "exit_rate": round(p_exit, 4),
+        "exit_rate_se": round(exit_se, 4),
         "keys_picked_up": sum(e.keys_picked_up for e in episodes),
         "doors_opened": sum(e.doors_opened for e in episodes),
         "locked_doors_unlocked": sum(e.locked_doors_unlocked for e in episodes),
@@ -435,8 +453,35 @@ def summarize_episodes(episodes: list[EpisodeMetrics]) -> dict[str, Any]:
     for family in sorted({e.family for e in episodes}):
         by_family[family] = _aggregate_episodes([e for e in episodes if e.family == family])
 
-    overall["tier12_exits"] = sum(1 for e in episodes if e.tier in (1, 2) and e.outcome == "exit")
-    overall["tier34_exits"] = sum(1 for e in episodes if e.tier in (3, 4) and e.outcome == "exit")
+    t12 = [e for e in episodes if e.tier in (1, 2)]
+    t34 = [e for e in episodes if e.tier in (3, 4)]
+    overall["tier12_exits"] = sum(1 for e in t12 if e.outcome == "exit")
+    overall["tier34_exits"] = sum(1 for e in t34 if e.outcome == "exit")
+    r12 = overall["tier12_exits"] / len(t12) if t12 else None
+    r34 = overall["tier34_exits"] / len(t34) if t34 else None
+    if r12 is not None and r34 is not None:
+        proxy = 0.25 * r12 + 0.75 * r34
+    elif r34 is not None:
+        proxy = r34
+    elif r12 is not None:
+        proxy = r12
+    else:
+        proxy = float(overall["exit_rate"])
+    overall["proxy_leaderboard_score"] = round(proxy, 4)
+
+    polytope = compute_polytope_scores(episodes)
+    per_map_rubric: dict[str, list[float]] = {}
+    per_map_exit: dict[str, list[float]] = {}
+    for e in episodes:
+        mk = f"{Path(e.wad).name}:{e.map_name}"
+        per_map_rubric.setdefault(mk, []).append(compute_episode_rubric_score(e))
+        per_map_exit.setdefault(mk, []).append(1.0 if e.outcome == "exit" else 0.0)
+    mean_map_rubric = {k: sum(v) / float(len(v)) for k, v in per_map_rubric.items() if v}
+    mean_map_exit = {k: sum(v) / float(len(v)) for k, v in per_map_exit.items() if v}
+    overall["verifiable_rubric_score"] = polytope["nominal"]
+    overall["rubric_polytope"] = polytope
+    overall["cvar_25_rubric"] = compute_cvar(mean_map_rubric, 0.25)
+    overall["cvar_25_exit"] = compute_cvar(mean_map_exit, 0.25)
     return {"overall": overall, "by_tier": by_tier, "by_family": by_family}
 
 
@@ -565,16 +610,20 @@ def _select_and_prune_replays(
     return {"best_success": best_path, "representative_failure": fail_path}
 
 
-def _apply_eval_mode(agent: Any, eval_mode: str) -> bool:
-    """Apply `'deterministic'` or `'stochastic'` eval mode to an agent if it exposes a flag."""
-    if eval_mode == "default":
-        return False
-    det_flag = eval_mode == "deterministic"
-    for attr in ("deterministic", "eval_deterministic", "_deterministic"):
-        if hasattr(agent, attr):
-            setattr(agent, attr, det_flag)
-            return True
-    return False
+def _apply_eval_mode(agent: Any, eval_mode: str, eval_temperature: float | None = None) -> bool:
+    """Apply `'deterministic'` / `'stochastic'` eval mode and optional temperature to an agent."""
+    applied = False
+    if eval_mode != "default":
+        det_flag = eval_mode == "deterministic"
+        for attr in ("deterministic", "eval_deterministic", "_deterministic"):
+            if hasattr(agent, attr):
+                setattr(agent, attr, det_flag)
+                applied = True
+                break
+    if eval_temperature is not None and hasattr(agent, "temperature"):
+        setattr(agent, "temperature", float(eval_temperature))
+        applied = True
+    return applied
 
 
 def evaluate_suite(
@@ -588,6 +637,7 @@ def evaluate_suite(
     record_dir: Path | None = None,
     keep_key_replays: bool = False,
     eval_mode: str = "default",
+    eval_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Instantiate an agent once and evaluate all `(spec, seed)` episodes."""
     if not specs:
@@ -611,7 +661,7 @@ def evaluate_suite(
     wall_start = time.perf_counter()
     init_start = time.perf_counter()
     agent = factory(obs_space, act_space, device)
-    eval_mode_applied = _apply_eval_mode(agent, eval_mode)
+    eval_mode_applied = _apply_eval_mode(agent, eval_mode, eval_temperature=eval_temperature)
     init_time_s = round(time.perf_counter() - init_start, 4)
 
     episodes: list[EpisodeMetrics] = []
@@ -643,6 +693,7 @@ def evaluate_suite(
             "agent_spec": agent_spec,
             "device": device,
             "eval_mode": eval_mode,
+            "eval_temperature": float(eval_temperature) if eval_temperature is not None else getattr(agent, "temperature", 1.0),
             "eval_mode_applied": eval_mode_applied,
             "render_buffers": render_buffers,
             "init_time_s": init_time_s,
@@ -734,6 +785,32 @@ def compare_reports(baseline: dict[str, Any], challenger: dict[str, Any]) -> dic
                 reason = f"Challenger regressed {key} ({diff})."
                 break
 
+    b_poly = b.get("rubric_polytope") or compute_polytope_scores(baseline.get("episodes", []))
+    c_poly = c.get("rubric_polytope") or compute_polytope_scores(challenger.get("episodes", []))
+    b_corners = b_poly.get("corners", {})
+    c_corners = c_poly.get("corners", {})
+    common_corners = set(b_corners) & set(c_corners)
+    poly_dom = bool(common_corners) and all(c_corners[k] >= b_corners[k] for k in common_corners) and any(
+        c_corners[k] > b_corners[k] for k in common_corners
+    )
+
+    def _cvar_from(rep: dict[str, Any], ov: dict[str, Any]) -> float:
+        if "cvar_25_rubric" in ov:
+            return float(ov["cvar_25_rubric"])
+        per_m: dict[str, list[float]] = {}
+        for ep in rep.get("episodes", []):
+            mk = f"{Path(str(ep.get('wad', ''))).name}:{ep.get('map_name', 'MAP01')}"
+            per_m.setdefault(mk, []).append(compute_episode_rubric_score(ep))
+        return compute_cvar({k: sum(v) / float(len(v)) for k, v in per_m.items() if v}, 0.25)
+
+    cvar_delta = round(_cvar_from(challenger, c) - _cvar_from(baseline, b), 4)
+    game_theory = {
+        "nominal_rubric_delta": round(float(c_poly.get("nominal", 0.0)) - float(b_poly.get("nominal", 0.0)), 4),
+        "min_corner_delta": round(float(c_poly.get("min_corner", 0.0)) - float(b_poly.get("min_corner", 0.0)), 4),
+        "polytope_dominates": poly_dom,
+        "cvar_25_rubric_delta": cvar_delta,
+    }
+
     return {
         "verdict": verdict,
         "reason": reason,
@@ -741,6 +818,7 @@ def compare_reports(baseline: dict[str, Any], challenger: dict[str, Any]) -> dic
         "per_map_deltas": per_map_deltas,
         "regressed_maps": regressed_maps,
         "single_map_gain_warning": single_map_gain_warning,
+        "game_theory": game_theory,
     }
 
 
@@ -850,8 +928,8 @@ def format_report_markdown(report: dict[str, Any]) -> str:
 
     lines = [
         f"## Evaluation Summary ({meta.get('git_commit') or 'uncommitted'})",
-        f"- Agent: `{meta['agent_spec']}` | Device: `{meta['device']}` | Eval mode: `{meta.get('eval_mode', 'default')}` | Init: `{meta['init_time_s']}s` | Wall: `{meta['wall_time_s']}s`",
-        f"- Episodes: `{overall['episodes']}` | Exits: `{overall['exits']}` | Deaths: `{overall['deaths']}` | Timeouts: `{overall['timeouts']}` | Errors: `{overall['errors']}`",
+        f"- Agent: `{meta['agent_spec']}` | Device: `{meta['device']}` | Eval mode: `{meta.get('eval_mode', 'default')}` (T={meta.get('eval_temperature', 1.0)}) | Init: `{meta['init_time_s']}s` | Wall: `{meta['wall_time_s']}s`",
+        f"- Episodes: `{overall['episodes']}` | Exits: `{overall['exits']}` (`{overall['exit_rate']:.1%}` +- `{overall.get('exit_rate_se', 0.0):.1%}`) | Proxy score: `{overall.get('proxy_leaderboard_score', overall['exit_rate']):.4f}` | Rubric: `{overall.get('verifiable_rubric_score', 0.0):.4f}` (min `{overall.get('rubric_polytope', {}).get('min_corner', 0.0):.4f}`, CVaR25 `{overall.get('cvar_25_rubric', 0.0):.4f}`) | Deaths: `{overall['deaths']}` | Timeouts: `{overall['timeouts']}` | Errors: `{overall['errors']}`",
         f"- Progression: Keys `{overall['keys_picked_up']}` | Doors `{overall['doors_opened']}` | Unlocks `{overall['locked_doors_unlocked']}` | Kills `{overall['kills']}` | Mean cells `{overall['mean_unique_cells']}`",
         f"- Funnel & Actions: `unlock|pickup={unlock_str}` | `exit|unlock={exit_u_str}` | Deaths after pickup `{overall.get('deaths_after_pickup', 0)}` | Opposing steps `{overall.get('opposing_button_steps', 0)}/{overall.get('total_steps', 0)}` | Consecutive USE `{overall.get('consecutive_use_presses', 0)}` | Wasted attacks `{overall.get('wasted_attack_steps', 0)}/{overall.get('attack_steps', 0)}`",
         f"- Compute: Total agent `{overall['total_agent_time_s']}s` | Max step `{overall['max_step_ms']} ms` | Within budget: `{overall['all_within_budget']}`",
@@ -903,13 +981,14 @@ def format_report_markdown(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Role 4 independent DoomAgent evaluator.")
-    parser.add_argument("--split", default="dev", choices=("train", "dev", "final", "stress", "all"))
+    parser.add_argument("--split", default="dev", choices=("train", "dev", "final", "final_ood", "stress", "all"))
     parser.add_argument(
         "--suite",
         default=None,
-        choices=("connect", "mvp_gate", "dev", "final", "train", "stress", "freedoom", "all"),
+        choices=("connect", "mvp_gate", "dev", "final", "final_ood", "train", "stress", "freedoom", "all"),
         help="Named map suite (overrides --split)",
     )
+    parser.add_argument("--corpus-manifest", type=Path, help="Evaluate a dev or eval corpus JSONL manifest")
     parser.add_argument("--map", action="append", default=None, help="wad[:map[:family[:tier[:ticks]]]]")
     parser.add_argument("--seeds", nargs="+", type=int, default=None, help="Override seed list for all maps")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
@@ -918,6 +997,12 @@ def main(argv: list[str] | None = None) -> int:
         default="default",
         choices=("default", "deterministic", "stochastic"),
         help="Override agent determinism flag during evaluation",
+    )
+    parser.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=None,
+        help="Override agent stochastic action sampling temperature during evaluation",
     )
     parser.add_argument(
         "--compare-determinism",
@@ -942,7 +1027,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, default=None, help="Write JSON report to this path")
     parser.add_argument("--compare", nargs=2, metavar=("BASELINE_JSON", "CHALLENGER_JSON"), default=None)
+    parser.add_argument(
+        "--compare-nash",
+        nargs="+",
+        metavar="REPORT_JSON",
+        default=None,
+        help="Game-theoretic Nash averaging & minimax-regret comparison across 2+ JSON reports",
+    )
     args = parser.parse_args(argv)
+
+    if args.compare_nash:
+        if len(args.compare_nash) < 2:
+            parser.error("--compare-nash requires at least 2 report JSON files")
+        named = [
+            (Path(p).stem, json.loads(Path(p).read_text(encoding="utf-8")))
+            for p in args.compare_nash
+        ]
+        nash_res = compare_reports_nash(named)
+        print("## Nash Averaging Comparison")
+        print("| Candidate | Nash Value | Minimax Regret | Mean Rubric | CVaR-25 | Polytope Min | Nash Weight |")
+        print("|---|---|---|---|---|---|---|")
+        for row in nash_res["agents"]:
+            print(
+                f"| {row['name']} | {row['nash_value']:.4f} | {row['minimax_regret']:.4f} "
+                f"| {row['mean_rubric']:.4f} | {row['cvar_25']:.4f} | {row['polytope_min']:.4f} | {row['nash_weight']:.3f} |"
+            )
+        print("\nTop Frontier Maps:")
+        for fm in nash_res["frontier_maps"][:5]:
+            print(f"- `{fm['map']}` (q*={fm['nash_weight']:.3f}): {fm['scores']}")
+        print("\n" + json.dumps(nash_res, indent=2))
+        return 0
 
     if args.compare:
         baseline = json.loads(Path(args.compare[0]).read_text(encoding="utf-8"))
@@ -951,7 +1065,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(cmp_result, indent=2))
         return 0
 
-    specs = resolve_maps(split=args.split, map_args=args.map, suite=args.suite)
+    if args.corpus_manifest:
+        if args.map or args.suite:
+            parser.error("--corpus-manifest cannot be combined with --map or --suite")
+        records = [json.loads(line) for line in args.corpus_manifest.read_text(encoding="utf-8").splitlines()]
+        if not records or any(record.get("split") not in ("dev", "eval") for record in records):
+            parser.error("--corpus-manifest requires a nonempty dev or eval split")
+        specs = [
+            MapSpec(record["wad"], map_name=record["map_name"], family=record["family"],
+                    tier=record["tier"], episode_ticks=record["episode_ticks"], split=record["split"])
+            for record in records
+        ]
+    else:
+        specs = resolve_maps(split=args.split, map_args=args.map, suite=args.suite)
     seeds_override = tuple(args.seeds) if args.seeds is not None else None
     if args.compare_determinism:
         stoch = evaluate_suite(
@@ -961,6 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
             seeds_override=seeds_override,
             render_buffers=args.render_buffers,
             eval_mode="stochastic",
+            eval_temperature=args.eval_temperature,
         )
         det = evaluate_suite(
             specs,
@@ -987,6 +1114,7 @@ def main(argv: list[str] | None = None) -> int:
         record_dir=args.record_dir,
         keep_key_replays=args.keep_key_replays,
         eval_mode=args.eval_mode,
+        eval_temperature=args.eval_temperature,
     )
     if args.check_mvp_gate is not None:
         base_rep = (

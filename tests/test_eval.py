@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from doom_env import spaces as S
 from doom_env.sensors import RAY_DOOR, RAY_LOCKED
@@ -313,7 +314,7 @@ def test_wasted_attack_diagnostics_and_eval_mode():
 
 def test_resolve_stress_and_freedoom_suites():
     stress_specs = resolve_maps(suite="stress")
-    assert len(stress_specs) == 10
+    assert len(stress_specs) == 14
     assert all(s.split == "stress" for s in stress_specs)
     expected_stress_wads = {
         "exit_ahead.wad",
@@ -330,8 +331,8 @@ def test_resolve_stress_and_freedoom_suites():
     assert expected_stress_wads.issubset({Path(s.wad).name for s in stress_specs})
 
     freedoom_specs = resolve_maps(suite="freedoom")
-    assert len(freedoom_specs) == 4
-    assert [s.map_name for s in freedoom_specs] == ["MAP01", "MAP02", "MAP03", "MAP04"]
+    assert len(freedoom_specs) == 8
+    assert [s.map_name for s in freedoom_specs] == [f"MAP{i:02d}" for i in range(1, 9)]
     assert all(
         s.wad == "vizdoom/freedoom2.wad"
         and s.family == "freedoom"
@@ -340,3 +341,25 @@ def test_resolve_stress_and_freedoom_suites():
         for s in freedoom_specs
     )
     assert Path(_resolve_wad_path("vizdoom/freedoom2.wad")).exists()
+
+
+def test_resolve_final_ood_and_freedoom_suites_and_summary_metrics():
+    from training.eval import summarize_episodes
+    from training.interfaces import EpisodeMetrics
+
+    ood_specs = resolve_maps(suite="final_ood")
+    assert len(ood_specs) == 8
+    assert {s.tier for s in ood_specs} == {1, 2, 3, 4}
+
+    fd_specs = resolve_maps(suite="freedoom")
+    assert len(fd_specs) == 8
+    assert [s.map_name for s in fd_specs] == [f"MAP{i:02d}" for i in range(1, 9)]
+
+    eps = [
+        EpisodeMetrics(wad="a.wad", map_name="MAP01", family="combat", tier=1, seed=0, outcome="exit"),
+        EpisodeMetrics(wad="b.wad", map_name="MAP01", family="gauntlet", tier=4, seed=0, outcome="timeout"),
+    ]
+    overall = summarize_episodes(eps)["overall"]
+    assert overall["exit_rate_se"] == pytest.approx(0.3536, abs=1e-3)
+    # 0.25 * T12(1.0) + 0.75 * T34(0.0) = 0.25
+    assert overall["proxy_leaderboard_score"] == pytest.approx(0.25, abs=1e-4)

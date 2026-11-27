@@ -63,6 +63,10 @@ THING_DOOMEDNUM: dict[str, int] = {
     "l": 3006,  # LostSoul (melee, 100 HP)
     "k": 3005,  # Cacodemon (projectile, 400 HP)
     "n": 69,    # HellKnight (projectile, 500 HP)
+    "N": 3003,  # BaronOfHell (projectile, 1000 HP)
+    "Q": 68,    # Arachnotron (plasma, 500 HP)
+    "V": 67,    # Fatso / Mancubus (projectile, 600 HP)
+    "K": 66,    # Revenant (homing projectile/melee, 300 HP)
     # Pickups & props
     "h": 2011,  # Stimpack (+10 HP)
     "H": 2012,  # Medikit (+25 HP)
@@ -71,17 +75,21 @@ THING_DOOMEDNUM: dict[str, int] = {
     "a": 2048,  # ClipBox (+50 bullets)
     "e": 2049,  # ShellBox (+20 shells)
     "o": 2046,  # RocketBox (+5 rockets)
-    "u": 2047,  # CellPack (+100 cells)
+    "u": 2047,  # Cell (+20 cells)
+    "J": 17,    # CellPack (+100 cells)
     "g": 2001,  # Shotgun
     "G": 2002,  # Chaingun
     "W": 82,    # SuperShotgun
     "L": 2003,  # RocketLauncher
     "F": 2004,  # PlasmaRifle
+    "C": 2005,  # Chainsaw
+    "Z": 2025,  # RadSuit (radiation suit)
+    "U": 2013,  # Soulsphere (+100 health up to 200)
     "O": 2024,  # BlurSphere (Powerup -> other)
     "x": 2035,  # ExplosiveBarrel
 }
 
-MONSTER_CHARS = frozenset({"z", "s", "c", "i", "m", "S", "l", "k", "n"})
+MONSTER_CHARS = frozenset({"z", "s", "c", "i", "m", "S", "l", "k", "n", "N", "Q", "V", "K"})
 
 # Visual texture themes (all standard Freedoom2 / Doom2 textures)
 THEMES: dict[str, tuple[str, str, str, int]] = {
@@ -145,6 +153,8 @@ class PolygonSector:
     door_switch: tuple[tuple[float, float], tuple[float, float], int] | None = None
     # Two-sided shared edges marked impassable (sight passes through, movement/rays stop).
     blocking_edges: tuple[tuple[tuple[float, float], tuple[float, float]], ...] = field(default_factory=tuple)
+    # Optional ZDoom UDMF sector special (e.g., 71 = Nukage 5 dmg / 32 tics).
+    sector_special: int = 0
 
 
 def layout_hash(spec_text: str) -> str:
@@ -153,7 +163,7 @@ def layout_hash(spec_text: str) -> str:
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
 
 
-def _parse_grid(grid: str) -> list[str]:
+def _parse_grid_with_offset(grid: str) -> tuple[list[str], int]:
     rows = [line.strip() for line in grid.strip("\n").splitlines() if line.strip()]
     if not rows:
         raise ValueError("Grid cannot be empty")
@@ -173,7 +183,13 @@ def _parse_grid(grid: str) -> list[str]:
     if needs_border:
         w2 = width + 2
         padded = ["#" * w2, *[f"#{r}#" for r in padded], "#" * w2]
-    return padded
+        return padded, 1
+    return padded, 0
+
+
+def _parse_grid(grid: str) -> list[str]:
+    rows, _ = _parse_grid_with_offset(grid)
+    return rows
 
 
 def _sector_kind_for_cell(ch: str) -> str:
@@ -235,10 +251,12 @@ def _emit_udmf(
         lines.append(f"vertex {{ x = {x:.1f}; y = {y:.1f}; }}")
     for sec in sectors:
         id_part = f' id = {int(sec["id"])};' if int(sec.get("id", 0) or 0) != 0 else ""
+        sp_val = int(sec.get("special", 0) or 0)
+        sp_part = f" special = {sp_val};" if sp_val != 0 else ""
         lines.append(
             f'sector {{ texturefloor = "{sec["floor"]}"; textureceiling = "{sec["ceil"]}"; '
             f'heightfloor = {int(sec["hf"])}; heightceiling = {int(sec["hc"])}; '
-            f'lightlevel = {int(sec["light"])};{id_part} }}'
+            f'lightlevel = {int(sec["light"])};{id_part}{sp_part} }}'
         )
     for sd in sidedefs:
         lines.append(
@@ -293,30 +311,58 @@ def build_grid_textmap(
     extra_things: Sequence[ThingSpec] = (),
     skull_keys: bool = False,
     door_close_delay: int = 150,
+    floor_heights: dict[tuple[int, int], int] | None = None,
+    ceiling_heights: dict[tuple[int, int], int] | None = None,
+    sector_specials: dict[tuple[int, int], int] | None = None,
 ) -> str:
     """Compile a 2D ASCII grid into a valid ZDoom UDMF `TEXTMAP` string.
 
-    Each connected component of normal open cells becomes one sector (with varied
-    room textures), each connected component of identical door cells becomes a door
-    sector (ceiling=0), and each connected component of exit cells becomes an exit
-    sector (`GATE3`, `special=243 playercross`).
+    Each connected component of normal open cells with matching floor/ceiling/special
+    becomes one sector (with varied room textures), each connected component of
+    identical door cells becomes a door sector (ceiling=floor), and each connected
+    component of exit cells becomes an exit sector (`GATE3`, `special=243 playercross`).
     """
-    rows = _parse_grid(grid)
+    rows, pad_off = _parse_grid_with_offset(grid)
     height = len(rows)
     width = len(rows[0])
     s = float(cell_size)
 
-    # 1. Assign sector IDs by flood-filling connected components of identical sector kind.
+    fh_map = floor_heights or {}
+    ch_map = ceiling_heights or {}
+    sp_map = sector_specials or {}
+
+    def _cell_props(r: int, c: int) -> tuple[str, int, int, int]:
+        ch = rows[r][c]
+        kind = _sector_kind_for_cell(ch)
+        if kind == "void":
+            return ("void", 0, 0, 0)
+        orig_key = (r - pad_off, c - pad_off)
+        sp = int(sp_map.get(orig_key, 0)) if kind == "room" else 0
+        if kind not in ("room", "exit"):
+            if orig_key in fh_map:
+                hf = int(fh_map[orig_key])
+            else:
+                nbr_hfs = [
+                    int(fh_map.get((nr - pad_off, nc - pad_off), 0))
+                    for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1))
+                    if 0 <= nr < height and 0 <= nc < width and rows[nr][nc] != "#"
+                ]
+                hf = min(nbr_hfs) if nbr_hfs else 0
+            return (kind, hf, hf, 0)
+        hf = int(fh_map.get(orig_key, 0))
+        hc = int(ch_map.get(orig_key, 128))
+        return (kind, hf, hc, sp)
+
+    # 1. Assign sector IDs by flood-filling connected components of identical properties.
     cell_sector: list[list[int]] = [[-1] * width for _ in range(height)]
-    sector_kinds: list[str] = []
+    sector_props: list[tuple[str, int, int, int]] = []
     for r in range(height):
         for c in range(width):
-            ch = rows[r][c]
-            kind = _sector_kind_for_cell(ch)
-            if kind == "void" or cell_sector[r][c] != -1:
+            props = _cell_props(r, c)
+            if props[0] == "void" or cell_sector[r][c] != -1:
                 continue
-            sid = len(sector_kinds)
-            sector_kinds.append(kind)
+            sid = len(sector_props)
+            sector_props.append(props)
             q: deque[tuple[int, int]] = deque([(r, c)])
             cell_sector[r][c] = sid
             while q:
@@ -324,10 +370,11 @@ def build_grid_textmap(
                 for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                     nr, nc = cr + dr, cc + dc
                     if 0 <= nr < height and 0 <= nc < width:
-                        if cell_sector[nr][nc] == -1 and _sector_kind_for_cell(rows[nr][nc]) == kind:
+                        if cell_sector[nr][nc] == -1 and _cell_props(nr, nc) == props:
                             cell_sector[nr][nc] = sid
                             q.append((nr, nc))
 
+    sector_kinds = [p[0] for p in sector_props]
     if not sector_kinds:
         raise ValueError("Grid has no playable cells")
     if len(sector_kinds) >= 2048:
@@ -338,19 +385,30 @@ def build_grid_textmap(
     room_counter = 0
     sectors: list[dict[str, object]] = []
     sector_wall_tex: list[str] = []
-    for kind in sector_kinds:
+    for kind, hf, hc, sp in sector_props:
         if kind == "room":
             tname = THEME_NAMES[(base_idx + room_counter) % len(THEME_NAMES)]
             room_counter += 1
             wall_tex, floor_tex, ceil_tex, light = THEMES[tname]
-            sectors.append({"floor": floor_tex, "ceil": ceil_tex, "hf": 0, "hc": 128, "light": light})
+            if sp != 0:
+                floor_tex = "NUKAGE1"
+            sec_dict: dict[str, object] = {
+                "floor": floor_tex,
+                "ceil": ceil_tex,
+                "hf": hf,
+                "hc": hc,
+                "light": light,
+            }
+            if sp != 0:
+                sec_dict["special"] = sp
+            sectors.append(sec_dict)
             sector_wall_tex.append(wall_tex)
         elif kind == "exit":
-            sectors.append({"floor": "GATE3", "ceil": "CEIL1_1", "hf": 0, "hc": 128, "light": 208})
+            sectors.append({"floor": "GATE3", "ceil": "CEIL1_1", "hf": hf, "hc": hc, "light": 208})
             sector_wall_tex.append("GRAY1")
         else:
-            # Door sector: ceiling starts closed at 0
-            sectors.append({"floor": "FLAT5_4", "ceil": "CEIL1_1", "hf": 0, "hc": 0, "light": 192})
+            # Door sector: ceiling starts closed at hf
+            sectors.append({"floor": "FLAT5_4", "ceil": "CEIL1_1", "hf": hf, "hc": hf, "light": 192})
             sector_wall_tex.append("DOORTRAK")
 
     # 3. Collect all directed cell boundary segments.
@@ -491,10 +549,22 @@ def build_grid_textmap(
                         "repeatspecial": True,
                     })
             elif back_kind == "exit":
+                front_hf, front_hc = int(sectors[front_sec]["hf"]), int(sectors[front_sec]["hc"])
+                back_hf, back_hc = int(sectors[back_sec]["hf"]), int(sectors[back_sec]["hc"])
                 sd_front = len(sidedefs)
-                sidedefs.append({"sector": front_sec, "top": "-", "mid": "-", "bot": "-"})
+                sidedefs.append({
+                    "sector": front_sec,
+                    "top": sector_wall_tex[back_sec] if front_hc > back_hc else "-",
+                    "mid": "-",
+                    "bot": sector_wall_tex[back_sec] if front_hf < back_hf else "-",
+                })
                 sd_back = len(sidedefs)
-                sidedefs.append({"sector": back_sec, "top": "-", "mid": "-", "bot": "-"})
+                sidedefs.append({
+                    "sector": back_sec,
+                    "top": sector_wall_tex[front_sec] if back_hc > front_hc else "-",
+                    "mid": "-",
+                    "bot": sector_wall_tex[front_sec] if back_hf < front_hf else "-",
+                })
                 linedefs.append({
                     "v1": v1,
                     "v2": v2,
@@ -505,10 +575,22 @@ def build_grid_textmap(
                     "playercross": True,
                 })
             else:
+                front_hf, front_hc = int(sectors[front_sec]["hf"]), int(sectors[front_sec]["hc"])
+                back_hf, back_hc = int(sectors[back_sec]["hf"]), int(sectors[back_sec]["hc"])
                 sd_front = len(sidedefs)
-                sidedefs.append({"sector": front_sec, "top": "-", "mid": "-", "bot": "-"})
+                sidedefs.append({
+                    "sector": front_sec,
+                    "top": sector_wall_tex[back_sec] if front_hc > back_hc else "-",
+                    "mid": "-",
+                    "bot": sector_wall_tex[back_sec] if front_hf < back_hf else "-",
+                })
                 sd_back = len(sidedefs)
-                sidedefs.append({"sector": back_sec, "top": "-", "mid": "-", "bot": "-"})
+                sidedefs.append({
+                    "sector": back_sec,
+                    "top": sector_wall_tex[front_sec] if back_hc > front_hc else "-",
+                    "mid": "-",
+                    "bot": sector_wall_tex[front_sec] if back_hf < front_hf else "-",
+                })
                 linedefs.append({
                     "v1": v1,
                     "v2": v2,
@@ -599,6 +681,9 @@ def build_grid_wad(
     extra_things: Sequence[ThingSpec] = (),
     skull_keys: bool = False,
     door_close_delay: int = 150,
+    floor_heights: dict[tuple[int, int], int] | None = None,
+    ceiling_heights: dict[tuple[int, int], int] | None = None,
+    sector_specials: dict[tuple[int, int], int] | None = None,
 ) -> Path:
     """Compile a 2D ASCII grid and write a complete UDMF PWAD file."""
     textmap = build_grid_textmap(
@@ -610,6 +695,9 @@ def build_grid_wad(
         extra_things=extra_things,
         skull_keys=skull_keys,
         door_close_delay=door_close_delay,
+        floor_heights=floor_heights,
+        ceiling_heights=ceiling_heights,
+        sector_specials=sector_specials,
     )
     return _write_textmap_wad(path, textmap, map_name=map_name)
 
@@ -640,14 +728,17 @@ def build_polygon_textmap(
         is_door = (_door_code_from_kind(ps.kind) is not None) or (ps.kind == "remote_door")
         hc = ps.height_floor if is_door else ps.height_ceiling
         floor = "GATE3" if ps.kind == "exit" else ("FLAT5_4" if is_door else ps.floor_texture)
-        sectors.append({
+        sec_dict: dict[str, object] = {
             "floor": floor,
             "ceil": ps.ceiling_texture,
             "hf": ps.height_floor,
             "hc": hc,
             "light": ps.light_level,
             "id": int(ps.sector_id),
-        })
+        }
+        if int(ps.sector_special) != 0:
+            sec_dict["special"] = int(ps.sector_special)
+        sectors.append(sec_dict)
 
     # Collect directed boundary edges from every polygon (normalized CW -> interior on right).
     # Key by undirected segment (min(p1,p2), max(p1,p2)) to stitch shared edges.
@@ -880,3 +971,95 @@ def build_polygon_wad(
     """Compile a non-grid polygonal map and write a complete UDMF PWAD file."""
     textmap = build_polygon_textmap(poly_sectors, things, door_close_delay=door_close_delay)
     return _write_textmap_wad(path, textmap, map_name=map_name)
+
+
+def _d4_transform_pt(
+    pt: tuple[float, float],
+    rot_k: int,
+    flip_x: bool,
+    angle_deg: float = 0.0,
+) -> tuple[float, float]:
+    import math
+
+    x, y = float(pt[0]), float(pt[1])
+    if flip_x:
+        x = -x
+    for _ in range(int(rot_k) % 4):
+        x, y = -y, x
+    ang = float(angle_deg) % 360.0
+    if abs(ang) > 1e-6:
+        rad = math.radians(ang)
+        ca, sa = math.cos(rad), math.sin(rad)
+        x, y = (x * ca - y * sa), (x * sa + y * ca)
+    return (round(float(x), 1), round(float(y), 1))
+
+
+def _d4_transform_angle(angle: int, rot_k: int, flip_x: bool, angle_deg: float = 0.0) -> int:
+    ang = int(angle) % 360
+    if flip_x:
+        ang = (180 - ang) % 360
+    ang = (ang + 90 * (int(rot_k) % 4)) % 360
+    if abs(float(angle_deg)) > 1e-6:
+        ang = int(round((ang + float(angle_deg)) % 360.0)) % 360
+    return ang
+
+
+def transform_polygon_map(
+    poly_sectors: Sequence[PolygonSector],
+    things: Sequence[ThingSpec],
+    rot_k: int = 0,
+    flip_x: bool = False,
+    angle_deg: float = 0.0,
+) -> tuple[tuple[PolygonSector, ...], tuple[ThingSpec, ...]]:
+    """Apply D4 symmetry + optional continuous rotation (degrees CCW) while preserving exact vertex stitching."""
+    def tx(pt: tuple[float, float]) -> tuple[float, float]:
+        return _d4_transform_pt(pt, rot_k, flip_x, angle_deg)
+
+    out_sectors: list[PolygonSector] = []
+    for ps in poly_sectors:
+        verts = [tx(p) for p in ps.vertices]
+        if _signed_area(verts) > 0:
+            verts.reverse()
+        out_holes: list[PolygonHole] = []
+        for hole in ps.holes:
+            hverts = [tx(p) for p in hole.vertices]
+            if _signed_area(hverts) < 0:
+                hverts.reverse()
+            out_holes.append(PolygonHole(vertices=tuple(hverts), wall_texture=hole.wall_texture))
+        exit_sw = (tx(ps.exit_switch[0]), tx(ps.exit_switch[1])) if ps.exit_switch is not None else None
+        door_sw = (
+            (tx(ps.door_switch[0]), tx(ps.door_switch[1]), ps.door_switch[2])
+            if ps.door_switch is not None
+            else None
+        )
+        blk_edges = tuple((tx(p1), tx(p2)) for p1, p2 in ps.blocking_edges)
+        out_sectors.append(
+            PolygonSector(
+                name=ps.name,
+                vertices=tuple(verts),
+                kind=ps.kind,
+                wall_texture=ps.wall_texture,
+                floor_texture=ps.floor_texture,
+                ceiling_texture=ps.ceiling_texture,
+                height_floor=ps.height_floor,
+                height_ceiling=ps.height_ceiling,
+                light_level=ps.light_level,
+                holes=tuple(out_holes),
+                exit_switch=exit_sw,
+                sector_id=ps.sector_id,
+                door_switch=door_sw,
+                blocking_edges=blk_edges,
+                sector_special=ps.sector_special,
+            )
+        )
+
+    out_things = tuple(
+        ThingSpec(
+            x=tx((t.x, t.y))[0],
+            y=tx((t.x, t.y))[1],
+            doomednum=t.doomednum,
+            angle=_d4_transform_angle(t.angle, rot_k, flip_x, angle_deg),
+        )
+        for t in things
+    )
+    return tuple(out_sectors), out_things

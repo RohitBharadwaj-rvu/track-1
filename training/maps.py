@@ -24,11 +24,12 @@ from training.wad_gen.families import (
     MapDefinition,
     materialize_definition,
 )
+from training.wad_gen.final_ood import FINAL_OOD_DEFINITIONS, FINAL_OOD_MAPS
 from training.wad_gen.procedural import generate_procedural_wad
 from training.wad_gen.stress import STRESS_DEFINITIONS
 from training.wad_gen.verify import WadVerificationResult, verify_wad_in_engine
 
-REGISTERED_DEFINITIONS = (*ALL_DEFINITIONS, *STRESS_DEFINITIONS)
+REGISTERED_DEFINITIONS = (*ALL_DEFINITIONS, *STRESS_DEFINITIONS, *FINAL_OOD_DEFINITIONS)
 STRESS_MAPS = tuple(d.spec for d in STRESS_DEFINITIONS)
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -92,6 +93,7 @@ def get_maps(
             "train": TRAIN_MAPS,
             "dev": DEV_MAPS,
             "final": FINAL_MAPS,
+            "final_ood": FINAL_OOD_MAPS,
             "stress": STRESS_MAPS,
             "all": ALL_MAPS,
         }
@@ -215,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="List registered maps by split and tier.")
     parser.add_argument(
         "--split",
-        choices=("train", "dev", "final", "stress", "all"),
+        choices=("train", "dev", "final", "final_ood", "stress", "all"),
         default="all",
         help="Split to generate, list, or verify. The legacy all suite contains Train, Dev, and Final.",
     )

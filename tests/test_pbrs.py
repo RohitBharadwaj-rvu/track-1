@@ -193,3 +193,42 @@ def test_pbrs_never_rewards_standing_still(tmp_path):
     pbrs_disc = GeodesicPBRS(wad, "MAP01", scale=3.0, gamma=0.995)
     pbrs_disc.reset(p0)
     assert pbrs_disc.step(p0) <= 0.0
+
+
+def test_pbrs_freedoom_remote_switch_dropoff_and_damaging_costs():
+    from doom_env.wrapper import IWAD
+    from training.eval import resolve_maps
+    from training.pbrs import _REMOTE_DOOR_LOCK
+
+    # 1. Freedoom2 binary Doom WAD MAP01..MAP08 must all build valid nav graphs
+    for spec in resolve_maps(suite="freedoom"):
+        g = _build_nav_graph(IWAD, spec.map_name)
+        assert g is not None, f"Failed to parse Freedoom binary WAD {spec.map_name}"
+        assert len(g.exit_cells) >= 1
+
+    # 2. Remote door requires switch waypoint before exit becomes reachable
+    sw_pbrs = GeodesicPBRS("maps/stress/remote_door_switch.wad", "MAP01", scale=2.0, gamma=1.0)
+    assert sw_pbrs.graph is not None and len(sw_pbrs.graph.switch_waypoints) >= 1
+    assert any(lk == _REMOTE_DOOR_LOCK for lk, _ in sw_pbrs.graph.locked_door_cells.values())
+    env_sw = make_env("maps/stress/remote_door_switch.wad", "MAP01", episode_ticks=200, render_buffers=False)
+    try:
+        env_sw.reset(seed=0)
+        sw_pbrs.reset(env_sw.privileged_state())
+        assert sw_pbrs._prev_stage_key is not None and sw_pbrs._prev_stage_key[0] == "switch"
+    finally:
+        env_sw.close()
+
+    # 3. Directed cliff dropoff allows downhill u->v without allowing uphill v->u
+    drop_g = _build_nav_graph("maps/stress/dropoff_return.wad", "MAP01")
+    assert drop_g is not None
+    assert any(
+        not any(rv == u for rv, _, _ in drop_g.adj[v])
+        for u, edges in enumerate(drop_g.adj)
+        for v, _, _ in edges
+    )
+
+    # 4. Damaging nukage sector edges carry ~3.0x traversal cost penalty
+    nuk_g = _build_nav_graph("maps/stress/nukage_hazard.wad", "MAP01")
+    assert nuk_g is not None
+    norm_costs = {round(c / nuk_g.cell_size, 1) for edges in nuk_g.adj for _, c, _ in edges}
+    assert any(c >= 2.9 for c in norm_costs)

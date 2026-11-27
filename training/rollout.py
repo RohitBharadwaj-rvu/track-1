@@ -128,6 +128,10 @@ def resolve_train_maps(
 
 
 def _resolve_wad_path(wad: str) -> str:
+    if wad == "vizdoom/freedoom2.wad":
+        from doom_env.wrapper import IWAD
+
+        return IWAD
     p = Path(wad)
     if p.is_absolute() or p.exists():
         return str(p)
@@ -164,6 +168,7 @@ class _DoomWorkerSlot:
         map_weights: Sequence[float] | None = None,
         use_ego_map: bool = False,
         mirror_prob: float = 0.0,
+        champion_baselines: dict[str, dict[str, float]] | None = None,
     ):
         if not map_specs:
             raise ValueError("map_specs must not be empty")
@@ -175,6 +180,7 @@ class _DoomWorkerSlot:
         self.max_cached_envs = max(1, max_cached_envs)
         self.use_ego_map = bool(use_ego_map)
         self.mirror_prob = float(np.clip(mirror_prob, 0.0, 1.0))
+        self.champion_baselines = champion_baselines
         self._ego_map = EgocentricSpatialMap() if self.use_ego_map else None
         self._pbrs_cache: dict[tuple[str, str], GeodesicPBRS | None] = {}
         self._rng = np.random.default_rng(base_seed + slot_id * 10007)
@@ -192,10 +198,16 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked = 0
         self._kills = 0
         self._damage_taken = 0.0
+        self._use_waste_steps = 0
         self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
-        self._locked_doors_xy: list[tuple[float, float]] = []
+        self._locked_doors_xy: list[tuple[float, float, int]] = []
+        self._mapinfo_locks: dict[tuple[str, str], list[tuple[float, float, int]]] = {}
+        self._active_door_locks: list[tuple[float, float, int]] = []
         self._last_priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
         self._last_aux_targets = np.zeros(AUX_TARGET_DIM, dtype=np.float32)
+
+    def set_reward_config(self, reward_config: RewardConfig) -> None:
+        self.shaper.set_config(reward_config)
 
     def _get_pbrs(self, spec: MapSpec) -> GeodesicPBRS | None:
         cfg = self.shaper.config
@@ -222,6 +234,27 @@ class _DoomWorkerSlot:
     def set_map_weights(self, weights: Sequence[float]) -> None:
         self.map_probs = _normalize_weights(weights, len(self.map_specs))
 
+    def set_map_specs(
+        self,
+        map_specs: list[MapSpec],
+        weights: Sequence[float] | None = None,
+    ) -> None:
+        if not map_specs:
+            raise ValueError("map_specs must not be empty")
+        self.map_specs = list(map_specs)
+        self.map_probs = _normalize_weights(weights, len(self.map_specs))
+        live_wads = {_resolve_wad_path(s.wad) for s in self.map_specs}
+        for pk in [k for k in self._pbrs_cache if k[0] not in live_wads]:
+            del self._pbrs_cache[pk]
+        for mk in [k for k in self._mapinfo_locks if k[0] not in live_wads]:
+            del self._mapinfo_locks[mk]
+        for ek in [k for k, env in self._envs.items() if k[0] not in live_wads and env is not self._active_env]:
+            evicted = self._envs.pop(ek)
+            try:
+                evicted.close()
+            except Exception:
+                pass
+
     def _get_or_create_env(self, spec: MapSpec):
         wad_path = _resolve_wad_path(spec.wad)
         key = (wad_path, spec.map_name.upper(), int(spec.episode_ticks))
@@ -242,6 +275,28 @@ class _DoomWorkerSlot:
         self._envs[key] = env
         return env
 
+    def _get_door_locks(self, spec: MapSpec, env: Any) -> list[tuple[float, float, int]]:
+        wad_path = _resolve_wad_path(spec.wad)
+        key = (wad_path, spec.map_name.upper())
+        if key not in self._mapinfo_locks:
+            entries: list[tuple[float, float, int]] = []
+            try:
+                mi = getattr(env, "mapinfo", None)
+                if mi is not None and getattr(mi, "door_sectors", None):
+                    sec_lines = mi.sector_lines()
+                    for sid, lock_num in mi.door_sectors.items():
+                        if int(lock_num) <= 0:
+                            continue
+                        segs = sec_lines.get(int(sid))
+                        if segs is None or len(segs) == 0:
+                            continue
+                        pts = np.concatenate([segs[:, :2], segs[:, 2:]], axis=0)
+                        entries.append((float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])), int(lock_num)))
+            except Exception:
+                entries = []
+            self._mapinfo_locks[key] = entries
+        return self._mapinfo_locks[key]
+
     def _update_door_sighting_and_features(
         self,
         raw_obs: dict[str, Any],
@@ -251,12 +306,32 @@ class _DoomWorkerSlot:
         px = float(priv["x"])
         py = float(priv["y"])
         heading = math.radians(float(priv["angle"]))
+        keys_arr = np.asarray(priv["keys"], dtype=np.float32)
+        # sensors.KEY_NAMES order: BlueCard, YellowCard, RedCard, BlueSkull, YellowSkull, RedSkull
+        has_blue = bool(len(keys_arr) >= 4 and (keys_arr[0] > 0.5 or keys_arr[3] > 0.5))
+        has_yellow = bool(len(keys_arr) >= 5 and (keys_arr[1] > 0.5 or keys_arr[4] > 0.5))
+        has_red = bool(len(keys_arr) >= 6 and (keys_arr[2] > 0.5 or keys_arr[5] > 0.5))
+
+        def _is_unlockable(lock_num: int) -> bool:
+            if lock_num == 1:
+                return has_red
+            if lock_num == 2:
+                return has_blue
+            if lock_num == 3:
+                return has_yellow
+            if lock_num == 100:
+                return has_red or has_blue or has_yellow
+            if lock_num == 101:
+                return has_red and has_blue and has_yellow
+            return False
 
         if unlocked_this_step > 0 and self._locked_doors_xy:
-            # Remove nearest unlocked door(s) while preserving remaining sighted locks on Tier 4 maps
+            # Prefer removing nearest sighted door whose lock matches a held key
             for _ in range(min(unlocked_this_step, len(self._locked_doors_xy))):
+                unlockable_idx = [i for i, pt in enumerate(self._locked_doors_xy) if _is_unlockable(pt[2])]
+                pool_idx = unlockable_idx if unlockable_idx else list(range(len(self._locked_doors_xy)))
                 nearest_idx = min(
-                    range(len(self._locked_doors_xy)),
+                    pool_idx,
                     key=lambda i: math.hypot(self._locked_doors_xy[i][0] - px, self._locked_doors_xy[i][1] - py),
                 )
                 self._locked_doors_xy.pop(nearest_idx)
@@ -269,23 +344,33 @@ class _DoomWorkerSlot:
             best_ray = int(locked_indices[int(np.argmin(dists))])
             d = float(rays["distance"][best_ray]) * _RAY_RANGE
             ray_angle = heading + best_ray * (2.0 * math.pi / float(NUM_RAYS))
-            cand_xy = (px + d * math.cos(ray_angle), py + d * math.sin(ray_angle))
+            cx = px + d * math.cos(ray_angle)
+            cy = py + d * math.sin(ray_angle)
+            cand_lock = 0
+            best_lock_dist = 160.0
+            for lx, ly, lck in self._active_door_locks:
+                ld = math.hypot(cx - lx, cy - ly)
+                if ld < best_lock_dist:
+                    best_lock_dist = ld
+                    cand_lock = lck
             merged = False
-            for i, (lx, ly) in enumerate(self._locked_doors_xy):
-                if math.hypot(cand_xy[0] - lx, cand_xy[1] - ly) < 96.0:
-                    self._locked_doors_xy[i] = cand_xy
+            for i, (lx, ly, old_lck) in enumerate(self._locked_doors_xy):
+                if math.hypot(cx - lx, cy - ly) < 96.0:
+                    self._locked_doors_xy[i] = (cx, cy, cand_lock or old_lck)
                     merged = True
                     break
             if not merged:
-                self._locked_doors_xy.append(cand_xy)
+                self._locked_doors_xy.append((cx, cy, cand_lock))
 
         seen_locked = 0.0
         door_sin = 0.0
         door_cos = 0.0
         door_dist_norm = 0.0
         if self._locked_doors_xy:
+            unlockable_pts = [pt for pt in self._locked_doors_xy if _is_unlockable(pt[2])]
+            pool_pts = unlockable_pts if unlockable_pts else self._locked_doors_xy
             target_xy = min(
-                self._locked_doors_xy,
+                pool_pts,
                 key=lambda pt: math.hypot(pt[0] - px, pt[1] - py),
             )
             dx = target_xy[0] - px
@@ -301,7 +386,6 @@ class _DoomWorkerSlot:
 
         ep_ticks = max(1, int(priv.get("episode_ticks", 1)))
         rem_frac = max(0.0, 1.0 - float(priv.get("tic", 0)) / float(ep_ticks))
-        keys_arr = np.asarray(priv["keys"], dtype=np.float32)
         priv_features = np.zeros(PRIV_FEATURE_DIM, dtype=np.float32)
         priv_features[0] = min(float(self.shaper.unique_cells_visited) / 200.0, 2.0)
         priv_features[1] = min(float(self.shaper.post_key_cells_visited) / 60.0, 2.0)
@@ -325,7 +409,17 @@ class _DoomWorkerSlot:
 
         raw_obs, _ = env.reset(seed=self._current_seed)
         priv = env.privileged_state()
-        self.shaper.reset(priv, obs=raw_obs, pbrs=self._get_pbrs(spec))
+        baseline = None
+        if self.champion_baselines is not None:
+            map_key = f"{Path(spec.wad).name}:{spec.map_name.upper()}"
+            baseline = self.champion_baselines.get(map_key) or self.champion_baselines.get(Path(spec.wad).name)
+        self.shaper.reset(
+            priv,
+            obs=raw_obs,
+            pbrs=self._get_pbrs(spec),
+            champion_baseline=baseline,
+            tier=spec.tier,
+        )
         self._steps = 0
         self._total_reward = 0.0
         self._keys_picked_up = 0
@@ -333,10 +427,12 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked = 0
         self._kills = 0
         self._damage_taken = 0.0
+        self._use_waste_steps = 0
         self._prev_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
         if self._ego_map is not None:
             self._ego_map.reset()
         self._locked_doors_xy = []
+        self._active_door_locks = self._get_door_locks(spec, env)
         priv_f, aux_t = self._update_door_sighting_and_features(raw_obs, priv)
         obs_for_policy = mirror_raw_obs(raw_obs) if self._mirror_ep else raw_obs
         if self._mirror_ep:
@@ -355,7 +451,7 @@ class _DoomWorkerSlot:
 
         raw_obs, _, terminated, truncated, _ = self._active_env.step(act_env)
         priv = self._active_env.privileged_state()
-        reward, events, _ = self.shaper.step(
+        reward, events, comp = self.shaper.step(
             priv, action=act_env, prev_action=self._prev_action, obs=raw_obs
         )
         self._prev_action = act_env.copy()
@@ -367,6 +463,8 @@ class _DoomWorkerSlot:
         self._locked_doors_unlocked += events.locked_doors_unlocked
         self._kills += events.kills
         self._damage_taken += events.damage_taken
+        if comp.get("use_penalty", 0.0) < 0.0:
+            self._use_waste_steps += 1
 
         priv_f, aux_t = self._update_door_sighting_and_features(
             raw_obs, priv, unlocked_this_step=events.locked_doors_unlocked
@@ -377,7 +475,7 @@ class _DoomWorkerSlot:
             aux_t = mirror_aux_targets(aux_t)
         obs_proc = self._preprocess_with_ego(obs_for_policy, act_policy)
 
-        info: dict[str, Any] = {"mirrored": was_mirrored}
+        info: dict[str, Any] = {"mirrored": was_mirrored, "wad": self._active_spec.wad}
         if terminated or truncated:
             if priv.get("exit_reached"):
                 outcome = "exit"
@@ -385,6 +483,15 @@ class _DoomWorkerSlot:
                 outcome = "death"
             else:
                 outcome = "timeout"
+            tics = int(priv.get("tic", 0))
+            ep_extra = {
+                "rubric_score": round(float(self.shaper.last_rubric_score), 4),
+                "regressed_vs_champion": bool(self.shaper.last_regressed_vs_champion),
+                "early_death": bool(outcome == "death" and tics <= 700),
+                "died_after_pickup": bool(outcome == "death" and self._keys_picked_up > 0),
+                "use_waste_rate": round(float(self._use_waste_steps) / float(max(1, self._steps)), 4),
+                "episode_ticks": int(self._active_spec.episode_ticks),
+            }
             info["final_obs"] = obs_proc
             info["final_priv_features"] = priv_f
             info["final_aux_targets"] = aux_t
@@ -395,7 +502,7 @@ class _DoomWorkerSlot:
                 tier=self._active_spec.tier,
                 seed=self._current_seed,
                 steps=self._steps,
-                ticks=int(priv.get("tic", 0)),
+                ticks=tics,
                 outcome=outcome,
                 keys_picked_up=self._keys_picked_up,
                 doors_opened=self._doors_opened,
@@ -405,6 +512,7 @@ class _DoomWorkerSlot:
                 final_health=float(priv.get("health", 0.0)),
                 unique_cells_visited=self.shaper.unique_cells_visited,
                 total_reward=float(self._total_reward),
+                extra=ep_extra,
             )
             next_obs = self.reset()
             info["priv_features"] = self._last_priv_features
@@ -441,6 +549,7 @@ class SyncVecDoomEnv:
         map_weights: Sequence[float] | None = None,
         use_ego_map: bool = False,
         mirror_prob: float = 0.0,
+        champion_baselines: dict[str, dict[str, float]] | None = None,
     ):
         self.num_envs = num_envs if num_envs is not None else max(1, len(map_specs))
         self.slots = [
@@ -454,15 +563,28 @@ class SyncVecDoomEnv:
                 map_weights=map_weights,
                 use_ego_map=use_ego_map,
                 mirror_prob=mirror_prob,
+                champion_baselines=champion_baselines,
             )
             for i in range(self.num_envs)
         ]
         self._last_priv_batch = np.zeros((self.num_envs, PRIV_FEATURE_DIM), dtype=np.float32)
         self._last_aux_batch = np.zeros((self.num_envs, AUX_TARGET_DIM), dtype=np.float32)
 
+    def set_reward_config(self, reward_config: RewardConfig) -> None:
+        for slot in self.slots:
+            slot.set_reward_config(reward_config)
+
     def set_map_weights(self, weights: Sequence[float]) -> None:
         for slot in self.slots:
             slot.set_map_weights(weights)
+
+    def set_map_specs(
+        self,
+        map_specs: list[MapSpec],
+        weights: Sequence[float] | None = None,
+    ) -> None:
+        for slot in self.slots:
+            slot.set_map_specs(map_specs, weights)
 
     def get_privileged_batch(self) -> tuple[np.ndarray, np.ndarray]:
         return self._last_priv_batch.copy(), self._last_aux_batch.copy()
@@ -517,6 +639,7 @@ def _worker_loop(
     map_weights: Sequence[float] | None,
     use_ego_map: bool = False,
     mirror_prob: float = 0.0,
+    champion_baselines: dict[str, dict[str, float]] | None = None,
 ) -> None:
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(var, "1")
@@ -530,6 +653,7 @@ def _worker_loop(
         map_weights=map_weights,
         use_ego_map=use_ego_map,
         mirror_prob=mirror_prob,
+        champion_baselines=champion_baselines,
     )
     try:
         while True:
@@ -541,6 +665,11 @@ def _worker_loop(
                 conn.send(slot.step(data))
             elif cmd == "set_weights":
                 slot.set_map_weights(data)
+            elif cmd == "set_reward_config":
+                slot.set_reward_config(data)
+            elif cmd == "set_map_specs":
+                new_specs, new_weights = data
+                slot.set_map_specs(new_specs, new_weights)
             elif cmd == "close":
                 slot.close()
                 conn.send(None)
@@ -568,6 +697,7 @@ class SubprocVecDoomEnv:
         map_weights: Sequence[float] | None = None,
         use_ego_map: bool = False,
         mirror_prob: float = 0.0,
+        champion_baselines: dict[str, dict[str, float]] | None = None,
     ):
         self.num_envs = int(num_envs)
         ctx = mp.get_context("spawn")
@@ -591,6 +721,7 @@ class SubprocVecDoomEnv:
                     map_weights,
                     use_ego_map,
                     mirror_prob,
+                    champion_baselines,
                 ),
                 daemon=True,
             )
@@ -599,10 +730,23 @@ class SubprocVecDoomEnv:
             self._parent_conns.append(parent_conn)
             self._procs.append(proc)
 
+    def set_reward_config(self, reward_config: RewardConfig) -> None:
+        for conn in self._parent_conns:
+            conn.send(("set_reward_config", reward_config))
+
     def set_map_weights(self, weights: Sequence[float]) -> None:
         w = list(weights)
         for conn in self._parent_conns:
             conn.send(("set_weights", w))
+
+    def set_map_specs(
+        self,
+        map_specs: list[MapSpec],
+        weights: Sequence[float] | None = None,
+    ) -> None:
+        payload = (list(map_specs), None if weights is None else list(weights))
+        for conn in self._parent_conns:
+            conn.send(("set_map_specs", payload))
 
     def get_privileged_batch(self) -> tuple[np.ndarray, np.ndarray]:
         return self._last_priv_batch.copy(), self._last_aux_batch.copy()
@@ -709,6 +853,7 @@ class RolloutBuffer:
         hidden_shape: tuple[int, ...],
         *,
         use_ego_map: bool = False,
+        teacher_logit_dim: int = 0,
     ):
         self.num_steps = int(num_steps)
         self.num_envs = int(num_envs)
@@ -739,9 +884,28 @@ class RolloutBuffer:
         self.hiddens = np.zeros((T, *self.hidden_shape), dtype=np.float32)
         self.priv_features = np.zeros((T, N, PRIV_FEATURE_DIM), dtype=np.float32)
         self.aux_targets = np.zeros((T, N, AUX_TARGET_DIM), dtype=np.float32)
+        self.teacher_logits = (
+            np.zeros((T, N, int(teacher_logit_dim)), dtype=np.float32) if int(teacher_logit_dim) > 0 else None
+        )
 
         self.advantages = np.zeros((T, N), dtype=np.float32)
         self.returns = np.zeros((T, N), dtype=np.float32)
+        self.step_wads: list[list[str]] = [[""] * N for _ in range(T)]
+
+    def compute_per_wad_pvl(self) -> dict[str, float]:
+        """Compute mean positive GAE magnitude grouped by WAD for UED regret prioritization."""
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        pos_adv = np.maximum(self.advantages, 0.0)
+        for t in range(self.num_steps):
+            wads_t = self.step_wads[t]
+            for e in range(self.num_envs):
+                wad = wads_t[e]
+                if not wad:
+                    continue
+                sums[wad] = sums.get(wad, 0.0) + float(pos_adv[t, e])
+                counts[wad] = counts.get(wad, 0) + 1
+        return {wad: sums[wad] / float(counts[wad]) for wad in sums if counts[wad] > 0}
 
     def add(
         self,
@@ -759,6 +923,7 @@ class RolloutBuffer:
         hidden: np.ndarray,
         priv_features: np.ndarray | None = None,
         aux_targets: np.ndarray | None = None,
+        teacher_logits: np.ndarray | None = None,
     ) -> None:
         for k, arr in self.obs.items():
             arr[step] = obs_batch[k]
@@ -776,6 +941,8 @@ class RolloutBuffer:
             self.priv_features[step] = priv_features
         if aux_targets is not None:
             self.aux_targets[step] = aux_targets
+        if self.teacher_logits is not None and teacher_logits is not None:
+            self.teacher_logits[step] = teacher_logits
 
     def compute_returns_and_advantages(
         self,
@@ -830,7 +997,7 @@ class RolloutBuffer:
                 axis=1,
             )
 
-            yield {
+            batch_out = {
                 "obs": {k: _slice_seq(v) for k, v in self.obs.items()},
                 "prev_actions": _slice_seq(self.prev_actions),
                 "actions": _slice_seq(self.actions),
@@ -843,6 +1010,9 @@ class RolloutBuffer:
                 "aux_targets": _slice_seq(self.aux_targets),
                 "init_hidden": init_hidden,
             }
+            if self.teacher_logits is not None:
+                batch_out["teacher_logits"] = _slice_seq(self.teacher_logits)
+            yield batch_out
 
 
 def _policy_step(
@@ -893,6 +1063,8 @@ def collect_rollout(
     asymmetric_critic: Any = None,
     feature_hook: Any = None,
     curiosity: Any = None,
+    teacher_policy: Any = None,
+    teacher_hidden_state: list[Any] | None = None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, Any, np.ndarray, list[EpisodeMetrics], np.ndarray]:
     """Collect `buffer.num_steps` transitions, returning `(obs, prev_action, hidden, starts, eps, last_values)`."""
     import torch
@@ -904,6 +1076,8 @@ def collect_rollout(
     policy.eval()
     if asymmetric_critic is not None:
         asymmetric_critic.eval()
+    if teacher_policy is not None:
+        teacher_policy.eval()
 
     with torch.no_grad():
         priv_batch, aux_batch = vec_env.get_privileged_batch()
@@ -913,6 +1087,12 @@ def collect_rollout(
             obs_t = obs_to_torch(obs, device)
             prev_t = torch.as_tensor(prev_action, dtype=torch.float32, device=device)
             priv_t = torch.as_tensor(priv_batch, dtype=torch.float32, device=device)
+
+            teacher_logits_np = None
+            next_th = None
+            if teacher_policy is not None and teacher_hidden_state is not None:
+                t_logits_t, _, next_th = teacher_policy.act_step(obs_t, prev_t, teacher_hidden_state[0])
+                teacher_logits_np = t_logits_t.cpu().numpy().astype(np.float32)
 
             act_t, log_prob_t, value, next_hidden = _policy_step(
                 policy,
@@ -965,6 +1145,7 @@ def collect_rollout(
             for info in infos:
                 if "episode" in info:
                     completed_episodes.append(info["episode"])
+            buffer.step_wads[step] = [str(info.get("wad", "")) for info in infos]
 
             buffer.add(
                 step=step,
@@ -981,6 +1162,7 @@ def collect_rollout(
                 hidden=hidden_before,
                 priv_features=priv_batch,
                 aux_targets=aux_batch,
+                teacher_logits=teacher_logits_np,
             )
 
             if np.any(done):
@@ -988,8 +1170,12 @@ def collect_rollout(
                 keep_t = torch.as_tensor(keep_np, device=device).view(1, -1, 1)
                 next_hidden = next_hidden * keep_t
                 next_prev_action = action_np * keep_np[:, None]
+                if next_th is not None and teacher_hidden_state is not None:
+                    teacher_hidden_state[0] = next_th * keep_t
             else:
                 next_prev_action = action_np
+                if next_th is not None and teacher_hidden_state is not None:
+                    teacher_hidden_state[0] = next_th
 
             obs = next_obs
             prev_action = next_prev_action

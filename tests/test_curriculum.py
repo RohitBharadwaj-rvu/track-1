@@ -110,3 +110,38 @@ def test_adaptive_weights_upweight_unmastered_maps_and_tier3_require_exit():
     assert sched.observe_episodes(mixed) is True  # 16/24 >= 0.50 promotes to phase 2
     w = sched.compute_map_weights(specs)
     assert w[1] > w[0] * 3.0 and w[0] > 0.0
+
+
+def test_per_tier_budget_preserved_and_unseen_exploration_bonus():
+    # Skewed map counts (3 Tier 1 maps vs 1 each in T2/T3/T4) must still hit exact phase tier budgets
+    specs = [
+        MapSpec(wad="t1_a.wad", family="combat", tier=1, split="train"),
+        MapSpec(wad="t1_b.wad", family="combat", tier=1, split="train"),
+        MapSpec(wad="t1_c.wad", family="door_exit", tier=1, split="train"),
+        MapSpec(wad="t2_a.wad", family="multi_room", tier=2, split="train"),
+        MapSpec(wad="t3_a.wad", family="key_return", tier=3, split="train"),
+        MapSpec(wad="t4_a.wad", family="gauntlet", tier=4, split="train"),
+    ]
+    sched = CurriculumScheduler(
+        CurriculumConfig(
+            auto_curriculum=True,
+            family_weights={"combat": 0.5, "door_exit": 2.0},
+            adaptive_weights=True,
+            adaptive_floor=0.25,
+        )
+    )
+    sched.phase = 2
+    target_tb = sched.current_tier_weights()
+    w0 = sched.compute_map_weights(specs)
+    for tier in (1, 2, 3, 4):
+        tier_sum = sum(w0[i] for i, s in enumerate(specs) if s.tier == tier)
+        assert tier_sum == pytest.approx(target_tb[tier], abs=1e-5)
+
+    # Observed mastered map t1_a vs unseen map t1_b -> unseen receives optimistic bonus (w_unseen > w_mastered)
+    sched.observe_episodes([
+        EpisodeMetrics(wad="t1_a.wad", map_name="MAP01", family="combat", tier=1, seed=0, outcome="exit")
+    ])
+    w1 = sched.compute_map_weights(specs)
+    assert w1[1] > w1[0]
+    for tier in (1, 2, 3, 4):
+        assert sum(w1[i] for i, s in enumerate(specs) if s.tier == tier) == pytest.approx(target_tb[tier], abs=1e-5)
